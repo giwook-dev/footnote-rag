@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SYNTHETIC test fixture written by hand. Not a real DART filing. -->
+<DOCUMENT>
+<DOCUMENT-NAME ACODE="00760">감사보고서</DOCUMENT-NAME>
+<COMPANY-NAME AREGCIK="99000123">테스트상사(합성)</COMPANY-NAME>
+<BODY>
+<COVER>
+<COVER-TITLE>감 사 보 고 서</COVER-TITLE>
+<P>제 10 기 2025년 1월 1일부터 2025년 12월 31일까지</P>
+</COVER>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">독립된 감사인의 감사보고서</TITLE>
+<P>감사의견: 재무제표는 중요성의 관점에서 공정하게 표시하고 있습니다.</P>
+</SECTION-1>
+<LIBRARY>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">(첨부)재 무 제 표</TITLE>
+<SECTION-2>
+<TITLE ATOC="Y">재 무 상 태 표</TITLE>
+<TABLE BORDER="1">
+<THEAD><TR><TH>과 목</TH><TH>제 10 기</TH><TH>제 9 기</TH></TR></THEAD>
+<TBODY>
+<TR><TD>현금및현금성자산</TD><TE ALIGN="RIGHT">1,000</TE><TE ALIGN="RIGHT">900</TE></TR>
+<TR><TD>리스부채</TD><TE ALIGN="RIGHT">250</TE><TE ALIGN="RIGHT"><SPAN>200</SPAN></TE></TR>
+<TR><TU>(단위: 백만원)</TU></TR>
+<TR><TD> </TD></TR>
+</TBODY>
+</TABLE>
+</SECTION-2>
+<SECTION-2>
+<TITLE ATOC="Y">주석</TITLE>
+<P>제 10 기 2025년 12월 31일 현재</P>
+<P>1. 일반사항</P>
+<P>회사는 합성 데이터 시험용으로 설립되었습니다.</P>
+<P>12. 리스</P>
+<P>(1) 리스부채는 리스료의 현재가치로 측정합니다.</P>
+<P>1. 단기리스에는 인식 면제를 적용하였습니다.</P>
+<SECTION-3>
+<TITLE ATOC="Y">리스 만기분석</TITLE>
+<TABLE>
+<TR><TH>구분</TH><TH>1년 이내</TH><TH>1년 초과</TH></TR>
+<TR><TD>리스료</TD><TE>120</TE><TE>130</TE></TR>
+</TABLE>
+</SECTION-3>
+</SECTION-2>
+</SECTION-1>
+</LIBRARY>
+</BODY>
+</DOCUMENT>
