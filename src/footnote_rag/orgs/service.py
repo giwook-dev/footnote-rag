@@ -1,4 +1,12 @@
-"""Organization and user management."""
+"""조직과 사용자 관리 서비스.
+
+역할: 이메일(소문자 비교)로 사용자를 찾고, 사용자를 만들며(감사 기록 포함), 첫 조직과 관리자를 시드한다.
+주요 요소: ``get_user_by_email``, ``create_user``, ``seed_org``, ``EmailTakenError``.
+호출 관계: ``auth.router``, ``cli.cmd_seed``, ``evals.run``, 테스트의 ``make_org``가 호출한다.
+학습 문서: docs/study/03-auth-rbac-isolation.md
+
+Organization and user management.
+"""
 
 from __future__ import annotations
 

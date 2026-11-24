@@ -1,4 +1,12 @@
-"""Validate the eval dataset against the parser's real output.
+"""Eval 데이터셋 검증기: 근거 인용문이 파서 출력에 실제로 있는지 확인한다.
+
+역할: ``evidence_quote``가 캐시된 원문 ZIP의 파서 텍스트에 그대로 있고 기대 목차 아래에 있는지,
+데이터셋이 개수 규칙(15행 이상 등)을 지키는지 검사한다. ``_example`` 행은 건너뛴다.
+주요 요소: ``validate``, ``ValidationReport``, ``_check_coverage``, ``main``.
+호출 관계: ``dart.parser.parse_document_zip``과 ``evals.dataset.load_dataset``을 호출한다.
+학습 문서: docs/study/10-eval-and-mcp.md
+
+Validate the eval dataset against the parser's real output.
 
     python -m footnote_rag.evals.validate [--dataset evals/dataset.jsonl] [--zip-dir data/dart]
 

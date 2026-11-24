@@ -1,4 +1,12 @@
-"""Eval runner.
+"""Eval 실행기(recall@k, 인용 정확도, 거절 비율, 평균 비용·지연시간).
+
+역할: 임시 조직을 만들어 데이터셋의 공시를 정상 서비스·워커로 가져오고, 질문마다 검색·답변 결과를 채점해
+Markdown 리포트를 쓴다. 기본은 Fake 모드(비용 없음), ``--live``는 실제 제공자.
+주요 요소: ``run_eval``, ``EvalSummary``(지표 속성), ``render_report``, ``write_report``, ``main``.
+호출 관계: ``documents.service``, ``jobs.worker.Worker``, ``answering.service``를 그대로 호출한다.
+학습 문서: docs/study/10-eval-and-mcp.md
+
+Eval runner.
 
     python -m footnote_rag.evals.run [--dataset evals/dataset.jsonl] [--live] [--out evals/reports]
 

@@ -62,6 +62,39 @@ uv run ruff check . && uv run ruff format --check . && uv run pytest
 # 다른 DB를 쓰려면 TEST_DATABASE_URL=postgresql+asyncpg://...
 ```
 
+## 웹 화면으로 테스트하기
+
+FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`의 HTML·JS·CSS 3개)을 `/ui`에서 직접 서빙합니다. 화면은 기존 HTTP API를 그대로 호출하므로 권한 검사와 조직 격리도 그대로 적용됩니다. 역할에 따라 탭을 숨기는 것은 편의 기능일 뿐이고, 권한 판단은 서버가 합니다.
+
+1. 스택을 띄우고 첫 관리자를 만듭니다.
+
+   bash:
+
+   ```bash
+   docker compose up --build -d
+   curl http://localhost:8000/readyz
+   docker compose exec api python -m footnote_rag.cli seed \
+     --org "Demo" --admin-email admin@example.com --admin-password 'change-me-please'
+   ```
+
+   PowerShell:
+
+   ```powershell
+   docker compose up --build -d
+   Invoke-RestMethod http://localhost:8000/readyz
+   docker compose exec api python -m footnote_rag.cli seed `
+     --org "Demo" --admin-email admin@example.com --admin-password 'change-me-please'
+   ```
+
+2. 브라우저에서 http://localhost:8000/ui 를 엽니다(`http://localhost:8000/`도 `/ui/`로 리다이렉트). 위 계정으로 로그인합니다. 토큰은 탭을 닫으면 사라지는 `sessionStorage`에만 저장됩니다.
+3. **문서** 탭: 종목코드(프리셋: 삼성전자 005930, NAVER 035420, 현대자동차 005380)·기간·보고서 종류(F001/F002)로 검색하고 결과 행의 **가져오기**를 누릅니다. 새 문서는 202, 이미 가져온 문서는 200으로 구분해 안내합니다. 아래 "내 문서" 표는 `queued`/`processing` 문서가 있는 동안 3초마다 새로고침되고, `failed`면 오류 내용을 보여 줍니다.
+   - Fake 모드(OpenDART 키 없음)에서는 상단에 "Fake 모드(합성 데이터)" 배지가 뜨고, 합성 종목코드 `990001`~`990003`만 검색됩니다. 접수번호 직접 입력란에 `20260310900001`을 넣어 가져와도 됩니다.
+4. **질문** 탭: `ready` 문서를 고르고(안 고르면 전체) 질문합니다. 답변 본문의 `[n]`을 누르면 아래 각주(회사명·문서 제목·목차 경로·인용문·DART 원문 링크)가 강조됩니다. 상태 배지와 토큰·비용·지연시간도 표시됩니다. 이번 세션의 질문은 오른쪽 목록에 남습니다(새로고침하면 사라짐).
+5. **검토** 탭(reviewer·admin): 검토 대기 답변을 승인·반려합니다. 다른 검토자가 먼저 처리했다면 409를 받아 "이미 다른 검토자가 처리함"을 알리고 목록을 새로고침합니다. 검토 대기 답변을 확실히 만들어 보려면 `.env`에 `REVIEW_MODE=always`를 넣고 다시 띄웁니다(모든 답변이 검토 대기로 감).
+6. **관리** 탭(admin): 사용량(기본 최근 7일), 감사 로그 최근 50건(action 필터), 사용자 추가 폼이 있습니다. member·reviewer 계정을 만들어 다시 로그인하면 역할별로 보이는 탭이 달라지는 것을 확인할 수 있습니다.
+
+`/ui` 응답에는 `Content-Security-Policy`(`script-src 'self'` 등 외부 리소스 차단), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` 헤더가 붙습니다. Swagger(`/docs`)는 CDN 리소스를 쓰므로 이 CSP를 적용하지 않습니다.
+
 ## API 키 발급
 
 | 키 | 발급처 | 용도 |
@@ -109,6 +142,8 @@ AUTH="Authorization: Bearer $TOKEN"
 # 2. 접수번호 찾기 (실제 키 모드) — 삼성전자·NAVER·현대자동차 감사보고서
 docker compose exec api python -m footnote_rag.cli dart-find \
   --stock-codes 005930,035420,005380 --from 20260101 --to 20260531 --detail F001
+# 같은 검색을 API로: {mode, reports:[...], not_found:[...]}
+curl -s "$API/dart/reports?stock_codes=005930,035420,005380&date_from=20260101&date_to=20260531&detail=F001" -H "$AUTH"
 
 # 3. DART 가져오기: 202 {document_id, job_id}
 curl -s -X POST $API/documents/dart -H "$AUTH" -H 'Content-Type: application/json' \
@@ -138,8 +173,10 @@ curl -s "$API/usage?from=2026-11-01T00:00:00Z" -H "$AUTH"
 
 | 메서드 | 경로 | 권한 |
 | --- | --- | --- |
+| GET | `/ui` (웹 화면, `/`는 `/ui/`로 리다이렉트) | 공개(화면 안의 API 호출은 각 권한 적용) |
 | POST | `/auth/token` | 공개 |
 | GET | `/users/me` | 모든 역할 |
+| GET | `/dart/reports?stock_codes=&date_from=&date_to=&detail=` (종목코드로 감사보고서 검색) | member 이상 |
 | POST | `/users` | admin (같은 조직) |
 | POST | `/documents/dart` | member 이상 |
 | POST | `/documents/upload` (TXT/MD, 5MB) | member 이상 |
@@ -205,3 +242,4 @@ claude mcp add footnote-rag \
 - [docs/adr/](docs/adr/): 기술 결정 기록
 - [docs/data-sources.md](docs/data-sources.md): 사용한 공시와 수집 방법
 - [docs/ai-usage.md](docs/ai-usage.md): AI 활용 내역(초안)
+- [docs/study/README.md](docs/study/README.md): 학습 자료. 코드를 읽는 순서, 요청 흐름 해설, 설계 이유·대안·한계, 면접 Q&A, 용어집, 실습

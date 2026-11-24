@@ -1,4 +1,12 @@
-"""PostgreSQL job queue (``FOR UPDATE SKIP LOCKED``).
+"""PostgreSQL 작업 큐(``FOR UPDATE SKIP LOCKED``).
+
+역할: 작업 등록(호출자 트랜잭션에 추가), 원자적 claim, 성공·실패 기록(지수 백오프), 멈춘 작업 복구.
+주요 요소: ``enqueue``, ``claim_job``, ``mark_succeeded``, ``mark_failed``, ``recover_stale_jobs``,
+``backoff_seconds``, ``RetryableJobError``·``PermanentJobError``.
+호출 관계: ``documents.service``가 ``enqueue``를, ``jobs.worker.Worker``가 나머지를 호출한다.
+학습 문서: docs/study/04-job-queue.md
+
+PostgreSQL job queue (``FOR UPDATE SKIP LOCKED``).
 
 State machine::
 
@@ -54,6 +62,8 @@ def enqueue(session: AsyncSession, *, type: str, payload: dict[str, Any], max_at
 
 async def claim_job(session: AsyncSession, worker_id: str) -> Job | None:
     """Atomically take the oldest runnable job. Commits the claim."""
+    # 핵심: FOR UPDATE로 행을 잠그고, SKIP LOCKED로 다른 워커가 잠근 행은 기다리지 않고 건너뛴다.
+    # 같은 트랜잭션에서 running으로 바꾼 뒤 커밋하므로, 한 작업은 정확히 한 워커만 가져간다.
     stmt = (
         select(Job)
         .where(Job.status == "queued", Job.run_after <= func.now())

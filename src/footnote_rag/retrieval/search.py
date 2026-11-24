@@ -1,4 +1,12 @@
-"""pgvector cosine search, always scoped to one organization's ready documents."""
+"""pgvector cosine 벡터 검색. 항상 한 조직의 ``ready`` 문서로 범위를 제한한다.
+
+역할: 질문 벡터와 가까운 청크 top_k개를 cosine 거리순으로 찾고 점수(1 - 거리)를 붙인다.
+주요 요소: ``search_chunks``, ``RetrievedChunk``.
+호출 관계: ``answering.service.retrieve``가 호출한다. HNSW 인덱스는 alembic/versions/0001_initial.py에서 만든다.
+학습 문서: docs/study/05-rag-retrieval.md (테넌트 필터와 hnsw.iterative_scan)
+
+pgvector cosine search, always scoped to one organization's ready documents.
+"""
 
 from __future__ import annotations
 

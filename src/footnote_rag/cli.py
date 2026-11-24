@@ -1,4 +1,12 @@
-"""Command line tools.
+"""명령줄 도구(seed, dart-find, dart-fetch, dart-import).
+
+역할: 첫 조직·관리자 생성, 접수번호 찾기, 원문 ZIP 받아 목차 출력(파서 확인용), 가져오기 작업 등록.
+주요 요소: ``cmd_seed``, ``cmd_dart_find``, ``cmd_dart_fetch``, ``cmd_dart_import``, ``build_parser``.
+호출 관계: ``orgs.service``, ``dart.service.find_reports``(``GET /dart/reports``와 공유), ``jobs.handlers.load_dart_zip``,
+``documents.service.request_dart_import``(API와 같은 서비스 함수)를 호출한다.
+학습 문서: docs/study/07-dart-integration.md (dart-fetch로 실제 구조 확인)
+
+Command line tools.
 
 python -m footnote_rag.cli seed --org "Demo" --admin-email a@example.com --admin-password ...
 python -m footnote_rag.cli dart-find --stock-codes 005930,035420,005380 --from 20260101 --to 20260531
@@ -45,30 +53,22 @@ async def cmd_seed(args: argparse.Namespace) -> int:
 
 
 async def cmd_dart_find(args: argparse.Namespace) -> int:
-    from footnote_rag.dart.corp_codes import CorpCodeCache
-    from footnote_rag.jobs.handlers import dart_cache_dir
-    from footnote_rag.providers import make_dart_client
+    from footnote_rag.dart.service import find_reports
 
     s = get_settings()
-    client = make_dart_client(s)
-    cache_path = dart_cache_dir(s.dart_dir, client) / "corp_codes.json"
-    cache = CorpCodeCache(client, cache_path, s.dart_corp_code_ttl_days)
     print(f"# OpenDART mode: {s.dart_mode}", file=sys.stderr)
     print("corp_name\tstock_code\treport_nm\trcept_no\trcept_dt")
-    found = 0
-    for stock_code in [c.strip() for c in args.stock_codes.split(",") if c.strip()]:
-        try:
-            corp = await cache.by_stock_code(stock_code)
-        except KeyError:
-            print(f"# stock_code {stock_code} not found in corpCode list", file=sys.stderr)
-            continue
-        reports = await client.list_reports(
-            corp_code=corp.corp_code, bgn_de=args.date_from, end_de=args.date_to, detail=args.detail
+    stock_codes = [c.strip() for c in args.stock_codes.split(",") if c.strip()]
+    reports, not_found, _mode = await find_reports(
+        s, stock_codes, args.date_from, args.date_to, args.detail
+    )
+    for stock_code in not_found:
+        print(f"# stock_code {stock_code} not found in corpCode list", file=sys.stderr)
+    for r in reports:
+        print(
+            f"{r['corp_name']}\t{r['stock_code']}\t{r['report_nm']}\t{r['rcept_no']}\t{r['rcept_dt']}"
         )
-        for r in reports:
-            found += 1
-            print(f"{r.corp_name}\t{stock_code}\t{r.report_nm}\t{r.rcept_no}\t{r.rcept_dt}")
-    print(f"# {found} report(s) (pblntf_detail_ty={args.detail})", file=sys.stderr)
+    print(f"# {len(reports)} report(s) (pblntf_detail_ty={args.detail})", file=sys.stderr)
     return 0
 
 

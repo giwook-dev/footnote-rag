@@ -1,4 +1,11 @@
-"""Human review queue (reviewer / admin).
+"""사람 검토(HITL) 대기열 엔드포인트(reviewer / admin).
+
+역할: 상태별 답변 목록을 보여 주고, ``pending_review`` 답변을 승인·거절한다.
+주요 요소: ``list_reviews``(``GET /reviews``), ``decide``(``POST /reviews/{answer_id}``, 조건부 UPDATE).
+호출 관계: ``auth.deps.require_role(REVIEWERS)``로 보호되고 ``audit.service.record``를 같은 트랜잭션에서 부른다.
+학습 문서: docs/study/08-review-audit-usage.md
+
+Human review queue (reviewer / admin).
 
 A decision is a single conditional UPDATE (``... WHERE status = 'pending_review'``), so
 when two reviewers decide at the same time exactly one row update wins; the loser sees
@@ -95,6 +102,8 @@ async def decide(
 ) -> DecisionOut:
     new_status = "approved" if body.decision == "approve" else "rejected"
     org_id, user_id = user.org_id, user.id  # stable even if the session rolls back
+    # 조건부 UPDATE 한 번: WHERE에 status='pending_review'를 넣어 "읽고 나서 쓰기" 경쟁을 없앤다.
+    # 동시에 결정하면 먼저 행을 바꾼 요청만 1행을 받고, 나머지는 0행 → 아래에서 409(또는 404).
     result = await session.execute(
         update(Answer)
         .where(

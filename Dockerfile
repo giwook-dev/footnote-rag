@@ -8,6 +8,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
+# src includes the build-free web UI (src/footnote_rag/web/static) served at /ui
 COPY src ./src
 COPY alembic ./alembic
 COPY alembic.ini ./

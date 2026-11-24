@@ -1,4 +1,11 @@
-"""Authentication / authorization dependencies.
+"""인증·인가 FastAPI 의존성.
+
+역할: Bearer 토큰을 검증하고 DB에서 사용자를 다시 읽어(토큰의 org_id와 대조) 현재 사용자를 만든다.
+주요 요소: ``get_current_user``(401), ``require_role``(403), 역할 묶음 ``ANY_MEMBER``·``REVIEWERS``·``ADMINS``.
+호출 관계: 모든 보호된 라우터가 ``Depends(require_role(...))``로 쓰고, 이 모듈은 ``auth.security``를 부른다.
+학습 문서: docs/study/03-auth-rbac-isolation.md
+
+Authentication / authorization dependencies.
 
 401 = missing or invalid credentials, 403 = authenticated but role not allowed.
 The current user's ``org_id`` scopes every query; cross-org lookups return 404.
