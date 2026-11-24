@@ -150,7 +150,17 @@ async def test_cli_dart_find_prints_reports(capsys, settings, monkeypatch, tmp_p
 
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     args = cli.build_parser().parse_args(
-        ["dart-find", "--stock-codes", "990001,990003", "--from", "20260101", "--to", "20260531"]
+        [
+            "dart-find",
+            "--stock-codes",
+            "990001,990003",
+            "--from",
+            "20260101",
+            "--to",
+            "20260531",
+            "--detail",
+            "F001",
+        ]
     )
     assert await cli.cmd_dart_find(args) == 0
     out = capsys.readouterr().out

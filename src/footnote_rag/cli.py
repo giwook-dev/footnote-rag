@@ -1,9 +1,11 @@
-"""명령줄 도구(seed, dart-find, dart-fetch, dart-import).
+"""명령줄 도구(seed, dart-find, dart-fetch, dart-import, dart-reprocess).
 
-역할: 첫 조직·관리자 생성, 접수번호 찾기, 원문 ZIP 받아 목차 출력(파서 확인용), 가져오기 작업 등록.
-주요 요소: ``cmd_seed``, ``cmd_dart_find``, ``cmd_dart_fetch``, ``cmd_dart_import``, ``build_parser``.
+역할: 첫 조직·관리자 생성, 접수번호 찾기(기본 A001 사업보고서), 원문 ZIP 받아 목차 출력(파서 확인용),
+가져오기 작업 등록, 이미 가져온 문서의 재처리 작업 등록(파서 변경 뒤 다시 파싱).
+주요 요소: ``cmd_seed``, ``cmd_dart_find``, ``cmd_dart_fetch``, ``cmd_dart_import``, ``cmd_dart_reprocess``,
+``build_parser``.
 호출 관계: ``orgs.service``, ``dart.service.find_reports``(``GET /dart/reports``와 공유), ``jobs.handlers.load_dart_zip``,
-``documents.service.request_dart_import``(API와 같은 서비스 함수)를 호출한다.
+``documents.service.request_dart_import``·``request_reprocess``(API와 같은 서비스 함수)를 호출한다.
 학습 문서: docs/study/07-dart-integration.md (dart-fetch로 실제 구조 확인)
 
 Command line tools.
@@ -12,6 +14,7 @@ python -m footnote_rag.cli seed --org "Demo" --admin-email a@example.com --admin
 python -m footnote_rag.cli dart-find --stock-codes 005930,035420,005380 --from 20260101 --to 20260531
 python -m footnote_rag.cli dart-fetch --rcept-no 20260310000123   # download + print outline
 python -m footnote_rag.cli dart-import --org-admin-email a@example.com --rcept-no 2026...,2026...
+python -m footnote_rag.cli dart-reprocess --org-admin-email a@example.com (--rcept-no 2026...,... | --all)
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import asyncio
 import sys
 
 from footnote_rag.config import get_settings
+from footnote_rag.dart.client import DEFAULT_DETAIL, REPORT_DETAILS
 from footnote_rag.observability import configure_logging
 
 
@@ -113,6 +117,61 @@ async def cmd_dart_import(args: argparse.Namespace) -> int:
     return rc
 
 
+async def cmd_dart_reprocess(args: argparse.Namespace) -> int:
+    from sqlalchemy import select
+
+    from footnote_rag.db.models import Document
+    from footnote_rag.db.session import dispose_engine, get_sessionmaker
+    from footnote_rag.documents.service import (
+        DocumentBusyError,
+        DocumentNotFoundError,
+        request_reprocess,
+    )
+    from footnote_rag.orgs.service import get_user_by_email
+
+    rc = 0
+    async with get_sessionmaker()() as session:
+        user = await get_user_by_email(session, args.org_admin_email)
+        if user is None or user.role != "admin":
+            print("admin user not found", file=sys.stderr)
+            await dispose_engine()
+            return 1
+        org_id = user.org_id
+        query = select(Document.source_ref, Document.id).where(
+            Document.org_id == org_id, Document.source == "dart"
+        )
+        if args.all:
+            rows = list((await session.execute(query.order_by(Document.created_at))).all())
+            targets = [(r.source_ref, r.id) for r in rows]
+        else:
+            wanted = [r.strip() for r in args.rcept_no.split(",") if r.strip()]
+            found = dict(
+                (await session.execute(query.where(Document.source_ref.in_(wanted)))).all()
+            )
+            targets = [(r, found.get(r)) for r in wanted]
+        await session.commit()  # end the read-only transaction; keeps `user` loaded
+        for rcept_no, document_id in targets:
+            if document_id is None:
+                print(f"{rcept_no}	not found", file=sys.stderr)
+                rc = 1
+                continue
+            try:
+                result = await request_reprocess(session, user=user, document_id=document_id)
+            except DocumentNotFoundError:
+                print(f"{rcept_no}	not found", file=sys.stderr)
+                rc = 1
+                continue
+            except DocumentBusyError as exc:
+                print(f"{rcept_no}	skipped: document is {exc}", file=sys.stderr)
+                rc = 1
+                continue
+            print(f"{rcept_no}	queued	document={document_id}	job={result.job_id}")
+        if not targets:
+            print("no DART documents to reprocess", file=sys.stderr)
+    await dispose_engine()
+    return rc
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="footnote_rag.cli")
     sub = p.add_subparsers(dest="command", required=True)
@@ -122,11 +181,19 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument("--admin-email", required=True)
     seed.add_argument("--admin-password", required=True)
 
-    find = sub.add_parser("dart-find", help="list audit reports for stock codes")
+    find = sub.add_parser("dart-find", help="list annual/audit reports for stock codes")
     find.add_argument("--stock-codes", required=True)
     find.add_argument("--from", dest="date_from", required=True)
     find.add_argument("--to", dest="date_to", required=True)
-    find.add_argument("--detail", default="F001", help="F001 audit report, F002 consolidated")
+    find.add_argument(
+        "--detail",
+        default=DEFAULT_DETAIL,
+        choices=sorted(REPORT_DETAILS),
+        help=(
+            "pblntf_detail_ty (default A001): A001 annual report — listed companies include their "
+            "audited statements and notes here; F001 audit report; F002 consolidated audit report"
+        ),
+    )
 
     fetch = sub.add_parser("dart-fetch", help="download a filing into data/dart and print outline")
     fetch.add_argument("--rcept-no", required=True)
@@ -134,6 +201,15 @@ def build_parser() -> argparse.ArgumentParser:
     imp = sub.add_parser("dart-import", help="queue DART import jobs (same service as the API)")
     imp.add_argument("--org-admin-email", required=True)
     imp.add_argument("--rcept-no", required=True)
+
+    rep = sub.add_parser(
+        "dart-reprocess",
+        help="re-parse already imported DART documents (same service as the API, cached ZIPs)",
+    )
+    rep.add_argument("--org-admin-email", required=True)
+    target = rep.add_mutually_exclusive_group(required=True)
+    target.add_argument("--rcept-no", help="comma separated receipt numbers")
+    target.add_argument("--all", action="store_true", help="every DART document of the org")
     return p
 
 
@@ -142,6 +218,7 @@ COMMANDS = {
     "dart-find": cmd_dart_find,
     "dart-fetch": cmd_dart_fetch,
     "dart-import": cmd_dart_import,
+    "dart-reprocess": cmd_dart_reprocess,
 }
 
 

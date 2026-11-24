@@ -14,7 +14,7 @@
 <section id="login-view" class="login" hidden>
   <form id="login-form" class="card login-card">
     <div class="logo logo-lg">footnote<span>-rag</span></div>
-    <p class="note">DART 감사보고서 각주형 RAG 시연 화면</p>
+    <p class="note">DART 사업보고서·감사보고서 각주형 RAG 시연 화면</p>
     <label for="login-email">이메일</label>
     <input id="login-email" name="username" type="email" autocomplete="username" required>
     <label for="login-password">비밀번호</label>
@@ -46,7 +46,7 @@
     <section id="panel-documents" class="panel" role="tabpanel" aria-labelledby="tab-documents">
       <div class="card">
         <div class="card-head">
-          <h2>DART 감사보고서 검색</h2>
+          <h2>DART 보고서 검색</h2>
           <span class="note">종목코드로 OpenDART 공시 목록을 찾습니다</span>
         </div>
         <form id="dart-search-form" class="stack">
@@ -68,6 +68,7 @@
             <input id="dart-date-to" name="date_to" type="text" inputmode="numeric" size="9" maxlength="8" pattern="\d{8}" value="20260531" required>
             <label for="dart-detail">보고서 종류</label>
             <select id="dart-detail" name="detail">
+              <option value="A001" selected>A001 사업보고서(상장사 — 감사받은 재무제표·주석 포함)</option>
               <option value="F001">F001 감사보고서</option>
               <option value="F002">F002 연결감사보고서</option>
             </select>
@@ -84,7 +85,8 @@
             <tbody></tbody>
           </table>
         </div>
-        <p id="dart-empty" class="note" hidden>조건에 맞는 감사보고서가 없습니다.</p>
+        <p id="dart-empty" class="note" hidden>조건에 맞는 보고서가 없습니다.</p>
+        <p id="dart-hint" class="notice" hidden></p>
       </div>
 
       <div class="card">
@@ -107,12 +109,12 @@
         <div class="table-wrap">
           <table id="docs-table">
             <thead>
-              <tr><th scope="col">제목</th><th scope="col">회사</th><th scope="col">상태</th><th scope="col">섹션 수</th><th scope="col">오류</th></tr>
+              <tr><th scope="col">제목</th><th scope="col">회사</th><th scope="col">상태</th><th scope="col">섹션 수</th><th scope="col">오류</th><th scope="col"><span class="sr-only">작업</span></th></tr>
             </thead>
             <tbody></tbody>
           </table>
         </div>
-        <p id="docs-empty" class="note" hidden>아직 가져온 문서가 없습니다. 위에서 감사보고서를 검색해 가져오세요.</p>
+        <p id="docs-empty" class="note" hidden>아직 가져온 문서가 없습니다. 위에서 사업보고서를 검색해 가져오세요.</p>
       </div>
     </section>
 
@@ -125,7 +127,7 @@
             <fieldset class="doc-picker">
               <legend class="note">대상 문서 (선택하지 않으면 전체)</legend>
               <div id="question-docs" class="docs"></div>
-              <p id="question-docs-empty" class="note" hidden>준비된(ready) 문서가 없습니다. 문서 탭에서 감사보고서를 가져오세요.</p>
+              <p id="question-docs-empty" class="note" hidden>준비된(ready) 문서가 없습니다. 문서 탭에서 사업보고서를 가져오세요.</p>
             </fieldset>
             <label for="question-text">질문</label>
             <textarea id="question-text" name="question" minlength="2" maxlength="2000" required placeholder="예: 회사는 리스부채를 어떻게 측정하나요?"></textarea>
@@ -191,6 +193,7 @@
             <option value="user.created"></option>
             <option value="dart.search"></option>
             <option value="document.dart_import_requested"></option>
+            <option value="document.reprocess_requested"></option>
             <option value="document.ingest_succeeded"></option>
             <option value="document.ingest_failed"></option>
             <option value="question.asked"></option>

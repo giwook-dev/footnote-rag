@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SYNTHETIC test fixture written by hand. Not a real DART filing.
+     It mimics the structure seen in a real 2025 annual report (A001): the notes section has its
+     own TITLE followed by one more TITLE per note number, then P paragraphs and tables.
+     "3. 연결재무제표 주석" puts the note TITLEs directly in the section; "5. 재무제표 주석" wraps
+     each note in a TABLE-GROUP (TITLE + TABLEs), which is how the real filing writes them. -->
+<DOCUMENT>
+<DOCUMENT-NAME ACODE="11011">사업보고서</DOCUMENT-NAME>
+<COMPANY-NAME AREGCIK="99000456">시험전자(합성)</COMPANY-NAME>
+<BODY>
+<COVER>
+<COVER-TITLE>사 업 보 고 서</COVER-TITLE>
+<P>(제 10 기) 사업연도 2025년 01월 01일부터 2025년 12월 31일까지</P>
+</COVER>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">I. 회사의 개요</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">1. 회사의 개요</TITLE>
+<P>회사는 합성 데이터 시험용으로 설립되었습니다.</P>
+</SECTION-2>
+</SECTION-1>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">III. 재무에 관한 사항</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">2. 연결재무제표</TITLE>
+<TABLE>
+<TR><TH>과 목</TH><TH>제 10 기</TH></TR>
+<TR><TD>리스부채</TD><TE>250</TE></TR>
+</TABLE>
+</SECTION-2>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y" ENG="3. Notes to the Consolidated Financial Statements">3. 연결재무제표 주석</TITLE>
+<P>제 10 기 2025년 12월 31일 현재</P>
+<TITLE ATOC="Y" ENG="1. General Information (Consolidated)">1. 일반적 사항 (연결)</TITLE>
+<P>가. 연결회사의 개요</P>
+<P>연결회사는 합성 부품을 제조하고 판매합니다.</P>
+<P>1. 연결대상 종속기업 현황</P>
+<TABLE>
+<TR><TH>종속기업</TH><TH>지분율</TH></TR>
+<TR><TD>합성자회사</TD><TE>100%</TE></TR>
+</TABLE>
+<TITLE ATOC="Y" ENG="12. Leases">12.  리스</TITLE>
+<P>(1) 리스부채는 리스료의 현재가치로 측정합니다.</P>
+<P>나. 단기리스</P>
+<P>단기리스에는 인식 면제를 적용하였습니다.</P>
+</SECTION-2>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y" ENG="5. Notes to the Separate Financial Statements">5. 재무제표 주석</TITLE>
+<TABLE-GROUP ACLASS="{XBRL}NT_S_D810000" ADELETETABLE="N">
+<TITLE ATOC="Y" ENG="1. General Information">1. 일반적 사항</TITLE>
+<TABLE ACLASS="NORMAL" BORDER="0"><TBODY><TR><TD><P>가. 회사의 개요</P><P>회사는 별도재무제표를 작성합니다.</P></TD></TR></TBODY></TABLE>
+</TABLE-GROUP>
+<P></P>
+<TABLE-GROUP ACLASS="{XBRL}NT_S_D832610" ADELETETABLE="N">
+<TITLE ATOC="Y" ENG="12. Leases">12. 리스</TITLE>
+<TABLE ACLASS="NORMAL" BORDER="0"><TBODY><TR><TD>리스부채는 증분차입이자율로 할인합니다.</TD></TR></TBODY></TABLE>
+<P>3. 기타</P>
+<TABLE ACLASS="NORMAL" BORDER="1"><TBODY><TR><TH>구분</TH><TH>금액</TH></TR><TR><TD>리스부채</TD><TE>50</TE></TR></TBODY></TABLE>
+</TABLE-GROUP>
+<PGBRK/>
+</SECTION-2>
+</SECTION-1>
+</BODY>
+</DOCUMENT>

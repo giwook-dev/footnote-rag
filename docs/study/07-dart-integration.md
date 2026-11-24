@@ -7,7 +7,8 @@
 - OpenDART의 세 API(corpCode, list, document)가 각각 무엇을 주고 이 저장소 어디서 쓰이는지 안다.
 - OpenDART 오류 코드와 HTTP 오류를 재시도 가능/불가로 나누는 규칙을 말할 수 있다.
 - 캐시 전략(corpCode 7일, 원문 ZIP 영구, Fake 캐시 분리)과 `crtfc_key` 마스킹을 설명할 수 있다.
-- XML → `section_path` 파싱 규칙을 안다. 그리고 **이 파서는 실제 데이터로 확인되지 않은 가정**이라는 점과 확인 방법을 정확히 말할 수 있다.
+- 상장사는 왜 감사보고서(F001)가 아니라 사업보고서(A001)를 가져오는지 설명할 수 있다.
+- XML → `section_path` 파싱 규칙(주석 소제목 `TITLE` 포함)을 알고, 실제 원문으로 무엇을 확인했는지 말할 수 있다.
 
 ## 개념
 
@@ -23,8 +24,10 @@
 | API | 용도 | 코드 | 결과 |
 | --- | --- | --- | --- |
 | `corpCode.xml` | 전체 회사 목록 ZIP | `src/footnote_rag/dart/client.py::HttpDartClient.download_corp_codes` → `src/footnote_rag/dart/corp_codes.py::parse_corp_code_zip` | 상장사(종목코드 있음)만 `CorpInfo`로 |
-| `list.json` | 공시 목록 검색 | `src/footnote_rag/dart/client.py::HttpDartClient.list_reports` | `pblntf_ty=F`, `pblntf_detail_ty=F001`(감사보고서)/`F002`(연결감사보고서), `last_reprt_at=Y`, 100건씩 모든 페이지 |
+| `list.json` | 공시 목록 검색 | `src/footnote_rag/dart/client.py::HttpDartClient.list_reports` | `pblntf_detail_ty=A001`(사업보고서, 기본)/`F001`(감사보고서)/`F002`(연결감사보고서), `pblntf_ty`는 코드의 첫 글자(`src/footnote_rag/dart/client.py::pblntf_ty_for`: A001 → `A`, F001/F002 → `F`), `last_reprt_at=Y`, 100건씩 모든 페이지 |
 | `document.xml` | 공시 원문 ZIP | `src/footnote_rag/dart/client.py::HttpDartClient.download_document` | ZIP 바이트. ZIP이 아니면 오류 본문으로 해석 |
+
+**왜 A001이 기본인가**: 실제 키로 조회해 보니(2026-11-24) 삼성전자·NAVER·현대자동차 모두 F001/F002 결과가 0건이었다. 상장사는 감사받은 재무제표·주석·감사의견을 정기공시인 사업보고서(A001)에 넣어 공시한다. 그래서 `DartClient`, `src/footnote_rag/dart/service.py::find_reports`, `GET /dart/reports`, `cli dart-find`, 웹 화면 모두 A001이 기본이다([ADR 0006](../adr/0006-annual-report-a001.md)).
 
 모든 호출은 `src/footnote_rag/dart/client.py::HttpDartClient._get`을 지난다. 여기서 `crtfc_key`를 쿼리에 붙이고, 로그에는 마스킹한 URL만 남기며, HTTP·네트워크 오류를 분류한다.
 
@@ -87,29 +90,33 @@ def classify_status(code: str, message: str = "") -> DartError:
 4. **목차 경로** (`_walk`): `SECTION-1/2/3…` 안의 `TITLE`이 경로 한 단계가 된다. 자간이 벌어진 제목(`재 무 상 태 표`)은 붙인다(`src/footnote_rag/dart/parser.py::normalize_title`). `COVER`는 `COVER-TITLE`(없으면 "표지")을 경로로 쓴다.
 5. **투명 컨테이너**: `LIBRARY`처럼 제목 없이 하위 `SECTION-n`을 품은 태그는 경로를 늘리지 않고 통과한다.
 6. **표**: `TABLE > TR > TH/TD/TE/TU`를 행마다 `셀 | 셀 | 셀` 한 줄로 바꾼다(`_table_text`). 빈 행은 버린다.
-7. **주석 번호 제목 승격**: 제목에 "주석"이 들어간 섹션 안에서 `12. 리스`처럼 짧은 번호 문단은 하위 목차가 된다(`src/footnote_rag/dart/parser.py::is_note_heading`). `(1)`, `1)` 하위 항목, `1.5` 같은 숫자, `…다.`/`…음`/`…함`으로 끝나는 문장은 제목으로 보지 않는다.
-8. **텍스트 없음**: 추출된 텍스트가 하나도 없으면 `DartParseError`(재시도 불가).
+7. **주석 소제목(`TITLE`)**: 제목에 "주석"이 들어간 섹션 안에서, 섹션 자신의 첫 `TITLE` 뒤에 나오는 `TITLE`은 주석 소제목이다. 새 하위 목차(`… > 3. 연결재무제표 주석 > 1. 일반적 사항 (연결)`)를 시작하고, 소제목 텍스트는 본문에 넣지 않는다. 실제 사업보고서는 주석마다 `TABLE-GROUP` 안에 `TITLE`과 본문 `TABLE`을 두므로, `TITLE`을 직접 자식으로 가진 컨테이너는 펼쳐서 같은 규칙을 적용한다(`src/footnote_rag/dart/parser.py::_notes_children`).
+8. **주석 번호 문단 승격(대체 규칙)**: 그 주석 섹션에 `TITLE` 소제목이 하나도 없을 때만 `12. 리스`처럼 짧은 번호 문단이 하위 목차가 된다(`src/footnote_rag/dart/parser.py::is_note_heading`). 두 규칙이 섞여 이중으로 승격되지 않게 하기 위해서다. `(1)`, `1)` 하위 항목, `1.5` 같은 숫자, `…다.`/`…음`/`…함`으로 끝나는 문장은 제목으로 보지 않는다. "가.", "나." 수준은 나누지 않는다.
+9. **텍스트 없음**: 추출된 텍스트가 하나도 없으면 `DartParseError`(재시도 불가).
 
-### 중요: 이 파서는 가정이다
+### 실제 원문으로 확인한 것
 
-**실제 OpenDART 원문을 아직 한 건도 받지 못했다.** 작업 환경에서 `OPENDART_API_KEY`가 인식되지 않아 실제 모드가 `MissingKeyError`로 중단됐다([docs/data-sources.md](../data-sources.md)). 따라서 위 규칙은 OpenDART 원문 XML의 알려진 형식을 기준으로 작성한 **가정**이고, 다음 두 합성 데이터로만 검증했다.
+2026-11-24에 삼성전자 2025 사업보고서(`20260310002820`)를 `cli dart-fetch`로 받아 확인했다([docs/data-sources.md](../data-sources.md)).
 
-- `tests/fixtures/synthetic_audit_report.xml`: 중첩 목차, `LIBRARY`, 표, 주석 번호 문단, `SECTION-3`을 담은 손으로 만든 XML.
-- `src/footnote_rag/dart/fake_data.py::build_document_xml`: Fake 모드용 합성 감사보고서. 회사명에 `(합성)`, corp_code는 `99`로 시작한다.
+- ZIP: 본문 `20260310002820.xml`과 첨부 `_00760.xml`, `_00761.xml`. 본문만 파싱한다.
+- 기존 파서로 46개 섹션이 나왔지만 `3. 연결재무제표 주석`(약 156,000자)과 `5. 재무제표 주석`(약 135,000자)이 통째로 한 섹션이었다. 주석 소제목이 `TABLE-GROUP` 안의 `TITLE`이었기 때문이다.
+- 7번 규칙을 넣은 뒤 연결 주석 34개, 별도 주석 32개 하위 목차로 나뉘어 110개 섹션이 됐다.
 
-**실제 데이터로 확인하는 방법** (키를 `.env`에 넣은 뒤):
+테스트는 실제 원문을 커밋하지 않고 같은 구조를 흉내 낸 합성 데이터로 한다.
+
+- `tests/fixtures/synthetic_annual_report.xml`: 사업보고서 주석의 `TITLE` 소제목(직접 자식과 `TABLE-GROUP` 안 두 형태).
+- `tests/fixtures/synthetic_audit_report.xml`: 중첩 목차, `LIBRARY`, 표, 주석 번호 문단(대체 규칙), `SECTION-3`.
+- `src/footnote_rag/dart/fake_data.py::build_document_xml`: Fake 모드용 합성 사업보고서·감사보고서. 회사명에 `(합성)`, corp_code는 `99`로 시작한다.
+
+**직접 확인하는 방법** (키를 `.env`에 넣은 뒤):
 
 ```bash
 python -m footnote_rag.cli dart-find --stock-codes 005930,035420,005380 \
-  --from 20260101 --to 20260531 --detail F001
-python -m footnote_rag.cli dart-fetch --rcept-no <위에서 찾은 rcept_no>
+  --from 20260101 --to 20260531 --detail A001
+python -m footnote_rag.cli dart-fetch --rcept-no 20260310002820
 ```
 
-`src/footnote_rag/cli.py::cmd_dart_fetch`는 원문 ZIP을 `data/dart/`에 캐시하고 섹션마다 `[글자 수] 목차 경로`를 출력한다. 확인할 것:
-- 경로가 `(첨부)재무제표 > 주석 > 12. 리스`처럼 의미 있게 나오는가, 아니면 "본문" 하나로 뭉치는가.
-- 주석 제목이 `TITLE`이나 표 셀로 되어 있어 승격 규칙이 놓치지 않는가(ADR 0004 "한계").
-- 첨부 XML에 필요한 내용이 있지 않은가.
-- 다르면 파서와 [docs/data-sources.md](../data-sources.md)의 표를 실제 구조에 맞춰 고친다.
+`src/footnote_rag/cli.py::cmd_dart_fetch`는 원문 ZIP을 `data/dart/`에 캐시하고 섹션마다 `[글자 수] 목차 경로`를 출력한다. 파서를 바꾼 뒤 이미 가져온 문서는 `POST /documents/{id}/reprocess`(admin) 또는 `src/footnote_rag/cli.py::cmd_dart_reprocess`로 다시 처리한다. 둘 다 `src/footnote_rag/documents/service.py::request_reprocess`를 쓰고, 원문 ZIP 캐시를 재사용한다.
 
 ## 왜 이렇게 했나 / 대안 / 한계와 개선 방향
 
@@ -121,18 +128,19 @@ python -m footnote_rag.cli dart-fetch --rcept-no <위에서 찾은 rcept_no>
 **대안**: DART 뷰어 PDF 파싱(공식 API 없음, 스크래핑 필요), 뷰어 HTML 스크래핑(비공식, 구조 변경에 취약), 재무제표 수치 API만 사용(주석 서술이 없음). 모두 ADR 0004에서 기각했다.
 
 **한계와 개선 방향**
-- 파서 구조가 가정이다(위 참조). 실제 원문 하나로 검증하는 것이 가장 먼저 할 일이다.
-- 주석 번호 제목 인식은 휴리스틱이다.
+- 실제 원문 확인은 삼성전자 사업보고서 한 건으로 했다. 다른 회사·연도의 구조 차이는 `dart-fetch`로 계속 확인해야 한다.
+- 주석 번호 문단 승격(대체 규칙)은 휴리스틱이다. "가./나." 수준은 나누지 않는다.
+- 사업보고서의 재무 외 섹션(임원 현황 등)도 검색 대상에 들어간다.
 - 이미지·차트 안의 정보는 추출하지 않는다(`IMG` 등은 건너뜀).
 - OpenDART 일일 요청 한도를 관리하는 클라이언트 측 레이트 리미터는 없다. 020을 받으면 작업 큐의 백오프에 맡긴다.
 - `HttpDartClient`는 요청마다 `httpx.AsyncClient`를 새로 만든다. 요청 수가 많아지면 연결 재사용이 이득일 수 있다(측정하지 않음).
 
 ## 확인 질문
 
-1. 종목코드 `005930`으로 감사보고서 목록을 얻기까지 어떤 API를 어떤 순서로 부르나?
+1. 종목코드 `005930`으로 사업보고서 목록을 얻기까지 어떤 API를 어떤 순서로 부르나?
    <details><summary>답</summary>
 
-   `corpCode.xml`로 회사 목록을 받아(또는 7일 캐시) 종목코드 → `corp_code`를 찾고, `list.json`에 `corp_code`, 기간, `pblntf_ty=F`, `pblntf_detail_ty=F001`을 넣어 접수번호 목록을 받는다. `src/footnote_rag/cli.py::cmd_dart_find`가 이 순서다.
+   `corpCode.xml`로 회사 목록을 받아(또는 7일 캐시) 종목코드 → `corp_code`를 찾고, `list.json`에 `corp_code`, 기간, `pblntf_ty=A`, `pblntf_detail_ty=A001`을 넣어 접수번호 목록을 받는다(F001이면 `pblntf_ty=F`). `src/footnote_rag/cli.py::cmd_dart_find`가 이 순서다.
    </details>
 
 2. 원문 다운로드에서 014가 오면 작업과 문서는 어떻게 되나? 020이면?
@@ -141,10 +149,10 @@ python -m footnote_rag.cli dart-fetch --rcept-no <위에서 찾은 rcept_no>
    014는 재시도 불가라 작업과 문서가 바로 `failed`가 된다(`tests/test_jobs.py::test_non_retryable_dart_error_fails_job_and_document_immediately`). 020은 재시도 가능이라 작업은 백오프 후 `queued`, 문서도 `queued`로 돌아간다(`tests/test_jobs.py::test_retryable_dart_error_requeues_document`).
    </details>
 
-3. 이 파서가 실제 삼성전자 감사보고서에서 잘 동작한다고 말할 수 있나?
+3. 삼성전자 감사보고서를 F001로 검색하면 왜 0건이고, 주석은 어떻게 나뉘나?
    <details><summary>답</summary>
 
-   말할 수 없다. 실제 원문을 받지 못했고 합성 픽스처로만 검증했다. `cli dart-fetch`로 실제 원문의 목차를 출력해 확인해야 한다.
+   상장사는 감사받은 재무제표·주석을 사업보고서(A001)에 넣어 공시하기 때문이다. 사업보고서의 주석 섹션은 주석마다 `TABLE-GROUP` 안에 `TITLE` 소제목이 있어, 파서가 이를 하위 목차로 만든다(삼성전자 기준 연결 34개, 별도 32개). 실제 확인은 `cli dart-fetch` 출력으로 했다.
    </details>
 
 4. `crtfc_key`가 로그에 남지 않게 하는 장치 세 가지는?

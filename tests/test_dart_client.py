@@ -108,7 +108,7 @@ async def test_list_reports_paginates_and_handles_no_data():
         return httpx.Response(200, json=pages[params["page_no"]])
 
     reports = await _client(handler).list_reports(
-        corp_code="00000001", bgn_de="20260101", end_de="20260531"
+        corp_code="00000001", bgn_de="20260101", end_de="20260531", detail="F001"
     )
     assert [r.rcept_no for r in reports] == ["20260310000001", "20260310000002"]
 
@@ -122,6 +122,47 @@ async def test_list_reports_paginates_and_handles_no_data():
             corp_code="x", bgn_de="1", end_de="2"
         )
     assert exc.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    ("detail", "pblntf_ty"), [(None, "A"), ("A001", "A"), ("F001", "F"), ("F002", "F")]
+)
+async def test_list_reports_pblntf_ty_follows_detail(detail, pblntf_ty):
+    seen: list[dict[str, str]] = []
+
+    def handler(request):
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, json={"status": "000", "total_page": 1, "list": []})
+
+    kwargs = {} if detail is None else {"detail": detail}
+    await _client(handler).list_reports(
+        corp_code="00126380", bgn_de="20260101", end_de="20260531", **kwargs
+    )
+    assert len(seen) == 1
+    assert seen[0]["pblntf_ty"] == pblntf_ty
+    assert seen[0]["pblntf_detail_ty"] == (detail or "A001")  # A001 is the default
+
+
+async def test_list_reports_rejects_unknown_detail_without_a_request():
+    def handler(request):
+        raise AssertionError("no request expected")
+
+    with pytest.raises(ValueError):
+        await _client(handler).list_reports(
+            corp_code="x", bgn_de="20260101", end_de="20260531", detail="F003"
+        )
+
+
+async def test_fake_client_returns_annual_reports_by_default():
+    fake = FakeDartClient()
+    corp = fake_data.FAKE_CORPS[0]["corp_code"]
+    annual = await fake.list_reports(corp_code=corp, bgn_de="20260101", end_de="20260531")
+    audit = await fake.list_reports(
+        corp_code=corp, bgn_de="20260101", end_de="20260531", detail="F001"
+    )
+    assert [r.report_nm for r in annual] == ["사업보고서 (2025.12)"]
+    assert [r.report_nm for r in audit] == ["감사보고서 (2025.12)"]
+    assert annual[0].rcept_no != audit[0].rcept_no
 
 
 def _item(rcept_no: str) -> dict:
