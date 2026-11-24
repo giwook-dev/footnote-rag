@@ -10,6 +10,9 @@
   const FOOTNOTE_MARK = /\[(\d+)\]/;
   const REVIEWER_ROLES = ["reviewer", "admin"];
   const BUSY_STATUSES = ["queued", "processing"];
+  const REPROCESSABLE_STATUSES = ["ready", "failed"];
+  const AUDIT_REPORT_DETAILS = ["F001", "F002"];
+  const ANNUAL_REPORT_HINT = "상장사는 감사보고서를 사업보고서(A001)에 포함해 공시합니다.";
 
   const state = {
     user: null,
@@ -239,7 +242,7 @@
       $(id).querySelector("tbody").replaceChildren();
     }
     $("dart-results").hidden = true;
-    for (const id of ["dart-not-found", "dart-empty", "mode-badge", "review-count"]) {
+    for (const id of ["dart-not-found", "dart-empty", "dart-hint", "mode-badge", "review-count"]) {
       $(id).hidden = true;
     }
     $("history-empty").hidden = false;
@@ -388,6 +391,35 @@
     schedulePoll();
   }
 
+  const isAdmin = () => state.user !== null && state.user.role === "admin";
+
+  // admin에게만, ready/failed 문서에만 보인다. 권한 판단은 서버(403)가 한다.
+  function reprocessButton(d) {
+    if (!isAdmin() || !REPROCESSABLE_STATUSES.includes(d.status)) return null;
+    const button = el("button", {
+      className: "small",
+      text: "다시 처리",
+      attrs: { type: "button", "aria-label": `${d.title || "문서"} 다시 처리` },
+    });
+    button.addEventListener("click", guard(() => reprocessDocument(d, button)));
+    return button;
+  }
+
+  async function reprocessDocument(d, button) {
+    const ok = window.confirm(
+      `"${d.title || "문서"}"를 다시 처리할까요? 기존 청크를 지우고 원문을 다시 파싱·임베딩합니다.`,
+    );
+    if (!ok) return;
+    button.disabled = true;
+    try {
+      await api(`/documents/${encodeURIComponent(d.id)}/reprocess`, { method: "POST" });
+      showAlert("다시 처리를 시작했습니다. 워커가 처리하면 상태가 ready로 바뀝니다.", "success");
+      await loadDocuments(); // 상태가 queued가 되어 자동 새로고침이 다시 시작된다
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   function renderDocuments() {
     const tbody = $("docs-table").querySelector("tbody");
     tbody.replaceChildren(
@@ -399,6 +431,7 @@
           el("td", {}, [statusBadge(d.status)]),
           el("td", { text: fmtInt(d.section_count) }),
           el("td", { className: error ? "error" : "", text: error || "" }),
+          el("td", {}, [reprocessButton(d)]),
         ]);
       }),
     );
@@ -450,11 +483,12 @@
       showAlert("종목코드를 하나 이상 입력하세요.");
       return;
     }
+    const detail = $("dart-detail").value;
     const params = new URLSearchParams({
       stock_codes: codes.join(","),
       date_from: $("dart-date-from").value.trim(),
       date_to: $("dart-date-to").value.trim(),
-      detail: $("dart-detail").value,
+      detail,
     });
     setBusy($("dart-search-btn"), $("dart-search-spinner"), true);
     try {
@@ -473,7 +507,16 @@
       } else {
         box.hidden = true;
       }
-      $("dart-empty").hidden = state.dartReports.length > 0;
+      const empty = state.dartReports.length === 0;
+      $("dart-empty").hidden = !empty;
+      const hint = $("dart-hint");
+      if (empty && AUDIT_REPORT_DETAILS.includes(detail)) {
+        hint.textContent = ANNUAL_REPORT_HINT;
+        hint.hidden = false;
+      } else {
+        hint.textContent = "";
+        hint.hidden = true;
+      }
       renderDartResults();
     } finally {
       setBusy($("dart-search-btn"), $("dart-search-spinner"), false);

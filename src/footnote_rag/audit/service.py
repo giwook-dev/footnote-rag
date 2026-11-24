@@ -34,6 +34,7 @@ class Actions:
     DART_SEARCH = "dart.search"
     DART_IMPORT_REQUESTED = "document.dart_import_requested"
     TEXT_UPLOADED = "document.text_uploaded"
+    REPROCESS_REQUESTED = "document.reprocess_requested"
     INGEST_SUCCEEDED = "document.ingest_succeeded"
     INGEST_FAILED = "document.ingest_failed"
     INGEST_RETRY_SCHEDULED = "document.ingest_retry_scheduled"

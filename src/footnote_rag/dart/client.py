@@ -1,8 +1,9 @@
 """OpenDART API 클라이언트(Protocol 뒤의 HTTP 실제 구현과 합성 데이터 Fake).
 
-역할: ``list.json``(공시 목록, 페이지 반복), ``document.xml``(원문 ZIP), ``corpCode.xml``(고유번호 ZIP)을 호출하고,
+역할: ``list.json``(공시 목록, 페이지 반복. ``pblntf_ty``는 종류 코드의 첫 글자: A001→A, F001/F002→F), ``document.xml``(원문 ZIP), ``corpCode.xml``(고유번호 ZIP)을 호출하고,
 OpenDART ``status`` 코드와 HTTP 오류를 재시도 가능/불가 ``DartError``로 분류한다. 로그 URL의 ``crtfc_key``는 가린다.
-주요 요소: ``DartClient``, ``HttpDartClient``, ``FakeDartClient``, ``classify_status``, ``parse_error_body``.
+주요 요소: ``DartClient``, ``HttpDartClient``, ``FakeDartClient``, ``classify_status``, ``parse_error_body``,
+``REPORT_DETAILS``(A001 사업보고서 기본, F001, F002), ``pblntf_ty_for``.
 호출 관계: ``providers.make_dart_client``가 만들고 ``jobs.handlers``, ``dart.corp_codes``, ``cli``가 쓴다.
 학습 문서: docs/study/07-dart-integration.md
 
@@ -34,6 +35,24 @@ from footnote_rag.observability import get_logger, mask_url
 log = get_logger(__name__)
 
 RETRYABLE_CODES = frozenset({"020", "800", "900"})
+
+# pblntf_detail_ty codes this service searches. Listed companies file their audited financial
+# statements and notes inside the annual report (A001); F001/F002 are mostly non-listed filers.
+REPORT_DETAILS: dict[str, str] = {
+    "A001": "사업보고서",
+    "F001": "감사보고서",
+    "F002": "연결감사보고서",
+}
+DEFAULT_DETAIL = "A001"
+
+
+def pblntf_ty_for(detail: str) -> str:
+    """``pblntf_ty`` is the first letter of the detail code: A001 -> A, F001/F002 -> F."""
+    if detail not in REPORT_DETAILS:
+        raise ValueError(f"unsupported pblntf_detail_ty: {detail}")
+    return detail[0]
+
+
 NON_RETRYABLE_CODES = frozenset({"010", "011", "012", "013", "014", "901"})
 
 
@@ -79,7 +98,7 @@ class DartReport:
 
 class DartClient(Protocol):
     async def list_reports(
-        self, *, corp_code: str, bgn_de: str, end_de: str, detail: str = "F001"
+        self, *, corp_code: str, bgn_de: str, end_de: str, detail: str = DEFAULT_DETAIL
     ) -> list[DartReport]: ...
 
     async def download_document(self, rcept_no: str) -> bytes: ...
@@ -147,7 +166,7 @@ class HttpDartClient:
         return response
 
     async def list_reports(
-        self, *, corp_code: str, bgn_de: str, end_de: str, detail: str = "F001"
+        self, *, corp_code: str, bgn_de: str, end_de: str, detail: str = DEFAULT_DETAIL
     ) -> list[DartReport]:
         reports: list[DartReport] = []
         page_no = 1
@@ -158,7 +177,7 @@ class HttpDartClient:
                     "corp_code": corp_code,
                     "bgn_de": bgn_de,
                     "end_de": end_de,
-                    "pblntf_ty": "F",
+                    "pblntf_ty": pblntf_ty_for(detail),
                     "pblntf_detail_ty": detail,
                     "last_reprt_at": "Y",
                     "page_no": page_no,
@@ -213,11 +232,12 @@ class FakeDartClient:
         self.download_calls: list[str] = []
 
     async def list_reports(
-        self, *, corp_code: str, bgn_de: str, end_de: str, detail: str = "F001"
+        self, *, corp_code: str, bgn_de: str, end_de: str, detail: str = DEFAULT_DETAIL
     ) -> list[DartReport]:
+        pblntf_ty_for(detail)  # same validation as the HTTP client
         return [
             DartReport(**r)
-            for r in self._fake_data.FAKE_REPORTS
+            for r in self._fake_data.reports_for(detail)
             if r["corp_code"] == corp_code and bgn_de <= r["rcept_dt"] <= end_de
         ]
 

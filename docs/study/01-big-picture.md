@@ -17,7 +17,7 @@
 
 그래서 이 서비스는 다음을 한다.
 
-1. OpenDART에서 감사보고서 원문을 접수번호([rcept_no](glossary.md#rcept_no))로 가져와 목차 경로([section_path](glossary.md#section_path))별로 나누고 벡터로 저장한다.
+1. OpenDART에서 감사보고서(상장사는 감사받은 재무제표·주석이 들어 있는 사업보고서 A001) 원문을 접수번호([rcept_no](glossary.md#rcept_no))로 가져와 목차 경로([section_path](glossary.md#section_path))별로 나누고 벡터로 저장한다.
 2. 질문이 오면 관련 조각([청크](glossary.md#청킹))을 찾아 Claude에게 근거로 주고, Claude의 [Citations](glossary.md#citations) 기능이 돌려주는 인용 위치를 문장별 각주 `[1]`, `[2]`로 바꾼다.
 3. 근거가 약하면 바로 공개하지 않고 사람 검토([HITL](glossary.md#hitl)) 대기열로 보낸다.
 

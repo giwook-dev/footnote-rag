@@ -1,8 +1,10 @@
-"""문서·작업 엔드포인트(``POST /documents/dart``, ``POST /documents/upload``, ``GET /documents``, ``GET /jobs/{id}``).
+"""문서·작업 엔드포인트(``POST /documents/dart``, ``POST /documents/upload``, ``GET /documents``,
+``POST /documents/{id}/reprocess``, ``GET /jobs/{id}``).
 
 역할: 요청을 검증(``rcept_no`` 14자리)하고 서비스에 넘기며, 처음 요청은 202, 중복 요청은 200을 돌려준다.
-주요 요소: ``import_dart``, ``upload_text``, ``list_documents``, ``get_document``, ``get_job``.
-호출 관계: ``documents.service``의 ``request_dart_import``·``create_text_upload``를 호출한다.
+재처리는 admin만(403), 같은 조직 문서만(404), queued/processing이 아닐 때만(409) 202로 받는다.
+주요 요소: ``import_dart``, ``upload_text``, ``list_documents``, ``get_document``, ``reprocess_document``, ``get_job``.
+호출 관계: ``documents.service``의 ``request_dart_import``·``create_text_upload``·``request_reprocess``를 호출한다.
 학습 문서: docs/study/02-request-walkthrough.md
 
 /documents and /jobs endpoints.
@@ -19,15 +21,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from footnote_rag.auth.deps import ANY_MEMBER, require_role
+from footnote_rag.auth.deps import ADMINS, ANY_MEMBER, require_role
 from footnote_rag.config import get_settings
 from footnote_rag.db.models import Document, Job, User
 from footnote_rag.db.session import get_session
 from footnote_rag.documents.service import (
+    DocumentBusyError,
+    DocumentNotFoundError,
     InvalidRceptNoError,
     UploadRejectedError,
     create_text_upload,
     request_dart_import,
+    request_reprocess,
 )
 
 router = APIRouter(tags=["documents"])
@@ -42,6 +47,11 @@ class ImportOut(BaseModel):
     job_id: uuid.UUID | None
     status: str
     duplicate: bool = False
+
+
+class ReprocessOut(BaseModel):
+    document_id: uuid.UUID
+    job_id: uuid.UUID
 
 
 class DocumentOut(BaseModel):
@@ -139,6 +149,32 @@ async def get_document(
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
+
+
+@router.post(
+    "/documents/{document_id}/reprocess",
+    response_model=ReprocessOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        404: {"description": "No such document in your organization"},
+        409: {"description": "The document is queued or processing"},
+    },
+)
+async def reprocess_document(
+    document_id: uuid.UUID,
+    user: User = Depends(require_role(*ADMINS)),
+    session: AsyncSession = Depends(get_session),
+) -> ReprocessOut:
+    """Re-run ingestion (parse, chunk, embed) for a ready/failed document. Admin only."""
+    try:
+        result = await request_reprocess(session, user=user, document_id=document_id)
+    except DocumentNotFoundError:
+        raise HTTPException(status_code=404, detail="Document not found") from None
+    except DocumentBusyError as exc:
+        raise HTTPException(
+            status_code=409, detail=f"Document is {exc} and cannot be reprocessed now"
+        ) from None
+    return ReprocessOut(document_id=result.document.id, job_id=result.job_id)
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)

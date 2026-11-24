@@ -79,3 +79,44 @@ def test_app_js_builds_footnote_markers_from_text_and_checks_dart_prefix():
     assert 'const DART_URL_PREFIX = "https://dart.fss.or.kr/";' in js
     assert '"noopener noreferrer"' in js
     assert "sessionStorage" in js and "localStorage" not in js
+
+
+def test_report_kind_defaults_to_a001_annual_report():
+    html = _read("index.html")
+    select = re.search(r'<select id="dart-detail"[^>]*>(.*?)</select>', html, re.DOTALL)
+    assert select, "report kind <select> is missing"
+    options = re.findall(r"<option\b([^>]*)>(.*?)</option>", select.group(1))
+    assert [re.search(r'value="([^"]+)"', a).group(1) for a, _ in options] == [
+        "A001",
+        "F001",
+        "F002",
+    ]
+    first_attrs, first_label = options[0]
+    assert "selected" in first_attrs
+    assert first_label == "A001 사업보고서(상장사 — 감사받은 재무제표·주석 포함)"
+    assert all("selected" not in a for a, _ in options[1:])
+
+
+def test_zero_audit_report_results_show_annual_report_hint_via_text_content():
+    html = _read("index.html")
+    js = _read("app.js")
+    assert re.search(r'<p id="dart-hint" class="notice" hidden></p>', html)
+    assert '"상장사는 감사보고서를 사업보고서(A001)에 포함해 공시합니다."' in js
+    assert 'const AUDIT_REPORT_DETAILS = ["F001", "F002"];' in js
+    assert "hint.textContent = ANNUAL_REPORT_HINT;" in js
+    assert re.search(r"if \(empty && AUDIT_REPORT_DETAILS\.includes\(detail\)\)", js)
+
+
+def test_reprocess_button_is_admin_only_for_ready_or_failed_documents():
+    js = _read("app.js")
+    assert 'const REPROCESSABLE_STATUSES = ["ready", "failed"];' in js
+    assert 'const isAdmin = () => state.user !== null && state.user.role === "admin";' in js
+    assert "if (!isAdmin() || !REPROCESSABLE_STATUSES.includes(d.status)) return null;" in js
+    assert '"다시 처리"' in js
+    assert "window.confirm(" in js
+    # After the request the list is reloaded, which restarts polling for the queued document.
+    body = js[js.index("async function reprocessDocument") :]
+    body = body[: body.index("\n  }\n")]
+    assert "/reprocess`" in body and 'method: "POST"' in body
+    assert body.index("window.confirm(") < body.index("await api(")
+    assert "await loadDocuments();" in body

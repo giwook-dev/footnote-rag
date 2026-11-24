@@ -2,53 +2,71 @@
 
 ## 대상 공시
 
-삼성전자(005930), NAVER(035420), 현대자동차(005380)의 **2025 사업연도 감사보고서**(`pblntf_detail_ty=F001`).
+삼성전자(005930), NAVER(035420), 현대자동차(005380)의 **2025 사업연도 사업보고서**(`pblntf_detail_ty=A001`).
 
-| 회사 | report_nm | rcept_no | rcept_dt | DART 뷰어 |
-| --- | --- | --- | --- | --- |
-| | | | | |
+| 회사 | stock_code | report_nm | rcept_no | rcept_dt | DART 뷰어 |
+| --- | --- | --- | --- | --- | --- |
+| 삼성전자 | 005930 | 사업보고서 (2025.12) | 20260310002820 | 20260310 | [보기](https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260310002820) |
+| NAVER | 035420 | 사업보고서 (2025.12) | 20260313001021 | 20260313 | [보기](https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260313001021) |
+| 현대자동차 | 005380 | 사업보고서 (2025.12) | 20260318001394 | 20260318 | [보기](https://dart.fss.or.kr/dsaf001/main.do?rcpNo=20260318001394) |
 
-**표가 비어 있는 이유: 아직 실제로 조회하지 못했습니다.** 접수번호는 지어내지 않습니다.
+- 조회일: 2026-11-24. 실제 `OPENDART_API_KEY`로 `dart-find`를 실행해 얻은 값입니다.
+- 링크 형식: `https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}`.
 
-- 조회 시도: 2026-11-24
-- 실패 사유: 작업 환경의 `.env`에서 `OPENDART_API_KEY`가 인식되지 않았습니다(비어 있거나 없음). 실제 모드로 실행하면 `MissingKeyError: OPENDART_API_KEY is required when the provider is 'real'`로 중단됩니다. 키 값 자체는 확인·출력하지 않았습니다.
-- 재현 명령(키를 `.env`에 넣은 뒤):
+### 왜 감사보고서(F001/F002)가 아니라 사업보고서(A001)인가
+
+- 같은 날 같은 기간으로 F001(감사보고서)·F002(연결감사보고서)를 조회하면 세 회사 모두 **0건**이었습니다.
+- 상장사는 외부감사인의 감사보고서를 별도 공시(`pblntf_ty=F`)로 내지 않습니다. 감사받은 (연결)재무제표와 주석, 감사의견은 정기공시인 **사업보고서**(`pblntf_ty=A`, `pblntf_detail_ty=A001`) 안에 들어 있습니다. F001/F002로 별도 공시되는 것은 주로 비상장 외부감사 대상 회사의 감사보고서입니다.
+- 그래서 검색·가져오기의 기본 종류를 A001로 바꿨습니다(→ [ADR 0006](adr/0006-annual-report-a001.md)). F001/F002 검색은 비상장사용으로 남겨 두었습니다. 웹 화면은 F001/F002 검색 결과가 0건이면 "상장사는 감사보고서를 사업보고서(A001)에 포함해 공시합니다."라고 안내합니다.
+
+재현 명령(키를 `.env`에 넣은 뒤):
 
 ```bash
-python -m footnote_rag.cli dart-find \
-  --stock-codes 005930,035420,005380 --from 20260101 --to 20260531 --detail F001
-# 연결감사보고서가 필요하면 --detail F002
-python -m footnote_rag.cli dart-fetch --rcept-no <위에서 찾은 rcept_no>   # 원문 ZIP 캐시 + 목차 확인
+python -m footnote_rag.cli dart-find   --stock-codes 005930,035420,005380 --from 20260101 --to 20260531   # --detail A001이 기본값
+python -m footnote_rag.cli dart-fetch --rcept-no 20260310002820   # 원문 ZIP 캐시 + 목차 확인
 ```
 
-조회되면 위 표에 `dart-find` 출력의 회사명, report_nm, rcept_no, rcept_dt를 그대로 옮기고, 링크는 `https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}` 형식으로 적습니다.
+PowerShell에서는 쉼표로 구분한 종목코드를 따옴표로 감싸야 합니다(`--stock-codes "005930,035420,005380"`). 따옴표가 없으면 PowerShell이 배열로 해석하면서 앞자리 0이 사라집니다.
 
 ## 수집 방법
 
 1. `corpCode.xml`(ZIP)을 받아 종목코드 → 고유번호(corp_code)를 찾습니다. `data/dart/corp_codes.json`에 7일 캐시합니다(상장사만 저장).
-2. `list.json`에 `corp_code`, 기간, `pblntf_ty=F`, `pblntf_detail_ty=F001`, `last_reprt_at=Y`(최종 보고서만)를 넣어 접수번호를 찾습니다. 여러 페이지면 모두 읽습니다. `013`(데이터 없음)은 빈 목록으로 처리합니다.
+2. `list.json`에 `corp_code`, 기간, `pblntf_ty`(종류 코드의 첫 글자: A001 → `A`, F001/F002 → `F`), `pblntf_detail_ty`(기본 `A001`), `last_reprt_at=Y`(최종 보고서만)를 넣어 접수번호를 찾습니다. 여러 페이지면 모두 읽습니다. `013`(데이터 없음)은 빈 목록으로 처리합니다.
 3. `document.xml?rcept_no=`로 원문 ZIP을 받아 `data/dart/{rcept_no}.zip`에 저장하고, 있으면 재사용합니다. ZIP 대신 JSON/XML 오류 본문이 오면 `status` 코드로 분류합니다.
 4. 원문 XML을 목차 경로별 섹션으로 파싱하고(→ [ADR 0004](adr/0004-opendart-xml-over-pdf.md)), 청킹·임베딩 후 pgvector에 저장합니다.
 
 요청 URL은 로그에 남기되 `crtfc_key`는 `***`로 마스킹합니다. httpx 자체 요청 로그는 꺼 두었습니다.
 
-## 파서가 가정한 원문 구조 (실제 확인 필요)
+## 파서가 처리하는 원문 구조 (실제 확인)
 
-실제 ZIP을 받지 못해 아래 구조는 **OpenDART 원문 XML의 알려진 형식에 따른 가정**입니다. 합성 픽스처(`tests/fixtures/synthetic_audit_report.xml`, `dart/fake_data.py`)로만 검증했습니다.
+2026-11-24에 삼성전자 2025 사업보고서(`20260310002820`) 원문 ZIP을 받아 확인했습니다. 원문은 커밋하지 않았고, 테스트는 이 구조를 흉내 낸 합성 픽스처(`tests/fixtures/synthetic_annual_report.xml`, `tests/fixtures/synthetic_audit_report.xml`, `dart/fake_data.py`)로 합니다.
+
+| 확인 항목 | 실제 내용 |
+| --- | --- |
+| ZIP 구성 | `20260310002820.xml`(본문, 약 8.3MB), `20260310002820_00760.xml`, `20260310002820_00761.xml`(첨부). 본문만 파싱합니다. |
+| 본문 목차 | 기존 파서로 46개 섹션(`I. 회사의 개요 > 1. 회사의 개요` … `XII. 상세표 > 4. 연구개발실적(상세)`) |
+| 주석 섹션 | `III. 재무에 관한 사항 > 3. 연결재무제표 주석`(약 156,000자), `> 5. 재무제표 주석`(약 135,000자). 기존 파서는 각각 한 섹션으로 뭉쳤습니다. |
+| 주석 소제목 | 주석 `SECTION-2`의 제목 `TITLE` 뒤에 주석 번호마다 `TABLE-GROUP`이 있고, 그 첫 자식이 `<TITLE ATOC="Y" ENG="1. General Information (Consolidated)">1. 일반적 사항 (연결)</TITLE>`입니다. 본문은 같은 `TABLE-GROUP` 안의 `TABLE` 셀(`가. 연결회사의 개요 …`)에 있습니다. |
+| 개선 후 | 연결 주석 34개, 별도 주석 32개 하위 목차로 나뉘어 본문 110개 섹션. 예: `… > 3. 연결재무제표 주석 > 16. 우발부채와 약정사항 (연결)`, `… > 5. 재무제표 주석 > 12. 차입금` |
+
+파서 규칙:
 
 | 요소 | 처리 |
 | --- | --- |
 | `DOCUMENT-NAME` | 보고서명(문서 제목 일부) |
 | `COMPANY-NAME`(`AREGCIK` 속성) | 회사명, corp_code |
 | `BODY` | 본문 시작점 |
-| `COVER` / `COVER-TITLE` | 표지 섹션(`감사보고서`) |
-| `SECTION-1/2/3…` + `TITLE` | 목차 경로. 자간이 벌어진 제목(`재 무 상 태 표`)은 붙여 씀 |
+| `COVER` / `COVER-TITLE` | 표지 섹션(`사업보고서`) |
+| `SECTION-1/2/3…` + 첫 `TITLE` | 목차 경로. 자간이 벌어진 제목(`재 무 상 태 표`)은 붙여 씀 |
 | `LIBRARY` 등 제목 없는 컨테이너 | 투명하게 통과 |
 | `P`, `SPAN` 등 | 본문 텍스트 |
 | `TABLE` > `TR` > `TH/TD/TE/TU` | 행 단위 `셀 | 셀` |
-| 주석 섹션의 `12. 리스` 같은 짧은 번호 문단 | 하위 목차로 승격 |
+| 주석 섹션(제목에 "주석") 안의 추가 `TITLE` | 주석 소제목. 새 하위 목차(`… 주석 > 1. 일반적 사항 (연결)`)를 시작하고, 소제목 텍스트는 본문에 넣지 않음. 첫 소제목 앞 본문은 주석 섹션 경로에 남음 |
+| 주석 섹션 안의 `TITLE`을 가진 컨테이너(`TABLE-GROUP`) | 펼쳐서 위 규칙을 그대로 적용 |
+| 주석 섹션의 `12. 리스` 같은 짧은 번호 문단 | 그 주석 섹션에 `TITLE` 소제목이 하나도 없을 때만 하위 목차로 승격(이중 승격 방지) |
+| `가.`, `나.` 수준 제목 | 나누지 않음 |
 
-실제 원문을 받으면 `dart-fetch` 출력으로 목차를 확인하고, 다르면 실제 구조에 맞춰 파서와 이 표를 고쳐야 합니다.
+파서를 바꾼 뒤 이미 가져온 문서는 웹 화면의 **다시 처리** 버튼(admin), `POST /documents/{document_id}/reprocess`, 또는 `python -m footnote_rag.cli dart-reprocess`로 다시 파싱합니다. 원문 ZIP 캐시를 재사용하므로 다시 내려받지 않습니다.
 
 ## 원문을 커밋하지 않는 이유
 
@@ -59,7 +77,7 @@ python -m footnote_rag.cli dart-fetch --rcept-no <위에서 찾은 rcept_no>   #
 
 ## Eval 데이터셋 상태
 
-`evals/dataset.jsonl`에는 형식 예시 행(`"_example": true`) 3개만 있습니다. 실제 보고서를 받지 못해 질문과 근거 인용을 만들 수 없었기 때문입니다(문서 내용을 추측해 만들지 않음). 실제 보고서를 받은 뒤 할 일:
+`evals/dataset.jsonl`에는 형식 예시 행(`"_example": true`) 3개만 있습니다. 질문과 근거 인용은 문서 내용을 추측해 만들지 않고, 실제 사업보고서를 파싱한 텍스트에서 별도 작업으로 작성합니다. 할 일:
 
 1. `dart-fetch`로 세 보고서를 받아 목차와 텍스트를 확인합니다.
 2. 회사당 4개 이상, 답할 수 없는 질문 3개 이상, 두 회사 이상 비교 질문 2개 이상, 총 15개 이상을 작성합니다. `evidence_quote`는 파서가 뽑은 텍스트에서 그대로 복사합니다.

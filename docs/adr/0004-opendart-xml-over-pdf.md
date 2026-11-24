@@ -1,6 +1,6 @@
 # ADR 0004: 원문은 DART PDF 대신 OpenDART XML, 각주 위치는 페이지 대신 목차 경로
 
-- 상태: 채택
+- 상태: 채택 (보고서 종류 기본값과 주석 제목 규칙은 [ADR 0006](0006-annual-report-a001.md)이 고침)
 - 날짜: 2026-11-24
 
 ## 맥락
@@ -9,11 +9,11 @@
 
 ## 결정
 
-- OpenDART API만 씁니다: `corpCode.xml`(종목코드 → 고유번호, 7일 캐시), `list.json`(`pblntf_ty=F`, `pblntf_detail_ty=F001` 감사보고서 / `F002` 연결감사보고서, `last_reprt_at=Y`), `document.xml`(원문 ZIP, `data/dart/{rcept_no}.zip`에 캐시).
+- OpenDART API만 씁니다: `corpCode.xml`(종목코드 → 고유번호, 7일 캐시), `list.json`(`pblntf_detail_ty=A001` 사업보고서(기본, 상장사) / `F001` 감사보고서 / `F002` 연결감사보고서, `pblntf_ty`는 코드의 첫 글자, `last_reprt_at=Y` → [ADR 0006](0006-annual-report-a001.md)), `document.xml`(원문 ZIP, `data/dart/{rcept_no}.zip`에 캐시).
 - 원문 XML의 `SECTION-n` + `TITLE` 구조로 **목차 경로**(`section_path`)를 만들고, 각주 위치를 페이지 번호 대신 목차 경로로 표시합니다. 예: `(첨부)재무제표 > 주석 > 12. 리스`.
 - 파서(`dart/parser.py`)는 순수 함수이며 `lxml`(`recover=True`)로 파싱하고 XML 선언의 인코딩(UTF-8/EUC-KR)을 따릅니다. 선언이 없으면 UTF-8, 실패하면 CP949로 읽습니다.
 - 표(`TABLE/TR/TH/TD/TE/TU`)는 행마다 `셀 | 셀 | 셀` 한 줄로 바꿉니다. 청킹이 행 경계에서 자르므로 표 행이 쪼개지지 않습니다.
-- "주석" 섹션 안의 짧은 번호 문단(`12. 리스`)은 하위 목차로 승격합니다. `(1)`, `1)` 같은 하위 항목과 `…다.`로 끝나는 문장은 제목으로 보지 않습니다.
+- "주석" 섹션 안의 추가 `TITLE`(실제 사업보고서의 주석 소제목)은 하위 목차가 됩니다([ADR 0006](0006-annual-report-a001.md)). 그런 `TITLE`이 없는 주석 섹션에서만 짧은 번호 문단(`12. 리스`)을 하위 목차로 승격합니다. `(1)`, `1)` 같은 하위 항목과 `…다.`로 끝나는 문장은 제목으로 보지 않습니다.
 - ZIP의 본문 XML은 `{rcept_no}.xml`, 없으면 가장 큰 XML입니다. **첨부 XML(예: 외부감사 실시내용)은 포함하지 않습니다.** 감사의견·재무제표·주석이 본문에 있고, 첨부는 감사 시간·인원 같은 행정 정보라 질의응답 근거로서 가치가 낮고 검색 잡음이 되기 때문입니다.
 - 텍스트가 하나도 없으면 `DartParseError`(재시도 불가)입니다.
 
@@ -32,6 +32,8 @@
 | 재무제표 수치 API(`fnlttSinglAcnt` 등)만 사용 | 숫자만 있고 주석 서술(회계정책, 우발부채 등)이 없음 |
 
 ## 한계 (중요)
+
+> 2026-11-24 갱신: 실제 키로 삼성전자 2025 사업보고서 원문을 받아 구조를 확인했고, 주석 소제목은 `TITLE`(주석 `TABLE-GROUP` 안)로 표현됨을 확인해 파서를 고쳤습니다([ADR 0006](0006-annual-report-a001.md), `docs/data-sources.md`). 아래는 작성 당시의 기록입니다.
 
 - **실제 원문 구조 확인을 하지 못했습니다.** 계획은 실제 ZIP 하나를 받아 태그 구조를 확인하고 파서를 맞추도록 했지만, 이번 작업 환경에서 `OPENDART_API_KEY`가 설정되어 있지 않아 다운로드하지 못했습니다(`docs/data-sources.md`). 현재 파서는 OpenDART 원문 XML의 알려진 구조(`DOCUMENT-NAME`, `COMPANY-NAME AREGCIK`, `BODY`, `COVER`, `SECTION-n`, `TITLE`, `LIBRARY`, `P`, `TABLE`)를 기준으로 작성했고 합성 픽스처로만 검증했습니다. 실제 키로 `python -m footnote_rag.cli dart-fetch --rcept-no …`를 실행해 출력 목차를 보고 파서를 맞춰야 합니다.
 - 주석 번호 제목 인식은 휴리스틱입니다. 실제 보고서에서 주석 제목이 `TITLE`이나 표 셀로 표현되면 규칙을 추가해야 합니다.

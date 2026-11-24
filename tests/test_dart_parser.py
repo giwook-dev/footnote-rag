@@ -102,6 +102,74 @@ def test_fake_zip_excludes_attachment():
     assert all("첨부(합성)" not in s.text for s in parsed.sections)
 
 
+ANNUAL_FIXTURE = Path(__file__).parent / "fixtures" / "synthetic_annual_report.xml"
+NOTES = "III. 재무에 관한 사항 > 3. 연결재무제표 주석"
+
+
+def test_annual_report_note_titles_become_sub_sections():
+    parsed = parse_document_xml(ANNUAL_FIXTURE.read_bytes())
+    sections = _by_path(parsed)
+    assert parsed.title == "시험전자(합성) 사업보고서"
+    general = sections[f"{NOTES} > 1. 일반적 사항 (연결)"]
+    lease = sections[f"{NOTES} > 12. 리스"]  # whitespace in the TITLE is normalized
+    # Paragraphs and tables up to the next TITLE belong to the sub-section.
+    assert "가. 연결회사의 개요" in general
+    assert "연결회사는 합성 부품을 제조하고 판매합니다." in general
+    assert "합성자회사 | 100%" in general
+    assert "(1) 리스부채는 리스료의 현재가치로 측정합니다." in lease
+    assert "단기리스에는 인식 면제를 적용하였습니다." in lease
+    # "가."/"나." level headings are not split.
+    assert not any(p.endswith(("가. 연결회사의 개요", "나. 단기리스")) for p in sections)
+
+
+def test_annual_report_note_title_text_is_not_duplicated_and_preamble_stays():
+    sections = _by_path(parse_document_xml(ANNUAL_FIXTURE.read_bytes()))
+    assert sections[NOTES] == "제 10 기 2025년 12월 31일 현재"
+    texts = "\n".join(sections.values())
+    assert "일반적 사항 (연결)" not in texts
+    assert "12. 리스" not in texts and "12.  리스" not in texts
+    assert "3. 연결재무제표 주석" not in texts
+
+
+def test_title_headings_take_priority_over_numbered_paragraphs():
+    sections = _by_path(parse_document_xml(ANNUAL_FIXTURE.read_bytes()))
+    # Inside a notes section with TITLE sub-headings, "1. ..." paragraphs are body text.
+    assert f"{NOTES} > 1. 연결대상 종속기업 현황" not in sections
+    assert "1. 연결대상 종속기업 현황" in sections[f"{NOTES} > 1. 일반적 사항 (연결)"]
+    # Non-notes sections are unchanged.
+    assert (
+        sections["I. 회사의 개요 > 1. 회사의 개요"]
+        == "회사는 합성 데이터 시험용으로 설립되었습니다."
+    )
+
+
+def test_table_group_note_titles_become_sub_sections():
+    """Real filings wrap each note in TABLE-GROUP > (TITLE, TABLE...) under the notes section."""
+    sections = _by_path(parse_document_xml(ANNUAL_FIXTURE.read_bytes()))
+    separate = "III. 재무에 관한 사항 > 5. 재무제표 주석"
+    assert (
+        sections[f"{separate} > 1. 일반적 사항"]
+        == "가. 회사의 개요 회사는 별도재무제표를 작성합니다."
+    )
+    lease = sections[f"{separate} > 12. 리스"].splitlines()
+    assert lease == [
+        "리스부채는 증분차입이자율로 할인합니다.",
+        "3. 기타",
+        "구분 | 금액",
+        "리스부채 | 50",
+    ]
+    assert separate not in sections  # no text before the first note
+    assert not any(p.startswith(f"{separate} > 3. 기타") for p in sections)
+
+
+def test_fake_annual_report_has_note_sub_sections():
+    rcept_no = fake_data.FAKE_ANNUAL_REPORTS[0]["rcept_no"]
+    parsed = parse_document_zip(fake_data.build_document_zip(rcept_no), rcept_no)
+    paths = [s.path for s in parsed.sections]
+    assert f"{NOTES} > 12. 리스 (연결)" in paths
+    assert f"{NOTES} > 1. 일반사항 (연결)" in paths
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

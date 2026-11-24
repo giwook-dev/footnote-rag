@@ -1,6 +1,6 @@
-"""DART 감사보고서 검색 엔드포인트 ``GET /dart/reports``(member 이상).
+"""DART 보고서 검색 엔드포인트 ``GET /dart/reports``(member 이상).
 
-역할: 종목코드(쉼표 구분, 최대 10개)·기간(YYYYMMDD)·종류(F001/F002)를 검증하고 ``find_reports``를 호출한다.
+역할: 종목코드(쉼표 구분, 최대 10개)·기간(YYYYMMDD)·종류(A001 기본/F001/F002)를 검증하고 ``find_reports``를 호출한다.
 OpenDART 오류는 재시도 가능하면 503, 아니면 502로 바꾸며, 응답에는 오류 코드와 고정된 짧은 메시지만 넣는다
 (API 키·요청 URL·OpenDART 원문 메시지는 넣지 않는다). 성공하면 ``dart.search`` 감사 로그를 남긴다.
 주요 요소: ``search_reports``, ``parse_stock_codes``, ``DartSearchOut``.
@@ -96,8 +96,12 @@ async def search_reports(
     ),
     date_from: str = Query(..., description="YYYYMMDD"),
     date_to: str = Query(..., description="YYYYMMDD"),
-    detail: Literal["F001", "F002"] = Query(
-        default="F001", description="F001 audit report, F002 consolidated audit report"
+    detail: Literal["A001", "F001", "F002"] = Query(
+        default="A001",
+        description=(
+            "A001 annual report (listed companies: audited statements and notes are here), "
+            "F001 audit report, F002 consolidated audit report"
+        ),
     ),
     user: User = Depends(require_role(*ANY_MEMBER)),
     session: AsyncSession = Depends(get_session),

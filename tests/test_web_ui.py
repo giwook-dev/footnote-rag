@@ -77,7 +77,7 @@ async def test_dart_reports_fake_mode_returns_synthetic_reports(client, make_org
     org = await make_org()
     resp = await client.get(
         "/dart/reports",
-        params={**PARAMS, "stock_codes": "990001, 990003,123456"},
+        params={**PARAMS, "stock_codes": "990001, 990003,123456", "detail": "F001"},
         headers=org.headers("member"),
     )
     assert resp.status_code == 200, resp.text
@@ -105,6 +105,30 @@ async def test_dart_reports_fake_mode_returns_synthetic_reports(client, make_org
     assert entry.metadata_["result_count"] == 2
 
 
+async def test_dart_reports_default_detail_is_a001_annual_report(client, make_org, sessionmaker):
+    org = await make_org()
+    resp = await client.get("/dart/reports", params=PARAMS, headers=org.headers("member"))
+    assert resp.status_code == 200, resp.text
+    reports = resp.json()["reports"]
+    assert len(reports) >= 1
+    assert {r["report_nm"] for r in reports} == {"사업보고서 (2025.12)"}
+    assert {r["stock_code"] for r in reports} == {"990001", "990003"}
+    async with sessionmaker() as s:
+        entry = await s.scalar(
+            select(AuditLog).where(AuditLog.org_id == org.org_id, AuditLog.action == "dart.search")
+        )
+    assert entry.metadata_["detail"] == "A001"
+
+
+async def test_dart_reports_detail_a001_explicit(client, make_org):
+    org = await make_org()
+    resp = await client.get(
+        "/dart/reports", params={**PARAMS, "detail": "A001"}, headers=org.headers("member")
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["reports"]) >= 1
+
+
 async def test_dart_reports_detail_f002_and_date_range(client, make_org):
     org = await make_org()
     resp = await client.get(
@@ -129,6 +153,9 @@ async def test_dart_reports_detail_f002_and_date_range(client, make_org):
         {"date_to": "2026053"},
         {"date_from": "20260601", "date_to": "20260101"},
         {"detail": "F003"},
+        {"detail": "A002"},
+        {"detail": "a001"},
+        {"detail": ""},
     ],
 )
 async def test_dart_reports_invalid_input_is_422(client, make_org, override):
@@ -220,11 +247,43 @@ async def test_find_reports_service_returns_reports_not_found_and_mode(
 # ---- CLI output format ----
 
 
-async def test_cli_dart_find_output_format_is_unchanged(capsys, settings, monkeypatch, tmp_path):
+async def test_cli_dart_find_default_detail_is_a001_with_same_format(
+    capsys, settings, monkeypatch, tmp_path
+):
     from footnote_rag import cli
 
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     argv = ["dart-find", "--stock-codes", "990001,000000,990003"]
+    args = cli.build_parser().parse_args([*argv, "--from", "20260101", "--to", "20260531"])
+    assert args.detail == "A001"
+    assert await cli.cmd_dart_find(args) == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "corp_name	stock_code	report_nm	rcept_no	rcept_dt",
+        "가람전자(합성)	990001	사업보고서 (2025.12)	20260310900101	20260310",
+        "다솜모터스(합성)	990003	사업보고서 (2025.12)	20260310900103	20260310",
+    ]
+    comments = [line for line in captured.err.splitlines() if line.startswith("# ")]
+    assert comments == [
+        "# OpenDART mode: fake",
+        "# stock_code 000000 not found in corpCode list",
+        "# 2 report(s) (pblntf_detail_ty=A001)",
+    ]
+
+
+def test_cli_dart_find_rejects_unknown_detail():
+    from footnote_rag import cli
+
+    argv = ["dart-find", "--stock-codes", "990001", "--from", "20260101", "--to", "20260531"]
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([*argv, "--detail", "F003"])
+
+
+async def test_cli_dart_find_output_format_is_unchanged(capsys, settings, monkeypatch, tmp_path):
+    from footnote_rag import cli
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    argv = ["dart-find", "--stock-codes", "990001,000000,990003", "--detail", "F001"]
     args = cli.build_parser().parse_args([*argv, "--from", "20260101", "--to", "20260531"])
     assert await cli.cmd_dart_find(args) == 0
     captured = capsys.readouterr()

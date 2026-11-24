@@ -1,7 +1,9 @@
 """DART 원문 XML을 목차 경로(section_path)가 붙은 섹션 목록으로 바꾸는 순수 함수.
 
-역할: ``SECTION-n``+``TITLE``로 경로를 만들고, 표는 행 단위 ``셀 | 셀``, 주석의 ``12. 리스`` 같은 문단은 하위 목차로 승격한다.
-주의: 실제 OpenDART 원문을 아직 받지 못해 아래 구조는 가정이며 합성 픽스처로만 검증했다(docs/data-sources.md).
+역할: ``SECTION-n``+``TITLE``로 경로를 만들고, 표는 행 단위 ``셀 | 셀``로 바꾼다. 주석 섹션 안에서는
+섹션 제목 뒤의 추가 ``TITLE``(실제 사업보고서의 주석 번호별 소제목)을 하위 목차로 만들고, 그런 ``TITLE``이
+없을 때만 ``12. 리스`` 같은 짧은 번호 문단을 하위 목차로 승격한다.
+구조 확인: 삼성전자 2025 사업보고서(20260310002820) 원문으로 확인한 내용은 docs/data-sources.md에 있다.
 주요 요소: ``parse_document_zip``, ``parse_document_xml``, ``pick_main_member``, ``is_note_heading``, ``normalize_title``.
 호출 관계: ``jobs.handlers.handle_import_dart``, ``cli.cmd_dart_fetch``, ``evals.validate``가 호출한다.
 학습 문서: docs/study/07-dart-integration.md
@@ -26,8 +28,15 @@ Structure handled (DART "dart3.xsd" style documents):
     </DOCUMENT>
 
 * ``SECTION-n`` + ``TITLE`` build the path (``(첨부)재무제표 > 주석``).
-* Inside a section whose title contains "주석" (notes), short numbered paragraphs such as
-  ``12. 리스`` start a sub-section, giving paths like ``... > 주석 > 12. 리스``.
+* Inside a section whose title contains "주석" (notes), every ``TITLE`` after the section's own
+  title is a note sub-heading (annual reports: ``<TITLE ATOC="Y">1. 일반적 사항 (연결)</TITLE>``)
+  and starts a sub-section: ``... > 3. 연결재무제표 주석 > 1. 일반적 사항 (연결)``. The heading
+  text is not repeated in the body; text before the first sub-heading stays on the notes path.
+  In real filings each note is a ``TABLE-GROUP`` holding that ``TITLE`` and the note's ``TABLE``
+  elements; such titled groups are flattened so the same rule applies.
+* Only when a notes section has no such ``TITLE`` sub-headings, short numbered paragraphs such
+  as ``12. 리스`` start a sub-section instead (``... > 주석 > 12. 리스``).
+* Lower-level headings ("가.", "나.") are not split.
 * Tables become one line per row: ``cell | cell | cell``.
 * Container tags without a TITLE (``LIBRARY`` etc.) are descended into transparently.
 * The main document is ``{rcept_no}.xml`` when present, otherwise the largest XML member.
@@ -59,6 +68,7 @@ def is_note_heading(text: str) -> bool:
 
 _WS_RE = re.compile(r"[ \t\r\f\v　\xa0]+")
 _TABLE_CELL_TAGS = {"TD", "TH", "TE", "TU"}
+_TABLE_LIKE_TAGS = {"TABLE", "COVER"}
 _SKIP_TAGS = {"TITLE", "COVER-TITLE", "IMG", "IMAGE", "PGBRK", "IMG-CAPTION"}
 
 
@@ -146,21 +156,61 @@ def _is_notes_title(title: str) -> bool:
     return "주석" in title
 
 
-def _walk(el: etree._Element, path: list[str], out: _Collector) -> None:
+def _is_titled_group(el: etree._Element) -> bool:
+    """A non-section container whose direct children include a ``TITLE``.
+
+    Real annual reports wrap each note in ``<TABLE-GROUP><TITLE>1. 일반적 사항 (연결)</TITLE>
+    <TABLE>…</TABLE>…</TABLE-GROUP>`` directly under the notes ``SECTION-2``.
+    """
+    tag = _tag(el)
+    if not tag or tag in _TABLE_LIKE_TAGS or _SECTION_RE.match(tag):
+        return False
+    return any(_tag(c) == "TITLE" for c in el)
+
+
+def _notes_children(el: etree._Element) -> list[etree._Element]:
+    """Children of a notes element with titled groups flattened, so a group's ``TITLE`` reads as a
+    sub-heading and its tables/paragraphs follow it in document order."""
+    flat: list[etree._Element] = []
+    for child in el:
+        if _is_titled_group(child):
+            flat.extend(_notes_children(child))
+        else:
+            flat.append(child)
+    return flat
+
+
+def _walk(el: etree._Element, path: list[str], out: _Collector, *, own_title: bool = False) -> None:
+    """Walk ``el``'s children. ``own_title``: the first ``TITLE`` child is ``el``'s own title
+    (already the last element of ``path``) and is skipped."""
     in_notes = bool(path) and _is_notes_title(path[-1])
+    own_title_el = next((c for c in el if _tag(c) == "TITLE"), None) if own_title else None
+    children = _notes_children(el) if in_notes else list(el)
+    # Notes sub-headings written as extra TITLE elements (real annual reports) take priority over
+    # the short numbered-paragraph heuristic, so the two rules never promote headings twice.
+    title_headings = in_notes and any(
+        _tag(c) == "TITLE" and c is not own_title_el for c in children
+    )
     note_heading: str | None = None
 
     def current() -> list[str]:
         return [*path, note_heading] if note_heading else path
 
-    for child in el:
+    for child in children:
         tag = _tag(child)
-        if not tag or tag in _SKIP_TAGS:
+        if not tag:
+            continue
+        if tag == "TITLE" and title_headings and child is not own_title_el:
+            heading = normalize_title(_text_of(child))
+            if heading:
+                note_heading = heading  # the heading itself is not repeated in the body text
+            continue
+        if tag in _SKIP_TAGS:
             continue
         if _SECTION_RE.match(tag):
             title_el = next((c for c in child if _tag(c) == "TITLE"), None)
             title = normalize_title(_text_of(title_el)) if title_el is not None else ""
-            _walk(child, [*path, title] if title else path, out)
+            _walk(child, [*path, title] if title else path, out, own_title=bool(title))
             continue
         if tag == "COVER":
             cover_title_el = next((c for c in child if _tag(c) == "COVER-TITLE"), None)
@@ -176,7 +226,7 @@ def _walk(el: etree._Element, path: list[str], out: _Collector) -> None:
             _walk(child, path, out)  # transparent container (LIBRARY, BODY, ...)
             continue
         text = _text_of(child)
-        if in_notes and is_note_heading(text):
+        if in_notes and not title_headings and is_note_heading(text):
             note_heading = text
             continue
         out.add(current(), text)

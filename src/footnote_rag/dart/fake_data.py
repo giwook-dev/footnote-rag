@@ -1,7 +1,10 @@
 """Fake 모드와 테스트용 합성 DART 데이터. 실제 공시가 아니다.
 
-역할: ``(합성)`` 표시가 붙은 가상 회사 3곳의 공시 목록, 원문 XML/ZIP(첨부 XML 포함), corpCode ZIP을 만든다.
-주요 요소: ``FAKE_CORPS``, ``FAKE_REPORTS``, ``build_document_xml``, ``build_document_zip``, ``build_corp_code_zip``.
+역할: ``(합성)`` 표시가 붙은 가상 회사 3곳의 공시 목록(F001 감사보고서, A001 사업보고서),
+원문 XML/ZIP(첨부 XML 포함), corpCode ZIP을 만든다. 합성 사업보고서의 주석은 실제 사업보고서처럼
+주석 번호별 소제목을 ``TITLE`` 요소로 둔다.
+주요 요소: ``FAKE_CORPS``, ``FAKE_REPORTS``, ``FAKE_ANNUAL_REPORTS``, ``reports_for``, ``build_document_xml``,
+``build_document_zip``, ``build_corp_code_zip``.
 호출 관계: ``dart.client.FakeDartClient``가 호출한다. 파서는 이 데이터와 테스트 픽스처로만 검증됐다.
 학습 문서: docs/study/07-dart-integration.md, docs/study/09-testing-and-ops.md
 
@@ -36,6 +39,26 @@ FAKE_REPORTS = [
     for i, c in enumerate(FAKE_CORPS)
 ]
 
+# A001 사업보고서: listed companies file their audited statements and notes here.
+FAKE_ANNUAL_REPORTS = [
+    {
+        "corp_name": c["corp_name"],
+        "corp_code": c["corp_code"],
+        "stock_code": c["stock_code"],
+        "report_nm": "사업보고서 (2025.12)",
+        "rcept_no": f"2026031090010{i + 1}",
+        "flr_nm": c["corp_name"],
+        "rcept_dt": "20260310",
+    }
+    for i, c in enumerate(FAKE_CORPS)
+]
+
+
+def reports_for(detail: str) -> list[dict[str, str]]:
+    """Synthetic filing list per ``pblntf_detail_ty`` (F002 shares the F001 list, as before)."""
+    return FAKE_ANNUAL_REPORTS if detail == "A001" else FAKE_REPORTS
+
+
 _NOTES: dict[str, list[tuple[str, list[str]]]] = {
     "default": [
         ("1. 일반사항", ["회사는 전자부품의 제조와 판매를 주된 사업으로 영위하고 있습니다."]),
@@ -59,14 +82,66 @@ _NOTES: dict[str, list[tuple[str, list[str]]]] = {
 
 
 def _company(rcept_no: str) -> dict[str, str]:
-    for r in FAKE_REPORTS:
+    for r in (*FAKE_REPORTS, *FAKE_ANNUAL_REPORTS):
         if r["rcept_no"] == rcept_no:
             return r
     return {"corp_name": "합성회사(합성)", "corp_code": "99999999", "report_nm": "감사보고서"}
 
 
+def _is_annual(rcept_no: str) -> bool:
+    return any(r["rcept_no"] == rcept_no for r in FAKE_ANNUAL_REPORTS)
+
+
+def _annual_report_xml(company: dict[str, str], encoding: str) -> str:
+    """Annual report (A001) shaped like the real ones: each note is a ``TABLE-GROUP`` with its own
+    ``TITLE`` (note sub-heading) and ``TABLE`` body under the notes ``SECTION-2``."""
+    name = escape(company["corp_name"])
+    notes_xml = []
+    for heading, paragraphs in _NOTES["default"]:
+        cells = "".join(f"<P>{escape(p)}</P>" for p in paragraphs)
+        notes_xml.append(
+            f'<TABLE-GROUP ADELETETABLE="N"><TITLE ATOC="Y">{escape(heading)} (연결)</TITLE>'
+            f'<TABLE ACLASS="NORMAL" BORDER="0"><TBODY><TR><TD>{cells}</TD></TR></TBODY></TABLE>'
+            "</TABLE-GROUP>"
+        )
+    return f"""<?xml version="1.0" encoding="{encoding}"?>
+<DOCUMENT>
+<DOCUMENT-NAME ACODE="11011">사업보고서</DOCUMENT-NAME>
+<COMPANY-NAME AREGCIK="{company["corp_code"]}">{name}</COMPANY-NAME>
+<BODY>
+<COVER><COVER-TITLE>사 업 보 고 서</COVER-TITLE><P>{name} (제 57 기) 사업연도 2025년 01월 01일부터 2025년 12월 31일까지</P></COVER>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">I. 회사의 개요</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">1. 회사의 개요</TITLE>
+<P>{name}는 전자부품의 제조와 판매를 주된 사업으로 영위하고 있습니다.</P>
+</SECTION-2>
+</SECTION-1>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">III. 재무에 관한 사항</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">2. 연결재무제표</TITLE>
+<TABLE><TBODY>
+<TR><TH>과 목</TH><TH>제 57 기</TH><TH>제 56 기</TH></TR>
+<TR><TD>리스부채</TD><TE>1,234</TE><TE>1,100</TE></TR>
+<TR><TU>(단위: 백만원)</TU></TR>
+</TBODY></TABLE>
+</SECTION-2>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">3. 연결재무제표 주석</TITLE>
+<P>제 57 기 2025년 12월 31일 현재</P>
+{"".join(notes_xml)}
+</SECTION-2>
+</SECTION-1>
+</BODY>
+</DOCUMENT>
+"""
+
+
 def build_document_xml(rcept_no: str, *, encoding: str = "utf-8") -> bytes:
     company = _company(rcept_no)
+    if _is_annual(rcept_no):
+        return _annual_report_xml(company, encoding).encode(encoding)
     name = escape(company["corp_name"])
     notes_xml = []
     for heading, paragraphs in _NOTES["default"]:

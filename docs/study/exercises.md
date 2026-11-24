@@ -101,18 +101,18 @@ git checkout -- src/footnote_rag/jobs/queue.py   # 반드시 되돌리기
 
 ## 실습 7. 실제 키로 DART 보고서 하나 가져와 목차 확인하기
 
-**목표**: 파서가 가정한 원문 구조가 실제와 맞는지 확인한다. 이 저장소에서 아직 아무도 하지 못한 일이다([docs/data-sources.md](../data-sources.md)).
+**목표**: 파서가 처리하는 원문 구조가 실제와 맞는지 직접 확인한다. 삼성전자 사업보고서로 확인한 결과는 [docs/data-sources.md](../data-sources.md)에 있으니, 다른 회사(NAVER `20260313001021`, 현대자동차 `20260318001394`)로 같은 확인을 해 본다.
 
 **힌트**
 - OpenDART에서 인증키를 발급받아 `.env`의 `OPENDART_API_KEY`에 넣는다. **`.env`는 절대 커밋하지 않는다.** 키 값을 터미널 출력이나 문서에 붙여 넣지 않는다.
 - 접수번호는 지어내지 말고 `dart-find` 출력에서 복사한다.
-- `dart-fetch` 출력의 목차를 [07](07-dart-integration.md)의 파싱 규칙, [docs/data-sources.md](../data-sources.md)의 "파서가 가정한 원문 구조" 표와 비교한다.
+- `dart-fetch` 출력의 목차를 [07](07-dart-integration.md)의 파싱 규칙, [docs/data-sources.md](../data-sources.md)의 "파서가 처리하는 원문 구조" 표와 비교한다. PowerShell에서는 `--stock-codes "005930,035420"`처럼 따옴표로 감싼다.
 - 확인할 것: 경로가 "본문" 하나로 뭉치지 않는가, `주석 > 12. 리스` 같은 하위 목차가 나오는가, 표가 `셀 | 셀`로 나오는가, 섹션별 글자 수가 비정상적으로 작거나 크지 않은가.
 
 **확인 방법**
 
 ```bash
-python -m footnote_rag.cli dart-find --stock-codes 005930 --from 20260101 --to 20260531 --detail F001
+python -m footnote_rag.cli dart-find --stock-codes 005930 --from 20260101 --to 20260531 --detail A001
 python -m footnote_rag.cli dart-fetch --rcept-no <dart-find에서 복사한 rcept_no>
 ```
 
