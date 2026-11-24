@@ -49,7 +49,9 @@
 
 - 문서: `src/footnote_rag/retrieval/embedder.py::VoyageEmbedder.embed_documents`가 `src/footnote_rag/retrieval/embedder.py::iter_batches`로 나눠 `input_type="document"`로 호출한다. 배치 한도는 텍스트 1,000개(`EMBED_BATCH_MAX_TEXTS`, 코드에서 1,000 초과 불가)와 추정 토큰 100,000(`EMBED_BATCH_MAX_TOKENS`). 토큰은 **문자 수 = 토큰 수**로 보수적으로 추정한다(`estimate_tokens`). 한국어는 실제 토큰보다 크게 잡혀 한도 초과를 피한다.
 - 질문: `src/footnote_rag/retrieval/embedder.py::VoyageEmbedder.embed_query`가 `input_type="query"`로 하나만 보낸다.
-- 오류: 레이트 리밋·서버·연결·타임아웃은 `EmbeddingError(retryable=True)`, 그 밖의 Voyage 오류는 `retryable=False`. 워커는 이것을 작업 재시도로, API는 503으로 바꾼다.
+- 오류: 레이트 리밋·서버·연결·타임아웃은 `EmbeddingError(retryable=True)`, 그 밖의 Voyage 오류는 `retryable=False`. 문서 배치는 먼저 그 배치만 백오프로 재시도하고(`EMBED_BATCH_MAX_RETRIES`), 다 쓰면 워커가 작업 재시도로 넘긴다. 질문 경로의 API는 503으로 바꾼다.
+- 속도 제한: `src/footnote_rag/retrieval/embedder.py::RateLimiter`는 60초 슬라이딩 윈도우로 요청 수(`EMBED_RPM_LIMIT`)와 추정 토큰(`EMBED_TPM_LIMIT`)을 세고, 넘으면 보내기 전에 기다린다. 결제 수단 미등록 Voyage 계정(3 RPM / 10K TPM)은 `3`/`9000`을 권장한다. 소요 시간은 대략 `총 추정 토큰 ÷ EMBED_TPM_LIMIT` 분이다.
+- 캐시: `src/footnote_rag/retrieval/embedding_cache.py::CachedEmbedder`가 청크 텍스트의 `sha256(model|dim|input_type|text)` 키로 `embedding_cache`를 일괄 조회해 없는 것만 보내고, 배치가 성공할 때마다 바로 커밋한다. 질문은 캐시하지 않는다. 텍스트와 조직 ID를 저장하지 않으므로 조직 간에 공유한다([ADR 0007](../adr/0007-embedding-rate-limit-and-cache.md)). 테스트: `tests/test_embedding_rate_limit_cache.py::test_second_ingest_uses_the_cache_only`.
 - Fake: `src/footnote_rag/retrieval/embedder.py::FakeEmbedder`는 단어와 글자 bigram을 해시해 벡터 칸에 ±1을 더하고 L2 정규화한다. 네트워크 없이 "비슷한 글자가 많으면 가깝다"는 성질만 흉내 낸다. 의미 검색 품질과는 무관하다.
 
 ### 3. 벡터 검색: 테넌트 필터 + iterative scan

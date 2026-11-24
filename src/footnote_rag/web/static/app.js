@@ -420,6 +420,30 @@
     }
   }
 
+  const STAGE_LABELS = { download: "다운로드", parse: "파싱", embed: "임베딩", store: "저장" };
+
+  function fmtClock(iso) {
+    const t = new Date(iso);
+    if (Number.isNaN(t.getTime())) return "";
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`;
+  }
+
+  // 상태 칸 아래 줄: "임베딩 120/700" 또는 "재시도 대기(한도 초과) — 14:03:05". textContent로만 넣는다.
+  function progressNote(d) {
+    if (d.status === "queued" && d.next_retry_at) {
+      const reason = String(d.error || "").includes("한도 초과") ? "(한도 초과)" : "";
+      const text = `재시도 대기${reason} — ${fmtClock(d.next_retry_at)}`;
+      return el("span", { className: "doc-progress retry", text });
+    }
+    const p = d.progress;
+    if (d.status !== "processing" || !p || typeof p !== "object") return null;
+    const label = STAGE_LABELS[p.stage] || String(p.stage || "");
+    const counted = p.stage === "embed" || p.stage === "store";
+    const text = counted ? `${label} ${fmtInt(p.done)}/${fmtInt(p.total)}` : `${label} 중`;
+    return el("span", { className: "doc-progress", text });
+  }
+
   function renderDocuments() {
     const tbody = $("docs-table").querySelector("tbody");
     tbody.replaceChildren(
@@ -428,7 +452,7 @@
         return el("tr", {}, [
           el("td", { text: d.title || "(제목 없음)" }),
           el("td", { text: (d.meta && d.meta.corp_name) || "—" }),
-          el("td", {}, [statusBadge(d.status)]),
+          el("td", {}, [statusBadge(d.status), progressNote(d)]),
           el("td", { text: fmtInt(d.section_count) }),
           el("td", { className: error ? "error" : "", text: error || "" }),
           el("td", {}, [reprocessButton(d)]),

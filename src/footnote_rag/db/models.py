@@ -1,9 +1,11 @@
 """SQLAlchemy ORM 모델(테이블 매핑). 스키마 생성은 Alembic 마이그레이션이 맡는다.
 
-역할: organizations, users, documents, chunks(pgvector), jobs, questions, answers, llm_calls,
-audit_logs 테이블과 상태 enum 값을 정의한다.
-주요 요소: ``Document``, ``Chunk``, ``Job``, ``Answer``, ``LlmCall``, ``AuditLog``, ``ANSWER_STATUSES`` 등.
-호출 관계: 서비스·라우터·워커가 import해 쿼리한다. 실제 DDL은 alembic/versions/0001_initial.py.
+역할: organizations, users, documents, chunks(pgvector), embedding_cache(pgvector), jobs, questions,
+answers, llm_calls, audit_logs 테이블과 상태 enum 값을 정의한다.
+주요 요소: ``Document``, ``Chunk``, ``EmbeddingCache``, ``Job``, ``Answer``, ``LlmCall``, ``AuditLog``,
+``ANSWER_STATUSES`` 등.
+호출 관계: 서비스·라우터·워커가 import해 쿼리한다. 실제 DDL은 alembic/versions/0001_initial.py,
+0002_embedding_cache.py.
 학습 문서: docs/study/01-big-picture.md, ERD는 docs/architecture.md
 
 ORM models. The schema itself is created by Alembic (see alembic/versions).
@@ -114,6 +116,23 @@ class Chunk(Base):
     embedding: Mapped[list[float]] = mapped_column(
         Vector(get_settings().embedding_dim), nullable=False
     )
+
+
+class EmbeddingCache(Base):
+    """Document embeddings keyed by ``sha256(model|dim|input_type|text)``.
+
+    Shared across organizations on purpose: it stores no text and no org id, and the same
+    public filing text yields the same vector for everyone (docs/adr/0007).
+    """
+
+    __tablename__ = "embedding_cache"
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    dim: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(get_settings().embedding_dim), nullable=False
+    )
+    created_at: Mapped[datetime] = _created_at()
 
 
 class Job(Base):

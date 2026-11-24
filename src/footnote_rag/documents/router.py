@@ -3,6 +3,7 @@
 
 역할: 요청을 검증(``rcept_no`` 14자리)하고 서비스에 넘기며, 처음 요청은 202, 중복 요청은 200을 돌려준다.
 재처리는 admin만(403), 같은 조직 문서만(404), queued/processing이 아닐 때만(409) 202로 받는다.
+문서 응답에는 최신 작업의 ``progress``와 재시도 대기 시각 ``next_retry_at``이 추가 필드로 붙는다.
 주요 요소: ``import_dart``, ``upload_text``, ``list_documents``, ``get_document``, ``reprocess_document``, ``get_job``.
 호출 관계: ``documents.service``의 ``request_dart_import``·``create_text_upload``·``request_reprocess``를 호출한다.
 학습 문서: docs/study/02-request-walkthrough.md
@@ -31,6 +32,9 @@ from footnote_rag.documents.service import (
     InvalidRceptNoError,
     UploadRejectedError,
     create_text_upload,
+    job_next_retry_at,
+    job_progress,
+    latest_jobs_for_documents,
     request_dart_import,
     request_reprocess,
 )
@@ -64,6 +68,15 @@ class DocumentOut(BaseModel):
     section_count: int
     error: str | None
     created_at: datetime
+    # Added fields (from the document's latest job); the fields above are unchanged.
+    progress: dict[str, Any] | None = Field(
+        default=None,
+        description='Latest job progress: {"stage": "download"|"parse"|"embed"|"store", '
+        '"done": int, "total": int}',
+    )
+    next_retry_at: datetime | None = Field(
+        default=None, description="When a failed attempt is waiting to retry: its run_after"
+    )
 
     model_config = {"from_attributes": True}
 
@@ -79,8 +92,18 @@ class JobOut(BaseModel):
     result: dict[str, Any] | None
     created_at: datetime
     updated_at: datetime
+    progress: dict[str, Any] | None = Field(
+        default=None, description="Same as result.progress: {stage, done, total}"
+    )
 
     model_config = {"from_attributes": True}
+
+
+def _document_out(doc: Document, job: Job | None) -> DocumentOut:
+    out = DocumentOut.model_validate(doc)
+    out.progress = job_progress(job)
+    out.next_retry_at = job_next_retry_at(job)
+    return out
 
 
 @router.post(
@@ -130,11 +153,16 @@ async def upload_text(
 async def list_documents(
     user: User = Depends(require_role(*ANY_MEMBER)),
     session: AsyncSession = Depends(get_session),
-) -> list[Document]:
-    rows = await session.scalars(
-        select(Document).where(Document.org_id == user.org_id).order_by(Document.created_at.desc())
+) -> list[DocumentOut]:
+    docs = list(
+        await session.scalars(
+            select(Document)
+            .where(Document.org_id == user.org_id)
+            .order_by(Document.created_at.desc())
+        )
     )
-    return list(rows)
+    jobs = await latest_jobs_for_documents(session, user.org_id, [d.id for d in docs])
+    return [_document_out(d, jobs.get(d.id)) for d in docs]
 
 
 @router.get("/documents/{document_id}", response_model=DocumentOut)
@@ -142,13 +170,14 @@ async def get_document(
     document_id: uuid.UUID,
     user: User = Depends(require_role(*ANY_MEMBER)),
     session: AsyncSession = Depends(get_session),
-) -> Document:
+) -> DocumentOut:
     doc = await session.scalar(
         select(Document).where(Document.id == document_id, Document.org_id == user.org_id)
     )
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    return doc
+    jobs = await latest_jobs_for_documents(session, user.org_id, [doc.id])
+    return _document_out(doc, jobs.get(doc.id))
 
 
 @router.post(
@@ -182,10 +211,12 @@ async def get_job(
     job_id: uuid.UUID,
     user: User = Depends(require_role(*ANY_MEMBER)),
     session: AsyncSession = Depends(get_session),
-) -> Job:
+) -> JobOut:
     job = await session.scalar(
         select(Job).where(Job.id == job_id, Job.payload["org_id"].astext == str(user.org_id))
     )
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    out = JobOut.model_validate(job)
+    out.progress = job_progress(job)
+    return out

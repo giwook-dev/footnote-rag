@@ -120,3 +120,17 @@ def test_reprocess_button_is_admin_only_for_ready_or_failed_documents():
     assert "/reprocess`" in body and 'method: "POST"' in body
     assert body.index("window.confirm(") < body.index("await api(")
     assert "await loadDocuments();" in body
+
+
+def test_document_status_shows_progress_and_retry_wait_via_text_content():
+    js = _read("app.js")
+    body = js[js.index("function progressNote(d)") :]
+    body = body[: body.index("function renderDocuments()")]
+    # "임베딩 120/700" and "재시도 대기(한도 초과) — 14:03:05", built with el(..., { text })
+    assert 'embed: "임베딩"' in js
+    assert "재시도 대기${reason} — ${fmtClock(d.next_retry_at)}" in body
+    assert '"(한도 초과)"' in body
+    assert "`${label} ${fmtInt(p.done)}/${fmtInt(p.total)}`" in body
+    assert body.count('el("span", { className:') == 2 and "text })" in body
+    assert 'el("td", {}, [statusBadge(d.status), progressNote(d)])' in js
+    assert ".doc-progress" in _read("style.css")

@@ -3,7 +3,8 @@
 역할: 문서 행(queued)·작업 행·감사 로그를 한 트랜잭션으로 만든다. 같은 조직의 같은 ``rcept_no``는 기존 문서를 돌려준다.
 이미 처리된(ready/failed) 문서는 같은 방식으로 다시 처리 작업을 등록할 수 있다(``request_reprocess``).
 주요 요소: ``request_dart_import``, ``create_text_upload``, ``request_reprocess``, ``ImportResult``,
-``ReprocessResult``, ``InvalidRceptNoError``, ``DocumentNotFoundError``, ``DocumentBusyError``.
+``ReprocessResult``, ``InvalidRceptNoError``, ``DocumentNotFoundError``, ``DocumentBusyError``,
+``latest_jobs_for_documents``·``job_progress``·``job_next_retry_at``(문서 응답의 진행률·재시도 대기 시각).
 호출 관계: ``documents.router``, ``cli.cmd_dart_import``·``cli.cmd_dart_reprocess``, ``evals.run``이 호출하고
 ``jobs.queue.enqueue``를 부른다.
 학습 문서: docs/study/02-request-walkthrough.md, docs/study/04-job-queue.md
@@ -20,8 +21,11 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,6 +74,40 @@ async def _latest_job_id(session: AsyncSession, document_id: uuid.UUID) -> uuid.
         .order_by(Job.created_at.desc())
         .limit(1)
     )
+
+
+async def latest_jobs_for_documents(
+    session: AsyncSession, org_id: uuid.UUID, document_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, Job]:
+    """Most recent job of each document (``DISTINCT ON`` the payload's ``document_id``)."""
+    if not document_ids:
+        return {}
+    doc_key = Job.payload["document_id"].astext
+    rows = await session.scalars(
+        select(Job)
+        .where(
+            Job.payload["org_id"].astext == str(org_id),
+            doc_key.in_([str(d) for d in document_ids]),
+        )
+        .ext(distinct_on(doc_key))
+        .order_by(doc_key, Job.created_at.desc())
+    )
+    return {uuid.UUID(job.payload["document_id"]): job for job in rows}
+
+
+def job_progress(job: Job | None) -> dict[str, Any] | None:
+    """``jobs.result.progress`` ({stage, done, total}) or None."""
+    if job is None or not isinstance(job.result, dict):
+        return None
+    progress = job.result.get("progress")
+    return progress if isinstance(progress, dict) else None
+
+
+def job_next_retry_at(job: Job | None) -> datetime | None:
+    """``run_after`` while a failed attempt waits for its retry, else None."""
+    if job is None or job.status != "queued" or job.attempts == 0:
+        return None
+    return job.run_after
 
 
 async def _find_dart_document(

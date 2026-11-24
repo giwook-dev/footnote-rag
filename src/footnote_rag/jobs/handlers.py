@@ -2,8 +2,12 @@
 
 역할: 다운로드·파싱·청킹·임베딩은 트랜잭션 밖에서 하고, 결과 저장(청크 삭제 후 재삽입, 문서 ready,
 작업 succeeded, 감사)은 한 트랜잭션으로 한다. 외부 오류를 재시도 가능/불가 작업 오류로 바꾼다.
-주요 요소: ``handle_import_dart``, ``handle_ingest_text``, ``_embed_and_store``, ``load_dart_zip``, ``HANDLERS``.
-호출 관계: ``jobs.worker.Worker``가 작업 type으로 골라 호출하고, ``dart``·``documents.chunking``·``retrieval.embedder``를 부른다.
+임베딩은 ``CachedEmbedder``를 거쳐 캐시에 없는 청크만 보내고, 성공한 배치는 바로 캐시에 커밋된다.
+진행 중에는 ``JobProgress``가 ``jobs.result.progress``(단계, done/total)를 2초 이상 간격으로 기록한다.
+주요 요소: ``handle_import_dart``, ``handle_ingest_text``, ``_embed_and_store``, ``JobProgress``,
+``load_dart_zip``, ``HANDLERS``.
+호출 관계: ``jobs.worker.Worker``가 작업 type으로 골라 호출하고, ``dart``·``documents.chunking``·
+``retrieval.embedding_cache``·``retrieval.embedder``를 부른다.
 학습 문서: docs/study/02-request-walkthrough.md, docs/study/04-job-queue.md
 
 Job handlers: ``import_dart`` and ``ingest_text``.
@@ -11,19 +15,24 @@ Job handlers: ``import_dart`` and ``ingest_text``.
 Each handler downloads/parses/chunks/embeds outside any transaction, then writes the
 result in ONE transaction: delete old chunks -> insert new chunks -> document ready ->
 job succeeded -> audit entry. Re-running a job therefore never duplicates chunks.
+Embeddings already paid for (earlier batches, earlier attempts, other documents with the
+same text) come from ``embedding_cache`` instead of the provider.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from footnote_rag.audit.service import Actions, record
@@ -40,11 +49,17 @@ from footnote_rag.documents.text_upload import (
 )
 from footnote_rag.jobs.queue import PermanentJobError, RetryableJobError, mark_succeeded
 from footnote_rag.observability import get_logger
-from footnote_rag.retrieval.embedder import Embedder, EmbeddingError
+from footnote_rag.retrieval.embedder import REDUCED_LIMITS_HINT, Embedder, EmbeddingError
+from footnote_rag.retrieval.embedding_cache import (
+    CachedEmbedder,
+    EmbeddingCacheStore,
+    PgEmbeddingCache,
+)
 
 log = get_logger(__name__)
 
 DART_VIEWER_URL = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
+PROGRESS_MIN_INTERVAL_SECONDS = 2.0
 
 
 @dataclass
@@ -53,9 +68,90 @@ class JobContext:
     settings: Settings
     embedder: Embedder
     dart_client: DartClient
+    # Document-embedding cache; None = the ``embedding_cache`` table via ``sessionmaker``.
+    embedding_cache: EmbeddingCacheStore | None = None
+
+    def cached_embedder(self) -> CachedEmbedder:
+        return CachedEmbedder(
+            self.embedder, self.embedding_cache or PgEmbeddingCache(self.sessionmaker)
+        )
 
 
 Handler = Callable[[JobContext, Job], Awaitable[dict[str, Any]]]
+
+
+class JobProgress:
+    """Write ``jobs.result.progress = {stage, done, total}`` while the job runs.
+
+    Each write is its own short transaction, at most once per ``min_interval`` seconds within a
+    stage (a stage change is written at once). The write also refreshes ``locked_at``, and
+    ``keepalive`` heartbeats during embedding, so a long, rate-limited run (retry sleeps included)
+    is not mistaken for a dead worker by stale-job recovery.
+    Progress is best effort: a failed write is logged, never fails the job.
+    """
+
+    def __init__(
+        self,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        job: Job,
+        *,
+        min_interval: float = PROGRESS_MIN_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._sessionmaker = sessionmaker
+        self._job_id = job.id
+        self._locked_by = job.locked_by
+        self._min_interval = min_interval
+        self._clock = clock
+        self._last_write: float | None = None
+        self._last_stage: str | None = None
+        self.current: dict[str, Any] | None = None
+
+    async def update(self, stage: str, done: int, total: int) -> None:
+        self.current = {"stage": stage, "done": done, "total": total}
+        now = self._clock()
+        if (
+            stage == self._last_stage
+            and self._last_write is not None
+            and now - self._last_write < self._min_interval
+        ):
+            return
+        self._last_write, self._last_stage = now, stage
+        await self._write(result={"progress": self.current}, locked_at=func.now())
+
+    async def heartbeat(self) -> None:
+        """Refresh ``locked_at`` only (used while a batch sleeps between retries)."""
+        await self._write(locked_at=func.now())
+
+    @contextlib.asynccontextmanager
+    async def keepalive(self, interval_seconds: float) -> AsyncIterator[None]:
+        """Heartbeat every ``interval_seconds`` for the duration of the block."""
+
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                await self.heartbeat()
+
+        task = asyncio.create_task(beat())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _write(self, **values: Any) -> None:
+        conditions = [Job.id == self._job_id, Job.status == "running"]
+        if self._locked_by is not None:
+            conditions.append(Job.locked_by == self._locked_by)
+        try:
+            async with self._sessionmaker() as session:
+                await session.execute(update(Job).where(*conditions).values(**values))
+                await session.commit()
+        except SQLAlchemyError as exc:
+            log.warning(
+                "job.progress_write_failed", job_id=str(self._job_id), error=type(exc).__name__
+            )
 
 
 def dart_url(rcept_no: str) -> str:
@@ -114,6 +210,7 @@ async def _embed_and_store(
     title: str | None,
     meta_update: dict[str, Any],
     audit_extra: dict[str, Any],
+    progress: JobProgress,
 ) -> dict[str, Any]:
     s = ctx.settings
     drafts = chunk_sections(
@@ -121,21 +218,43 @@ async def _embed_and_store(
     )
     if not drafts:
         raise PermanentJobError("no chunks produced")
-    try:
-        embedded = await ctx.embedder.embed_documents([d.text for d in drafts])
-    except EmbeddingError as exc:
-        if exc.retryable:
-            raise RetryableJobError(str(exc)) from None
-        raise PermanentJobError(str(exc)) from None
-    if len(embedded.vectors) != len(drafts):
-        raise RetryableJobError("embedding count mismatch")
 
+    async def on_progress(done: int, total: int) -> None:
+        await progress.update("embed", done, total)
+
+    # Rate-limit waits and batch retries can be long; keep the job's lock fresh meanwhile.
+    heartbeat_seconds = max(1.0, s.job_lock_timeout_seconds / 3)
+    try:
+        async with progress.keepalive(heartbeat_seconds):
+            embedded = await ctx.cached_embedder().embed_documents(
+                [d.text for d in drafts], on_progress=on_progress
+            )
+    except EmbeddingError as exc:
+        message = str(exc)
+        if exc.payment_method_missing:
+            message = f"{message} — {REDUCED_LIMITS_HINT}"
+        if exc.retryable:
+            raise RetryableJobError(message) from None
+        raise PermanentJobError(message) from None
+    except SQLAlchemyError as exc:
+        # embedding_cache lookup/insert failed (DB hiccup): batches already cached are kept.
+        raise RetryableJobError(f"임베딩 캐시 DB 오류({type(exc).__name__})") from None
+    if len(embedded.vectors) != len(drafts):
+        raise RetryableJobError("임베딩 개수 불일치(embedding count mismatch)")
+
+    n = len(drafts)
+    await progress.update("store", 0, n)
     result = {
         "section_count": len(sections),
-        "chunk_count": len(drafts),
+        "chunk_count": n,
         "embedding_model": ctx.embedder.model,
+        # Billable tokens only: chunks served from embedding_cache cost nothing.
         "embedding_tokens": embedded.total_tokens,
+        "embedding_cache_hits": embedded.cache_hits,
+        "embedding_cache_misses": embedded.cache_misses,
     }
+    audit_metadata = {"job_id": str(job.id), "job_type": job.type, **result, **audit_extra}
+    result["progress"] = {"stage": "store", "done": n, "total": n}
     async with ctx.sessionmaker() as session:
         doc = await session.get(Document, document_id, with_for_update=True)
         if doc is None:
@@ -167,7 +286,7 @@ async def _embed_and_store(
             actor_user_id=doc.created_by,
             target_type="document",
             target_id=doc.id,
-            metadata={"job_id": str(job.id), "job_type": job.type, **result, **audit_extra},
+            metadata=audit_metadata,
         )
         await session.commit()
     return result
@@ -195,7 +314,9 @@ async def handle_import_dart(ctx: JobContext, job: Job) -> dict[str, Any]:
     document_id = uuid.UUID(job.payload["document_id"])
     rcept_no = str(job.payload["rcept_no"])
     doc = await _mark_processing(ctx, document_id)
+    progress = JobProgress(ctx.sessionmaker, job)
 
+    await progress.update("download", 0, 1)
     try:
         content = await load_dart_zip(
             ctx.dart_client, dart_cache_dir(ctx.settings.dart_dir, ctx.dart_client), rcept_no
@@ -204,6 +325,7 @@ async def handle_import_dart(ctx: JobContext, job: Job) -> dict[str, Any]:
         if exc.retryable:
             raise RetryableJobError(str(exc)) from None
         raise PermanentJobError(str(exc)) from None
+    await progress.update("parse", 0, 1)
     try:
         parsed = parse_document_zip(content, rcept_no)
     except DartParseError as exc:
@@ -228,12 +350,15 @@ async def handle_import_dart(ctx: JobContext, job: Job) -> dict[str, Any]:
         title=parsed.title,
         meta_update=meta,
         audit_extra={"rcept_no": rcept_no},
+        progress=progress,
     )
 
 
 async def handle_ingest_text(ctx: JobContext, job: Job) -> dict[str, Any]:
     document_id = uuid.UUID(job.payload["document_id"])
     await _mark_processing(ctx, document_id)
+    progress = JobProgress(ctx.sessionmaker, job)
+    await progress.update("parse", 0, 1)
     path = ctx.settings.upload_dir / str(job.payload["stored_name"])
     if not path.exists():
         raise PermanentJobError("uploaded file is missing")
@@ -249,6 +374,7 @@ async def handle_ingest_text(ctx: JobContext, job: Job) -> dict[str, Any]:
         title=None,
         meta_update={},
         audit_extra={},
+        progress=progress,
     )
 
 

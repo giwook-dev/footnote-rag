@@ -70,11 +70,12 @@ def _database() -> None:
 
 @pytest.fixture(autouse=True)
 async def _clean_jobs() -> AsyncIterator[None]:
-    """Jobs are global (not org-scoped); keep queue tests independent."""
+    """Jobs and the embedding cache are global (not org-scoped); keep tests independent."""
     from footnote_rag.db.session import get_sessionmaker
 
     async with get_sessionmaker()() as session:
         await session.execute(text("DELETE FROM jobs"))
+        await session.execute(text("DELETE FROM embedding_cache"))
         await session.commit()
     yield
 

@@ -42,6 +42,7 @@ erDiagram
     users { uuid id PK  uuid org_id FK  text email UK  text password_hash  user_role role  bool is_active }
     documents { uuid id PK  uuid org_id FK  uuid created_by FK  text title  document_source source  text source_ref  jsonb meta  document_status status  int section_count  text error }
     chunks { uuid id PK  uuid document_id FK  uuid org_id  text section_path  int chunk_index  text text  vector embedding }
+    embedding_cache { text key PK  text model  int dim  vector embedding  timestamptz created_at }
     jobs { uuid id PK  text type  jsonb payload  job_status status  int attempts  int max_attempts  timestamptz run_after  timestamptz locked_at  text locked_by  text last_error  jsonb result }
     questions { uuid id PK  uuid org_id FK  uuid asked_by FK  text text }
     answers { uuid id PK  uuid question_id FK  uuid org_id  text text  jsonb footnotes  answer_status status  text review_reason  uuid reviewed_by  timestamptz reviewed_at  text review_comment }
@@ -51,7 +52,8 @@ erDiagram
 
 - `documents`: `UNIQUE(org_id, source, source_ref)` — 같은 조직의 같은 접수번호는 하나만 존재합니다.
 - `chunks.embedding`: `vector(EMBEDDING_DIM)`, HNSW(`vector_cosine_ops`) 인덱스와 `(org_id)` 인덱스.
-- `jobs`: 조직 컬럼 대신 `payload.org_id`를 두고 `GET /jobs/{id}`가 이 값으로 범위를 제한합니다. 수집 결과(청크 수, 임베딩 토큰)는 `result`에 저장합니다.
+- `embedding_cache`: 문서 임베딩 캐시. `key = sha256(model | dim | input_type | text)`이며 텍스트와 조직 ID는 저장하지 않습니다. 조직 간 공유 판단은 [ADR 0007](adr/0007-embedding-rate-limit-and-cache.md)을 보세요.
+- `jobs`: 조직 컬럼 대신 `payload.org_id`를 두고 `GET /jobs/{id}`가 이 값으로 범위를 제한합니다. 실행 중에는 `result.progress = {stage, done, total}`(진행률)만 담기고, claim할 때 비워집니다. 성공하면 수집 결과(청크 수, `embedding_tokens`(실제 청구 대상), `embedding_cache_hits`, `embedding_cache_misses`, 마지막 `progress`)로 바뀝니다.
 - `audit_logs`: `BEFORE UPDATE OR DELETE` 행 트리거와 `BEFORE TRUNCATE` 문장 트리거가 예외를 던집니다. 실패한 로그인처럼 조직을 알 수 없는 행은 `org_id`가 NULL입니다.
 
 ## 조직 격리
@@ -73,13 +75,26 @@ sequenceDiagram
     A->>DB: BEGIN; INSERT documents(queued), jobs(import_dart), audit_logs; COMMIT
     A-->>C: 202 {document_id, job_id}
     W->>DB: SELECT … FOR UPDATE SKIP LOCKED → running, attempts+1
+    W->>DB: progress = download (짧은 트랜잭션, 이후 단계마다 동일)
     W->>D: document.xml (data/dart/{rcept_no}.zip 캐시 우선)
     W->>W: XML 파싱 → section_path별 섹션 → 청킹(1,500자/200자 겹침)
-    W->>V: embed(input_type=document), 1,000개·토큰 한도로 배치
-    W->>DB: BEGIN; DELETE chunks; INSERT chunks; documents ready; jobs succeeded; audit; COMMIT
+    W->>DB: SELECT embedding_cache WHERE key IN (청크 키들) — 일괄 조회
+    loop 캐시에 없는 텍스트만, 1,000개·토큰 한도(min(EMBED_BATCH_MAX_TOKENS, EMBED_TPM_LIMIT))로 배치
+        W->>W: RateLimiter.acquire (60초 윈도우, EMBED_RPM_LIMIT·EMBED_TPM_LIMIT)
+        W->>V: embed(input_type=document)
+        alt 429 또는 일시 오류
+            W->>W: 같은 배치만 min(BASE × 2^n, MAX) + 지터 대기 후 재시도(최대 EMBED_BATCH_MAX_RETRIES)
+        else 성공
+            W->>DB: INSERT embedding_cache … ON CONFLICT DO NOTHING; COMMIT
+            W->>DB: progress = embed done/total (2초 이상 간격, locked_at 갱신)
+        end
+    end
+    W->>DB: BEGIN; DELETE chunks; INSERT chunks; documents ready; jobs succeeded(result); audit; COMMIT
 ```
 
-재시도 시 기존 청크를 지우고 다시 넣으므로 청크가 중복되지 않습니다.
+재시도 시 기존 청크를 지우고 다시 넣으므로 청크가 중복되지 않습니다. 배치 재시도를 다 써서 작업이 실패해도 이미 성공한 배치는 `embedding_cache`에 커밋되어 있으므로, 작업 단위 재시도나 재처리(`POST /documents/{id}/reprocess`)는 남은 청크만 Voyage로 보냅니다. 문서 응답(`GET /documents`, `GET /documents/{id}`)에는 최신 작업의 `progress`와, 재시도 대기 중이면 `next_retry_at`(그 작업의 `run_after`)이 붙습니다.
+
+`RateLimiter`는 워커 프로세스 하나 안에서만 유효합니다. 워커를 여러 개 띄우면 한도를 워커 수로 나눠 설정해야 합니다(예: 3 RPM 계정에 워커 2개 → `EMBED_RPM_LIMIT=1`).
 
 ## 질문 처리 시퀀스
 
@@ -118,7 +133,7 @@ stateDiagram-v2
     running --> succeeded: 처리 완료 (청크·문서·감사와 같은 트랜잭션)
     running --> queued: 재시도 가능 실패 & attempts < max_attempts<br/>run_after = now + 2^attempts × BASE
     running --> failed: 재시도 불가 실패 또는 attempts 소진
-    running --> queued: locked_at이 JOB_LOCK_TIMEOUT 초과 (멈춘 작업 복구)
+    running --> queued: locked_at이 JOB_LOCK_TIMEOUT 초과 (멈춘 작업 복구)<br/>진행률 기록이 locked_at을 갱신하므로 오래 걸리는 임베딩은 해당 없음
     succeeded --> [*]
     failed --> [*]
 ```
@@ -128,9 +143,10 @@ stateDiagram-v2
 | OpenDART 020(요청 한도), 800(점검), 900, HTTP 5xx/429, 네트워크 오류 | 재시도 |
 | OpenDART 010/011/012/901(키·권한), 013(데이터 없음), 014(파일 없음), HTTP 4xx | 즉시 실패 |
 | 파싱 실패(텍스트 없음, ZIP 아님) | 즉시 실패 |
-| Voyage 레이트 리밋·서버·연결 오류 | 재시도 |
+| Voyage 429(`RateLimitError`)·5xx·연결·타임아웃·`TryAgain` | 먼저 **같은 배치만** 재시도(최대 `EMBED_BATCH_MAX_RETRIES`회, 지수 백오프 + 지터). 다 쓰면 작업 단위 재시도 |
+| Voyage 그 밖의 오류(인증, 잘못된 요청 등) | 즉시 실패(배치 재시도 없음) |
 
-작업이 실패하면 `jobs.last_error`와 `documents.error`가 채워지고 문서는 `failed`(재시도 예정이면 `queued`)가 됩니다. 워커는 SIGTERM을 받으면 처리 중인 작업을 끝낸 뒤 종료합니다.
+작업이 실패하면 `jobs.last_error`와 `documents.error`가 채워지고 문서는 `failed`(재시도 예정이면 `queued`)가 됩니다. 임베딩 실패는 한국어 설명이 남습니다(예: `임베딩 제공자 요청 한도 초과(결제 수단 미등록 가능성): 배치 재시도 6회 소진 — …`). 429 메시지에 "payment method"가 있으면 워커가 프로세스당 한 번 `embedding.provider_reduced_limits` 경고를 남깁니다(키·원문은 남기지 않음). 워커는 SIGTERM을 받으면 처리 중인 작업을 끝낸 뒤 종료합니다.
 
 ## 동시성 보장
 

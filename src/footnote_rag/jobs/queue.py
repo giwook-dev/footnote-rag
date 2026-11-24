@@ -1,6 +1,7 @@
 """PostgreSQL 작업 큐(``FOR UPDATE SKIP LOCKED``).
 
-역할: 작업 등록(호출자 트랜잭션에 추가), 원자적 claim, 성공·실패 기록(지수 백오프), 멈춘 작업 복구.
+역할: 작업 등록(호출자 트랜잭션에 추가), 원자적 claim(``result`` 초기화), 성공·실패 기록(지수 백오프),
+멈춘 작업 복구. 실행 중인 작업의 ``result``에는 진행률(``progress``)만 담긴다(``jobs.handlers.JobProgress``).
 주요 요소: ``enqueue``, ``claim_job``, ``mark_succeeded``, ``mark_failed``, ``recover_stale_jobs``,
 ``backoff_seconds``, ``RetryableJobError``·``PermanentJobError``.
 호출 관계: ``documents.service``가 ``enqueue``를, ``jobs.worker.Worker``가 나머지를 호출한다.
@@ -79,6 +80,9 @@ async def claim_job(session: AsyncSession, worker_id: str) -> Job | None:
     job.attempts = job.attempts + 1
     job.locked_at = func.now()
     job.locked_by = worker_id
+    # A running job's ``result`` only carries live progress; start every attempt from scratch
+    # so a retry never shows the previous attempt's numbers.
+    job.result = None
     await session.commit()
     await session.refresh(job)
     return job
