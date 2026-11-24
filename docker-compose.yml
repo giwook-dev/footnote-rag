@@ -1,0 +1,64 @@
+# `docker compose up` works with no API keys: every provider falls back to fake mode.
+# If a .env file exists, its keys are injected at runtime (never copied into the image).
+
+x-app: &app
+  image: footnote-rag:local
+  build: .
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    DATABASE_URL: postgresql+asyncpg://footnote:footnote@db:5432/footnote
+    DATA_DIR: /app/data
+  volumes:
+    - ./data:/app/data
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: footnote
+      POSTGRES_PASSWORD: footnote
+      POSTGRES_DB: footnote
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U footnote -d footnote"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["uvicorn", "footnote_rag.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(urllib.request.urlopen('http://127.0.0.1:8000/readyz').status != 200)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "footnote_rag.jobs.worker"]
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

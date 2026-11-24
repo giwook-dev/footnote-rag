@@ -1,0 +1,22 @@
+# Secrets: keys are injected at runtime (compose env_file), never baked into the image
+.env
+.env.*
+!.env.example
+
+# Local data (DART downloads, caches, uploads)
+data/
+
+# VCS / tooling / caches
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Not needed at runtime
+tests/
+docs/
+evals/reports/
