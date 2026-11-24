@@ -115,6 +115,14 @@ class Settings(BaseSettings):
     # Conservative per-request token budget. Tokens are estimated as one per character,
     # which over-counts for Korean, so real requests stay well below Voyage's limit.
     embed_batch_max_tokens: int = 100_000
+    # Client-side rate limit (60 s sliding window, per worker process). None = unlimited.
+    # Voyage accounts without a payment method get 3 RPM / 10K TPM: use 3 / 9000.
+    embed_rpm_limit: int | None = None
+    embed_tpm_limit: int | None = None
+    # Per-batch retry on 429 / transient errors before falling back to a job-level retry.
+    embed_batch_max_retries: int = 6
+    embed_retry_base_seconds: float = 20.0
+    embed_retry_max_seconds: float = 120.0
 
     # --- retrieval / answering ---
     top_k: int = 8
@@ -154,6 +162,13 @@ class Settings(BaseSettings):
     @property
     def dart_mode(self) -> Literal["fake", "real"]:
         return self._resolve(self.dart_provider, self.opendart_api_key)
+
+    @property
+    def embed_effective_batch_max_tokens(self) -> int:
+        """Per-request token budget: never larger than the TPM limit, if one is set."""
+        if self.embed_tpm_limit:
+            return min(self.embed_batch_max_tokens, self.embed_tpm_limit)
+        return self.embed_batch_max_tokens
 
     @property
     def dart_dir(self) -> Path:

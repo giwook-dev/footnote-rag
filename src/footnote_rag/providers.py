@@ -45,7 +45,7 @@ def make_dart_client(settings: Settings | None = None) -> DartClient:
 
 
 def make_embedder(settings: Settings | None = None) -> Embedder:
-    from footnote_rag.retrieval.embedder import FakeEmbedder, VoyageEmbedder
+    from footnote_rag.retrieval.embedder import FakeEmbedder, RateLimiter, VoyageEmbedder
 
     s = settings or get_settings()
     if s.embedder_mode == "fake":
@@ -55,7 +55,12 @@ def make_embedder(settings: Settings | None = None) -> Embedder:
         model=s.embedding_model,
         dim=s.embedding_dim,
         max_texts=s.embed_batch_max_texts,
-        max_tokens=s.embed_batch_max_tokens,
+        max_tokens=s.embed_effective_batch_max_tokens,
+        # One limiter per process: with N workers, divide EMBED_RPM_LIMIT/EMBED_TPM_LIMIT by N.
+        rate_limiter=RateLimiter(rpm=s.embed_rpm_limit, tpm=s.embed_tpm_limit),
+        max_retries=s.embed_batch_max_retries,
+        retry_base_seconds=s.embed_retry_base_seconds,
+        retry_max_seconds=s.embed_retry_max_seconds,
     )
 
 

@@ -13,7 +13,7 @@ Voyage AI `voyage-4`(1,024차원, `EMBEDDING_MODEL`/`EMBEDDING_DIM`으로 변경
 
 - 문서 청크는 `input_type="document"`, 질문은 `input_type="query"`.
 - 요청당 텍스트 1,000개 한도와 토큰 한도를 지키도록 배치를 나눕니다. 토큰은 문자 수로 보수적으로 추정합니다(한국어에서는 과대 추정 → 한도 초과 방지). 기본 배치 토큰 상한 `EMBED_BATCH_MAX_TOKENS=100000`.
-- 레이트 리밋·서버·연결·타임아웃 오류는 재시도 가능한 실패로 분류해 작업 큐의 백오프에 맡깁니다.
+- 레이트 리밋·서버·연결·타임아웃 오류는 재시도 가능한 실패로 분류해 작업 큐의 백오프에 맡깁니다. (보완: [ADR 0007](0007-embedding-rate-limit-and-cache.md)에서 먼저 배치 단위로 재시도하고, 클라이언트 측 속도 제한과 임베딩 캐시를 더했습니다.)
 - `Embedder` Protocol 뒤에 두고, 테스트·Fake 모드는 해시 기반 결정적 벡터(`FakeEmbedder`: 단어·문자 bigram feature hashing, L2 정규화)를 씁니다.
 
 ## 근거

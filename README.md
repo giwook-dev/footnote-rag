@@ -120,6 +120,11 @@ FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`�
 | `CLAUDE_EFFORT` | `medium` | `output_config.effort` |
 | `CLAUDE_MAX_TOKENS` | `16000` | 비스트리밍 요청 상한 |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `voyage-4` / `1024` | 차원은 마이그레이션 시점에 `vector(n)`으로 고정 |
+| `EMBED_BATCH_MAX_TOKENS` | `100000` | 요청 하나의 추정 토큰(문자 수) 상한. `EMBED_TPM_LIMIT`가 있으면 `min(이 값, EMBED_TPM_LIMIT)` |
+| `EMBED_RPM_LIMIT` | 없음(제한 없음) | 클라이언트 측 분당 요청 수 제한(60초 슬라이딩 윈도우, **워커 프로세스별**) |
+| `EMBED_TPM_LIMIT` | 없음(제한 없음) | 클라이언트 측 분당 추정 토큰 제한(워커 프로세스별). 결제 수단 미등록 Voyage 계정은 `9000` 권장 |
+| `EMBED_BATCH_MAX_RETRIES` | `6` | 429·일시 오류 시 **같은 배치만** 재시도하는 횟수. 다 쓰면 작업 단위 재시도로 넘김 |
+| `EMBED_RETRY_BASE_SECONDS` / `EMBED_RETRY_MAX_SECONDS` | `20` / `120` | 배치 재시도 대기 = `min(BASE × 2^n, MAX)` + 지터(최대 10%) |
 | `TOP_K` | `8` | 검색 청크 수 |
 | `MIN_RETRIEVAL_SCORE` | `0.35` | 최고 유사도가 이보다 낮으면 검토 대기 |
 | `REVIEW_MODE` | `on_low_confidence` | `always`면 모든 답변을 검토 대기로 |
@@ -129,6 +134,23 @@ FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`�
 | `JOB_LOCK_TIMEOUT_SECONDS` | `600` | 이보다 오래된 `running` 작업은 `queued`로 복구 |
 | `DATA_DIR` | `data` | DART ZIP·corpCode 캐시, 업로드 파일(gitignore) |
 | `LOG_LEVEL` / `LOG_JSON` | `INFO` / `true` | structlog |
+
+### Voyage 레이트 리밋
+
+Voyage 계정에 **결제 수단을 등록하지 않으면 한도가 3 RPM / 10K TPM**으로 낮아집니다. 이 상태에서 사업보고서(약 100만 자)를 기본 설정으로 가져오면 요청마다 429가 납니다. 다음과 같이 설정하세요.
+
+```bash
+EMBED_RPM_LIMIT=3
+EMBED_TPM_LIMIT=9000   # 10K보다 약간 낮게 잡아 여유를 둠
+```
+
+- 워커는 보내기 전에 한도를 넘지 않을 때까지 기다립니다. 그래도 429가 나면 그 배치만 백오프로 다시 보냅니다. 이미 임베딩한 청크는 `embedding_cache`에 저장되므로 작업이 실패했다가 재시도하거나 재처리해도 다시 비용을 내지 않습니다.
+- **소요 시간 계산**: 대략 `총 추정 토큰 ÷ EMBED_TPM_LIMIT` 분입니다. 토큰은 문자 수로 추정합니다. 예를 들어 100만 자 사업보고서는 `1,000,000 ÷ 9,000 ≈ 111분`입니다. 진행률은 웹 화면 문서 목록(`임베딩 120/700`)과 `GET /documents/{id}`·`GET /jobs/{id}`의 `progress`에서 볼 수 있습니다.
+- 429 메시지에 결제 수단 안내가 있으면 워커 로그에 `embedding.provider_reduced_limits` 경고가 한 번 남습니다. 최종 실패하면 문서 오류에 `임베딩 제공자 요청 한도 초과(결제 수단 미등록 가능성)`이 기록됩니다.
+- 결제 수단을 등록하면 한도가 올라갑니다. 등록해도 **무료 토큰은 그대로 유지**되므로 무료 범위 안에서는 비용이 나가지 않습니다. 등록한 뒤에는 `EMBED_RPM_LIMIT`·`EMBED_TPM_LIMIT`를 비워 두면 됩니다.
+- 이 제한은 **워커 프로세스마다 따로** 적용됩니다. 워커를 여러 개 띄우면 한도를 워커 수로 나눠 설정하세요(예: 워커 2개 → `EMBED_RPM_LIMIT=1`, `EMBED_TPM_LIMIT=4500`).
+
+배경과 대안은 [ADR 0007](docs/adr/0007-embedding-rate-limit-and-cache.md)을 보세요.
 
 ## curl 예시: 로그인 → DART 가져오기 → 질문
 
@@ -184,7 +206,7 @@ curl -s "$API/usage?from=2026-11-01T00:00:00Z" -H "$AUTH"
 | POST | `/users` | admin (같은 조직) |
 | POST | `/documents/dart` | member 이상 |
 | POST | `/documents/upload` (TXT/MD, 5MB) | member 이상 |
-| GET | `/documents`, `/documents/{id}`, `/jobs/{id}` | member 이상 |
+| GET | `/documents`, `/documents/{id}`, `/jobs/{id}` (문서 응답에 최신 작업의 `progress`·`next_retry_at` 추가) | member 이상 |
 | POST | `/documents/{id}/reprocess` (다시 파싱·임베딩. 202 `{document_id, job_id}`, `queued`/`processing`이면 409, 감사 로그 `document.reprocess_requested`) | admin (같은 조직) |
 | POST | `/questions`, `/search` | member 이상 |
 | GET | `/answers/{id}` | member는 `published`/`approved`만, reviewer·admin은 전부 |

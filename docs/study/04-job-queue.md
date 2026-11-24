@@ -95,6 +95,15 @@
    - `src/footnote_rag/jobs/handlers.py::_embed_and_store`: `EmbeddingError.retryable`을 따른다. 임베딩 개수 불일치는 재시도.
 2. **작업 오류 → 큐 상태**: `src/footnote_rag/jobs/worker.py::Worker._execute`가 `JobError`면 그 `retryable` 값을, **예상하지 못한 예외는 재시도 불가**로 처리한다(스택 로그를 남김).
 
+### 배치 단위 재시도와 작업 단위 재시도
+
+임베딩은 작업 큐보다 한 층 아래에서 먼저 재시도한다([ADR 0007](../adr/0007-embedding-rate-limit-and-cache.md)).
+
+- `src/footnote_rag/retrieval/embedder.py::VoyageEmbedder._embed_batch`: 배치를 보내기 전에 `src/footnote_rag/retrieval/embedder.py::RateLimiter.acquire`로 분당 요청·토큰 한도를 기다린다. 429나 일시 오류가 나면 **그 배치만** `min(EMBED_RETRY_BASE_SECONDS × 2^n, EMBED_RETRY_MAX_SECONDS)` + 지터만큼 쉬고 다시 보낸다. `EMBED_BATCH_MAX_RETRIES`를 다 쓰면 그때 `EmbeddingError(retryable=True)`가 되어 위의 작업 단위 재시도로 넘어간다.
+- 성공한 배치는 `src/footnote_rag/retrieval/embedding_cache.py::CachedEmbedder.embed_documents`가 곧바로 `embedding_cache`에 커밋한다. 그래서 작업 단위 재시도가 일어나도 남은 청크만 다시 보낸다. 작업 단위 재시도가 "처음부터 다시"여도 비용은 "남은 부분만"이다.
+- 진행률: `src/footnote_rag/jobs/handlers.py::JobProgress.update`가 `jobs.result.progress`를 2초 이상 간격으로 쓰면서 `locked_at`도 갱신한다. 임베딩 중에는 `JobProgress.keepalive`가 하트비트를 보내므로, 한도 때문에 오래 걸리는 작업이 멈춘 작업으로 잘못 복구되지 않는다. `claim_job`은 `result`를 비워 재시도가 이전 시도의 진행률을 보이지 않게 한다.
+- 테스트: `tests/test_embedding_rate_limit_cache.py::test_rate_limited_batch_is_retried_alone_and_the_job_does_not_fail`, `tests/test_embedding_rate_limit_cache.py::test_rate_limit_failure_schedules_retry_then_explains_in_korean`.
+
 외부 오류 표(OpenDART 020/800/900 재시도, 010/011/012/013/014/901 즉시 실패 등)는 [docs/architecture.md](../architecture.md#작업-상태-전이)와 [07. OpenDART 연동](07-dart-integration.md)에 있다.
 
 ### 실패 기록: 큐·문서·감사를 한 트랜잭션으로
@@ -174,7 +183,8 @@ assert len(claimed) == 1
 | Temporal 같은 워크플로 엔진 | 긴 다단계 작업의 상태·재시도를 엔진이 관리 | ADR에서 검토하지 않았다. 이 저장소의 작업은 단계가 하나(가져오기)뿐이다 |
 
 **한계와 개선 방향**
-- 처리 중 heartbeat가 없다. 작업이 `JOB_LOCK_TIMEOUT_SECONDS`보다 오래 걸리면 다른 워커가 다시 가져갈 수 있다. 결과는 멱등하지만 비용(다운로드·임베딩)은 두 번 든다.
+- 하트비트는 임베딩 단계(진행률 기록과 `JobProgress.keepalive`)에만 있다. 다운로드·파싱이 `JOB_LOCK_TIMEOUT_SECONDS`보다 오래 걸리면 다른 워커가 다시 가져갈 수 있다. 결과는 멱등하고, 임베딩은 캐시 덕분에 두 번 청구되지 않는다.
+- 임베딩 레이트 리미터는 워커 프로세스마다 따로 동작한다. 워커를 늘리면 `EMBED_RPM_LIMIT`·`EMBED_TPM_LIMIT`를 워커 수로 나눠야 한다(분산 리미터는 범위 밖).
 - 폴링 간격(`WORKER_POLL_INTERVAL_SECONDS`, 기본 1초)만큼 시작이 늦어진다.
 - `failed` 작업을 다시 돌리는 API가 없다. 지금은 SQL로 상태를 바꾸거나 작업을 새로 등록해야 한다. 데드레터 큐도 없다.
 - 백오프에 지터가 없다.
