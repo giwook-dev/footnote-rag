@@ -5,7 +5,7 @@ answers, llm_calls, audit_logs 테이블과 상태 enum 값을 정의한다.
 주요 요소: ``Document``, ``Chunk``, ``EmbeddingCache``, ``Job``, ``Answer``, ``LlmCall``, ``AuditLog``,
 ``ANSWER_STATUSES`` 등.
 호출 관계: 서비스·라우터·워커가 import해 쿼리한다. 실제 DDL은 alembic/versions/0001_initial.py,
-0002_embedding_cache.py.
+0002_embedding_cache.py, 0003_llm_calls_dropped_refs.py.
 학습 문서: docs/study/01-big-picture.md, ERD는 docs/architecture.md
 
 ORM models. The schema itself is created by Alembic (see alembic/versions).
@@ -205,6 +205,10 @@ class LlmCall(Base):
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     stop_reason: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Local models only: source numbers outside 1..k that were dropped (0 for Claude).
+    dropped_source_refs: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = _created_at()
 
 

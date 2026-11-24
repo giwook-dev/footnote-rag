@@ -195,6 +195,15 @@ flowchart TD
 
 출력 형식(각주 번호, 출처 목록)은 프롬프트로 요구하지 않는다. 그것은 Citations와 `build_footnotes`의 몫이다.
 
+### 로컬 모델 경로(Citations API 없음)
+
+`LLM_PROVIDER=local`이면 `src/footnote_rag/answering/local_llm.py::OllamaClient`가 호스트의 Ollama를 부른다. Citations API가 없으므로 위 설명과 반대로 **출력 형식을 프롬프트와 JSON 스키마로 요구**한다.
+- `src/footnote_rag/answering/prompt.py::build_local_user_prompt`가 검색 결과를 `[n] 제목\n본문`으로 나열하고, `LOCAL_ANSWER_SCHEMA`(`{"insufficient", "sentences": [{"text", "sources"}]}`)를 Ollama `format`으로 강제한다.
+- `src/footnote_rag/answering/local_llm.py::to_content_blocks`가 범위 밖 번호를 버리고, 문장마다 Claude와 같은 모양의 `search_result_location` citation을 만든다. 그래서 번호 매기기는 같은 `build_footnotes`를 탄다.
+- 인용문은 `src/footnote_rag/answering/footnotes.py::select_cited_text`가 청크에서 문자 2-gram이 가장 많이 겹치는 문장을 골라 300자로 자른 **근사값**이다. 각주의 `citation_method`가 `model_reference`로 표시된다(Claude는 `api_citation`).
+
+결정 이유와 대안은 [ADR 0008](../adr/0008-local-llm-ollama.md)을 보라.
+
 ## 왜 이렇게 했나 / 대안 / 한계와 개선 방향
 
 **왜** ([ADR 0002](../adr/0002-claude-citations-search-result.md))

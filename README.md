@@ -12,8 +12,8 @@
 | API | FastAPI, OAuth2 password flow + JWT, 역할(admin / reviewer / member), 조직 격리 |
 | 저장소 | PostgreSQL 16 + pgvector(HNSW, cosine), Alembic 마이그레이션 |
 | 비동기 작업 | Postgres `FOR UPDATE SKIP LOCKED` 큐, 지수 백오프 재시도, 멈춘 작업 복구 |
-| 외부 연동 | OpenDART(`corpCode.xml`, `list.json`, `document.xml`), Voyage `voyage-4` 임베딩, Claude `claude-sonnet-5-5` |
-| 답변 | `search_result` 블록 + Citations → 각주 변환, 서버 측 거절 fallback |
+| 외부 연동 | OpenDART(`corpCode.xml`, `list.json`, `document.xml`), Voyage `voyage-4` 임베딩, Claude `claude-sonnet-5-5`, 선택: 호스트의 Ollama(로컬 LLM) |
+| 답변 | `search_result` 블록 + Citations → 각주 변환, 서버 측 거절 fallback. 로컬 LLM은 번호 붙은 근거 + JSON 스키마 출력 → 서버 검증 → 같은 각주 변환 |
 | 운영 | structlog JSON 로그, `X-Request-ID`, `/healthz`, `/readyz`, Docker Compose, GitHub Actions CI |
 | 품질 | pytest(실제 Postgres, 외부 네트워크 없음), Eval 실행기, MCP 서버 |
 
@@ -63,6 +63,66 @@ uv run ruff check . && uv run ruff format --check . && uv run pytest
 # 다른 DB를 쓰려면 TEST_DATABASE_URL=postgresql+asyncpg://...
 ```
 
+## 로컬 LLM(Ollama)로 실행하기
+
+Anthropic API 크레딧 없이 실제 답변을 만들어 보려면 호스트에서 [Ollama](https://ollama.com/)를 돌리고 `LLM_PROVIDER=local`로 설정합니다. 임베딩은 그대로 Voyage를 쓰므로 실제 공시를 가져오려면 `VOYAGE_API_KEY`가 필요합니다. Fake 임베딩(키 없음)으로도 합성 공시에 대한 로컬 답변은 시험할 수 있습니다.
+
+1. **Ollama 설치와 모델 다운로드** (호스트, Docker 밖)
+
+   ```bash
+   # Windows/macOS: https://ollama.com/download 설치 프로그램, Linux: 공식 설치 스크립트
+   ollama pull qwen3:14b        # 약 9GB (4bit 양자화)
+   ollama list                  # qwen3:14b 가 보이면 준비 완료
+   ```
+
+2. **`.env` 설정**
+
+   ```bash
+   LLM_PROVIDER=local
+   # 기본값이면 생략 가능: LOCAL_LLM_BASE_URL=http://host.docker.internal:11434, LOCAL_LLM_MODEL=qwen3:14b
+   ```
+
+   `auto`는 `local`을 고르지 않으므로 반드시 명시합니다. API 키는 필요 없습니다. uvicorn을 컨테이너가 아니라 호스트에서 직접 띄우면 `LOCAL_LLM_BASE_URL=http://localhost:11434`로 바꿉니다.
+
+3. **스택 실행**
+
+   ```bash
+   docker compose up -d
+   ```
+
+   api 서비스에는 `extra_hosts: host.docker.internal:host-gateway`가 있어 Linux에서도 호스트의 Ollama에 닿습니다(Docker Desktop은 원래 이 이름을 제공). 워커는 LLM을 호출하지 않습니다. Ollama가 다른 PC나 WSL 밖에서 돈다면 `OLLAMA_HOST=0.0.0.0`으로 띄워야 컨테이너에서 접속됩니다.
+
+4. **연결 확인**: 웹 화면 **관리** 탭의 "LLM 상태" 카드나 `GET /llm/status`(admin)가 제공자·모델·연결 여부·모델 존재 여부를 보여 줍니다. 모델이 없으면 `ollama pull` 안내가 나옵니다. `/readyz`는 LLM 상태와 무관합니다.
+
+5. **GPU 사용 확인**: 질문을 한 번 보낸 뒤
+
+   ```bash
+   ollama ps     # PROCESSOR 열이 "100% GPU"면 GPU에 모두 올라감, "CPU"가 섞이면 VRAM 부족 또는 GPU 미지원
+   ```
+
+   AMD GPU는 Ollama가 ROCm(Linux)·Windows용 AMD 드라이버로 지원하며, **지원하는 GPU 목록이 Ollama 버전마다 다릅니다.** RX 9000 시리즈 같은 최신 GPU는 최신 Ollama와 최신 AMD 드라이버가 필요할 수 있으니 설치한 버전의 Ollama 공식 문서(GPU 지원 목록)에서 확인하세요. GPU를 못 쓰면 CPU로 돌아가며 매우 느립니다.
+
+**VRAM별 모델 예시** (4bit 양자화, `LOCAL_LLM_NUM_CTX=16384` 기준 대략치)
+
+| VRAM | 모델 예시 | 비고 |
+| --- | --- | --- |
+| 8GB | `qwen3:8b`, `llama3.1:8b` | 컨텍스트를 줄이면(`LOCAL_LLM_NUM_CTX=8192`) 여유가 생김 |
+| 12GB | `qwen3:8b`, `gemma3:12b` | 한국어 품질은 모델별로 직접 비교 권장 |
+| 16GB | `qwen3:14b`(기본) | RX 9070 XT(16GB)에서 GPU에 모두 올라가는 크기 |
+
+모델을 바꾸면 `LOCAL_LLM_MODEL`만 바꾸고 `ollama pull <모델>` 후 api를 다시 띄웁니다(`docker compose up -d api`).
+
+**동작 방식과 알려진 한계**
+
+- 로컬 모델에는 Claude의 Citations API가 없습니다. 검색 결과에 `[1]`, `[2]` 번호를 붙여 보내고, Ollama의 JSON 스키마 강제 출력으로 문장마다 근거 번호를 받습니다. 서버가 번호를 검증하고(범위 밖 번호는 버리고 `llm_calls.dropped_source_refs`에 기록) Claude와 같은 각주·신뢰도·검토 흐름에 태웁니다.
+- **인용 정확도**: 근거 번호는 모델이 고르므로 문장과 근거가 맞지 않을 수 있습니다. 인용문(`cited_text`)은 서버가 청크에서 가장 비슷한 문장을 고른 **근사값**입니다. 각주에 `citation_method: "model_reference"`가 붙고, 화면에 "로컬 모델이 지정한 근거 — 인용문은 근사 매칭"이 표시됩니다. Claude 답변은 `api_citation`입니다.
+- **속도**: GPU와 모델 크기에 따라 질문 하나에 수십 초가 걸릴 수 있습니다. `LOCAL_LLM_TIMEOUT_SECONDS`(기본 180초)를 넘으면 504입니다. 첫 질문은 모델을 VRAM에 올리느라 더 느립니다.
+- 출력이 `LOCAL_LLM_MAX_TOKENS`에 걸리면 완성된 문장만 남기고 `pending_review`(`truncated`)로 보냅니다. JSON이 깨지면 한 번 다시 요청하고, 또 실패하면 502입니다.
+- Ollama가 꺼져 있으면 503("로컬 LLM 서버(Ollama)에 연결할 수 없습니다"), 모델이 없으면 503("모델 … 이 없습니다: ollama pull …")입니다.
+- 비용은 `ollama:<모델>` 이름으로 0원 기록됩니다. Claude와 품질을 비교하려면 `python -m footnote_rag.evals.run --live`를 제공자별로 돌려 리포트를 비교합니다([Eval](#eval)).
+
+설계 이유와 대안은 [ADR 0008](docs/adr/0008-local-llm-ollama.md)을 보세요.
+
 ## 웹 화면으로 테스트하기
 
 FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`의 HTML·JS·CSS 3개)을 `/ui`에서 직접 서빙합니다. 화면은 기존 HTTP API를 그대로 호출하므로 권한 검사와 조직 격리도 그대로 적용됩니다. 역할에 따라 탭을 숨기는 것은 편의 기능일 뿐이고, 권한 판단은 서버가 합니다.
@@ -90,9 +150,9 @@ FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`�
 2. 브라우저에서 http://localhost:8000/ui 를 엽니다(`http://localhost:8000/`도 `/ui/`로 리다이렉트). 위 계정으로 로그인합니다. 토큰은 탭을 닫으면 사라지는 `sessionStorage`에만 저장됩니다.
 3. **문서** 탭: 종목코드(프리셋: 삼성전자 005930, NAVER 035420, 현대자동차 005380)·기간·보고서 종류(기본 A001 사업보고서, F001/F002 감사보고서)로 검색하고 결과 행의 **가져오기**를 누릅니다. F001/F002 결과가 0건이면 "상장사는 감사보고서를 사업보고서(A001)에 포함해 공시합니다."라는 안내가 나옵니다. 새 문서는 202, 이미 가져온 문서는 200으로 구분해 안내합니다. 아래 "내 문서" 표는 `queued`/`processing` 문서가 있는 동안 3초마다 새로고침되고, `failed`면 오류 내용을 보여 줍니다. admin에게는 `ready`/`failed` 문서 옆에 **다시 처리** 버튼이 보입니다(확인 대화상자 → 재처리 작업 등록 → 자동 새로고침 재시작).
    - Fake 모드(OpenDART 키 없음)에서는 상단에 "Fake 모드(합성 데이터)" 배지가 뜨고, 합성 종목코드 `990001`~`990003`만 검색됩니다. 접수번호 직접 입력란에 `20260310900101`(합성 사업보고서)을 넣어 가져와도 됩니다.
-4. **질문** 탭: `ready` 문서를 고르고(안 고르면 전체) 질문합니다. 답변 본문의 `[n]`을 누르면 아래 각주(회사명·문서 제목·목차 경로·인용문·DART 원문 링크)가 강조됩니다. 상태 배지와 토큰·비용·지연시간도 표시됩니다. 이번 세션의 질문은 오른쪽 목록에 남습니다(새로고침하면 사라짐).
+4. **질문** 탭: `ready` 문서를 고르고(안 고르면 전체) 질문합니다. 답변 본문의 `[n]`을 누르면 아래 각주(회사명·문서 제목·목차 경로·인용문·DART 원문 링크)가 강조됩니다. 상태 배지와 토큰·비용·지연시간·모델명도 표시됩니다. 로컬 LLM 답변이면 각주 위에 "로컬 모델이 지정한 근거 — 인용문은 근사 매칭"이 표시됩니다. 이번 세션의 질문은 오른쪽 목록에 남습니다(새로고침하면 사라짐).
 5. **검토** 탭(reviewer·admin): 검토 대기 답변을 승인·반려합니다. 다른 검토자가 먼저 처리했다면 409를 받아 "이미 다른 검토자가 처리함"을 알리고 목록을 새로고침합니다. 검토 대기 답변을 확실히 만들어 보려면 `.env`에 `REVIEW_MODE=always`를 넣고 다시 띄웁니다(모든 답변이 검토 대기로 감).
-6. **관리** 탭(admin): 사용량(기본 최근 7일), 감사 로그 최근 50건(action 필터), 사용자 추가 폼이 있습니다. member·reviewer 계정을 만들어 다시 로그인하면 역할별로 보이는 탭이 달라지는 것을 확인할 수 있습니다.
+6. **관리** 탭(admin): LLM 상태(제공자·모델·연결 여부), 사용량(기본 최근 7일), 감사 로그 최근 50건(action 필터), 사용자 추가 폼이 있습니다. member·reviewer 계정을 만들어 다시 로그인하면 역할별로 보이는 탭이 달라지는 것을 확인할 수 있습니다.
 
 `/ui` 응답에는 `Content-Security-Policy`(`script-src 'self'` 등 외부 리소스 차단), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` 헤더가 붙습니다. Swagger(`/docs`)는 CDN 리소스를 쓰므로 이 CSP를 적용하지 않습니다.
 
@@ -115,10 +175,17 @@ FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`�
 | `APP_ENV` | `dev` | `production`이면 JWT 비밀값 검사 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `60` | JWT 만료 |
 | `ANTHROPIC_API_KEY` / `VOYAGE_API_KEY` / `OPENDART_API_KEY` | 없음 | 비어 있으면 미설정으로 간주 |
-| `LLM_PROVIDER` / `EMBEDDER` / `DART_PROVIDER` | `auto` | `auto` \| `fake` \| `real` |
+| `LLM_PROVIDER` / `EMBEDDER` / `DART_PROVIDER` | `auto` | `auto` \| `fake` \| `real`. `LLM_PROVIDER`만 `local`(호스트 Ollama, 키 불필요)도 받음. `auto`는 `local`을 고르지 않음 |
 | `CLAUDE_MODEL` | `claude-sonnet-5-5` | 날짜 접미사 없는 모델 ID |
 | `CLAUDE_EFFORT` | `medium` | `output_config.effort` |
 | `CLAUDE_MAX_TOKENS` | `16000` | 비스트리밍 요청 상한 |
+| `LOCAL_LLM_BASE_URL` | `http://host.docker.internal:11434` | `LLM_PROVIDER=local`일 때 Ollama 네이티브 API 주소. 호스트에서 uvicorn을 직접 띄우면 `http://localhost:11434` |
+| `LOCAL_LLM_MODEL` | `qwen3:14b` | Ollama 모델 이름(미리 `ollama pull`). `llm_calls.model`에는 `ollama:<이름>`으로 저장, 비용 0 |
+| `LOCAL_LLM_NUM_CTX` | `16384` | 컨텍스트 길이(`options.num_ctx`). 작으면 프롬프트 앞부분이 조용히 잘림 |
+| `LOCAL_LLM_MAX_TOKENS` | `2048` | 출력 토큰 상한(`options.num_predict`). 도달하면 `pending_review`(`truncated`) |
+| `LOCAL_LLM_TIMEOUT_SECONDS` | `180` | 요청 응답 대기 시간(초). 넘으면 504 |
+| `LOCAL_LLM_THINK` | `false` | Ollama `think`(추론 모델의 생각 단계). 켜면 느려짐 |
+| `LOCAL_LLM_TEMPERATURE` | `0` | `options.temperature` |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `voyage-4` / `1024` | 차원은 마이그레이션 시점에 `vector(n)`으로 고정 |
 | `EMBED_BATCH_MAX_TOKENS` | `100000` | 요청 하나의 추정 토큰(문자 수) 상한. `EMBED_TPM_LIMIT`가 있으면 `min(이 값, EMBED_TPM_LIMIT)` |
 | `EMBED_RPM_LIMIT` | 없음(제한 없음) | 클라이언트 측 분당 요청 수 제한(60초 슬라이딩 윈도우, **워커 프로세스별**) |
@@ -212,6 +279,7 @@ curl -s "$API/usage?from=2026-11-01T00:00:00Z" -H "$AUTH"
 | GET | `/answers/{id}` | member는 `published`/`approved`만, reviewer·admin은 전부 |
 | GET/POST | `/reviews`, `/reviews/{answer_id}` | reviewer, admin |
 | GET | `/audit-logs`, `/usage` | admin |
+| GET | `/llm/status` (현재 LLM 제공자·모델·연결 여부. 로컬이면 Ollama `/api/tags`를 3초 타임아웃으로 확인) | admin |
 
 토큰이 없거나 잘못되면 `401`, 역할이 부족하면 `403`, 다른 조직의 리소스는 `404`입니다. 전체 스키마는 `http://localhost:8000/docs`(Swagger)에서 볼 수 있습니다.
 
@@ -234,10 +302,10 @@ python -m footnote_rag.cli dart-reprocess --org-admin-email ... (--rcept-no <rce
 ```bash
 python -m footnote_rag.evals.validate            # evidence_quote가 파서 출력에 그대로 있는지 검사
 python -m footnote_rag.evals.run                 # Fake 모드(기본): 비용 없음
-python -m footnote_rag.evals.run --live          # 실제 제공자: 비용 발생
+python -m footnote_rag.evals.run --live          # 설정한 제공자(LLM_PROVIDER=real → Claude, local → Ollama)
 ```
 
-리포트는 `evals/reports/{timestamp}-{mode}.md`로 저장됩니다(검색 recall@k, 인용 정확도, 답하지 말아야 할 질문의 거절 비율, 평균 비용·지연시간). CI에서는 돌리지 않습니다. 현재 `evals/dataset.jsonl`에는 형식 예시(`_example: true`)만 있습니다. 이유는 [docs/data-sources.md](docs/data-sources.md)를 보세요.
+리포트는 `evals/reports/{timestamp}-{mode}[-{provider}]-{model}.md`로 저장됩니다(예: `20261124T120000Z-live-local-qwen3-14b.md`, `…-live-real-claude-sonnet-5-5.md`, `…-fake-fake-llm.md`). 머리말에 제공자·모델·`citation_method`(`api_citation` / `model_reference`)가 적혀 있어 Claude와 로컬 결과를 나란히 비교할 수 있습니다. 지표는 검색 recall@k, 인용 정확도, 답하지 말아야 할 질문의 거절 비율, 평균 비용·지연시간입니다. CI에서는 돌리지 않습니다. 현재 `evals/dataset.jsonl`에는 형식 예시(`_example: true`)만 있습니다. 이유는 [docs/data-sources.md](docs/data-sources.md)를 보세요.
 
 ## MCP 서버 (Claude Code 연결)
 

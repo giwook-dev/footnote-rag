@@ -1,11 +1,13 @@
-"""질문·답변·검색 엔드포인트(``POST /questions``, ``GET /answers/{id}``, ``POST /search``).
+"""질문·답변·검색 엔드포인트(``POST /questions``, ``GET /answers/{id}``, ``POST /search``, ``GET /llm/status``).
 
-역할: 서비스 예외를 HTTP 상태(404/503/502)로 바꾸고, member에게는 검토 대기 답변 본문을 숨긴다.
-주요 요소: ``post_question``, ``get_answer``, ``search``, ``_visible_to``, ``get_embedder``·``get_llm``(app.state).
+역할: 서비스 예외를 HTTP 상태(404/503/502/504)로 바꾸고, member에게는 검토 대기 답변 본문을 숨긴다.
+``GET /llm/status``(admin)는 현재 LLM 제공자·모델·연결 상태를 돌려준다(``/readyz``와 별개).
+주요 요소: ``post_question``, ``get_answer``, ``search``, ``llm_status``, ``_visible_to``,
+``get_embedder``·``get_llm``(app.state).
 호출 관계: ``answering.service``의 ``ask_question``·``retrieve``를 호출한다. ``mcp_server``도 이 API를 쓴다.
 학습 문서: docs/study/02-request-walkthrough.md
 
-/questions, /answers and /search endpoints.
+/questions, /answers, /search and /llm/status endpoints.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from footnote_rag.answering.service import (
     ask_question,
     retrieve,
 )
-from footnote_rag.auth.deps import ANY_MEMBER, REVIEWERS, require_role
+from footnote_rag.auth.deps import ADMINS, ANY_MEMBER, REVIEWERS, require_role
 from footnote_rag.config import get_settings
 from footnote_rag.db.models import Answer, User
 from footnote_rag.db.session import get_session
@@ -78,6 +80,16 @@ class SearchHit(BaseModel):
     score: float
     text: str
     dart_url: str | None
+
+
+class LLMStatusOut(BaseModel):
+    provider: str
+    model: str
+    base_url: str | None = None
+    # None = not checked (Claude: no probe call to avoid spending tokens)
+    connected: bool | None
+    model_available: bool | None
+    detail: str | None = None
 
 
 def _visible_to(user: User, status: str) -> bool:
@@ -142,6 +154,23 @@ async def get_answer(
         text=a.text,
         footnotes=a.footnotes,
         created_at=a.created_at,
+    )
+
+
+@router.get("/llm/status", response_model=LLMStatusOut, tags=["ops"])
+async def llm_status(
+    _user: User = Depends(require_role(*ADMINS)),
+    llm: LLMClient = Depends(get_llm),
+) -> LLMStatusOut:
+    """Current LLM provider, model and reachability (local: ``GET {base}/api/tags``, 3 s)."""
+    status = getattr(llm, "status", None)
+    if callable(status):
+        return LLMStatusOut(**await status())
+    return LLMStatusOut(
+        provider=str(getattr(llm, "provider", "unknown")),
+        model=str(getattr(llm, "model", "unknown")),
+        connected=None,
+        model_available=None,
     )
 
 

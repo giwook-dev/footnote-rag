@@ -270,7 +270,7 @@ async def test_upgrade_from_0001_adds_embedding_cache_to_an_existing_db(
         exists = await s.scalar(select(func.to_regclass("embedding_cache")))
     assert exists is None
     await asyncio.to_thread(_alembic, "upgrade", "head")
-    assert "0002_embedding_cache" in await asyncio.to_thread(_alembic, "current")
+    assert "(head)" in await asyncio.to_thread(_alembic, "current")  # 0002 and later applied
     async with sessionmaker() as s:
         assert await s.scalar(select(func.count()).select_from(EmbeddingCache)) == 0
         assert await s.scalar(select(func.count()).select_from(Chunk)) > 0

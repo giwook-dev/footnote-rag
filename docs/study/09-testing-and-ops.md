@@ -36,11 +36,16 @@ def make_llm(settings: Settings | None = None) -> LLMClient:
     s = settings or get_settings()
     if s.llm_mode == "fake":
         return FakeLLM()
+    if s.llm_mode == "local":  # LLM_PROVIDER=local: 호스트 Ollama, 키 불필요
+        from footnote_rag.answering.local_llm import OllamaClient
+        return OllamaClient(base_url=s.local_llm_base_url, model=s.local_llm_model, ...)
     return ClaudeClient(
         api_key=_require(s.anthropic_api_key, "ANTHROPIC_API_KEY"),
         ...
     )
 ```
+
+LLM만 네 번째 값 `local`을 받는다. `auto`는 `local`을 고르지 않으므로 명시해야 켜진다([ADR 0008](../adr/0008-local-llm-ollama.md)).
 
 ### 설계도: 실제/Fake 제공자 선택 구조
 

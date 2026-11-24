@@ -12,7 +12,8 @@ Review gate (``REVIEW_MODE=on_low_confidence``): an answer goes to ``pending_rev
   * the model refused (``refusal``),
   * retrieval returned nothing (``no_retrieval_results``; Claude is NOT called),
   * the best similarity is below ``MIN_RETRIEVAL_SCORE`` (``low_retrieval_score``), or
-  * the answer carries no footnotes (``no_citations``).
+  * the answer carries no footnotes (``no_citations``), or
+  * the client flagged it (``LLMResponse.review_flags``, e.g. ``truncated`` for a local model).
 Otherwise it is ``published``. ``REVIEW_MODE=always`` sends every answer to review.
 """
 
@@ -82,6 +83,10 @@ def review_reasons(
     reasons: list[str] = []
     if llm_response is not None and llm_response.stop_reason == "refusal":
         reasons.append("refusal")
+    if llm_response is not None:
+        # Client-specific flags, e.g. "truncated" when a local model hit num_predict.
+        flags = getattr(llm_response, "review_flags", None) or []
+        reasons.extend(f for f in flags if f not in reasons)
     if not retrieved:
         reasons.append("no_retrieval_results")
     elif max(c.score for c in retrieved) < settings.min_retrieval_score:
@@ -174,7 +179,9 @@ async def ask_question(
             text, footnotes = REFUSAL_TEXT, []
         else:
             built = build_footnotes(llm_response.content, to_source_refs(retrieved))
-            text, footnotes = built.text or NO_EVIDENCE_TEXT, built.footnotes
+            method = llm_response.citation_method
+            text = built.text or NO_EVIDENCE_TEXT
+            footnotes = [{**f, "citation_method": method} for f in built.footnotes]
 
     reasons = review_reasons(
         retrieved=retrieved,
@@ -223,6 +230,7 @@ async def ask_question(
                 cost_usd=cost,
                 latency_ms=llm_response.latency_ms,
                 stop_reason=llm_response.stop_reason,
+                dropped_source_refs=llm_response.dropped_source_refs,
             )
         )
         usage_out = {

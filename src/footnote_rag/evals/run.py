@@ -11,7 +11,9 @@ Eval runner.
     python -m footnote_rag.evals.run [--dataset evals/dataset.jsonl] [--live] [--out evals/reports]
 
 Default is fake mode (FakeEmbedder / FakeLLM / FakeDartClient): no network, no cost; it
-exercises the pipeline mechanics. ``--live`` uses the configured real providers.
+exercises the pipeline mechanics. ``--live`` uses the configured providers, including the LLM
+selected by ``LLM_PROVIDER`` (``real`` = Claude, ``local`` = Ollama). The report header and file
+name carry the provider, model and citation_method so Claude and local runs can be compared.
 
 The runner creates a throw-away organization, imports every filing referenced by the
 dataset through the normal service + worker, then asks each question through the normal
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -35,9 +38,9 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from footnote_rag.answering.llm import NO_EVIDENCE_TEXT, LLMClient
+from footnote_rag.answering.llm import CITATION_API, NO_EVIDENCE_TEXT, LLMClient
 from footnote_rag.answering.service import ask_question, retrieve
-from footnote_rag.config import Settings, get_settings
+from footnote_rag.config import LOCAL_MODEL_PREFIX, Settings, get_settings
 from footnote_rag.dart.client import DartClient
 from footnote_rag.db.models import Document, User
 from footnote_rag.documents.service import request_dart_import
@@ -69,6 +72,10 @@ class EvalSummary:
     results: list[ItemResult] = field(default_factory=list)
     skipped_examples: int = 0
     import_failures: list[str] = field(default_factory=list)
+    # Which LLM produced the answers, so Claude and local (Ollama) reports can be compared.
+    provider: str = "unknown"
+    model: str = "unknown"
+    citation_method: str = CITATION_API
 
     def _answerable(self) -> list[ItemResult]:
         return [r for r in self.results if r.item.answerable]
@@ -106,15 +113,37 @@ def _matches(path: str, prefixes: list[str]) -> bool:
     return any(path.startswith(p) for p in prefixes)
 
 
+def describe_llm(llm: LLMClient) -> tuple[str, str, str]:
+    """(provider, model id as stored in llm_calls, citation_method) of an LLM client."""
+    provider = str(getattr(llm, "provider", "unknown"))
+    model = str(getattr(llm, "model_id", None) or getattr(llm, "model", "unknown"))
+    method = str(getattr(llm, "citation_method", CITATION_API))
+    return provider, model, method
+
+
+def report_filename(summary: EvalSummary, stamp: str) -> str:
+    """``{stamp}-{mode}-{provider}-{model}.md`` (provider omitted when it equals the mode)."""
+    model = summary.model.removeprefix(LOCAL_MODEL_PREFIX)
+    slug = re.sub(r"[^A-Za-z0-9._]+", "-", model).strip("-") or "unknown"
+    parts = [stamp, summary.mode]
+    if summary.provider != summary.mode:
+        parts.append(summary.provider)
+    parts.append(slug)
+    return "-".join(parts) + ".md"
+
+
 def _pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 100:.1f}%"
 
 
 def render_report(summary: EvalSummary) -> str:
     lines = [
-        f"# Eval report ({summary.mode})",
+        f"# Eval report ({summary.mode}, {summary.provider}, {summary.model})",
         "",
         f"- generated: {datetime.now(UTC).isoformat(timespec='seconds')}",
+        f"- provider: {summary.provider}",
+        f"- model: `{summary.model}`",
+        f"- citation_method: {summary.citation_method}",
         f"- dataset: `{summary.dataset}`",
         f"- evaluated rows: {len(summary.results)} (skipped `_example` rows: {summary.skipped_examples})",
         f"- k: {summary.k}",
@@ -171,7 +200,15 @@ async def run_eval(
     from footnote_rag.db.session import get_sessionmaker
 
     sm = get_sessionmaker()
-    summary = EvalSummary(mode=mode, dataset=dataset_name, k=settings.top_k)
+    provider, model, method = describe_llm(llm)
+    summary = EvalSummary(
+        mode=mode,
+        dataset=dataset_name,
+        k=settings.top_k,
+        provider=provider,
+        model=model,
+        citation_method=method,
+    )
     runnable = [i for i in items if not i.example]
     summary.skipped_examples = len(items) - len(runnable)
     if not runnable:
@@ -263,7 +300,7 @@ async def run_eval(
 def write_report(summary: EvalSummary, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    path = out_dir / f"{stamp}-{summary.mode}.md"
+    path = out_dir / report_filename(summary, stamp)
     path.write_text(render_report(summary), encoding="utf-8")
     return path
 

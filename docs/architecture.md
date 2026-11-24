@@ -12,6 +12,7 @@ flowchart LR
     reviewer["Reviewer"] -->|"approve / reject"| api
     api <--> db[("PostgreSQL 16 + pgvector<br/>chunks · jobs · audit_logs · llm_calls")]
     api -->|"search_result + citations"| claude["Claude Sonnet 5.5<br/>(server-side fallback)"]
+    api -.->|"LLM_PROVIDER=local<br/>/api/chat + JSON 스키마"| ollama["Ollama (호스트)<br/>host.docker.internal:11434"]
     api -->|"input_type=query"| voyage["Voyage voyage-4"]
     worker["Worker (N개)"] -->|"FOR UPDATE SKIP LOCKED"| db
     worker -->|"document.xml ZIP"| dart["OpenDART"]
@@ -23,6 +24,7 @@ flowchart LR
 - **API**는 요청마다 `X-Request-ID`를 붙이고(없으면 생성) 처리 시간을 JSON 로그로 남깁니다. 감사 로그 행에도 같은 request_id가 저장됩니다.
 - **워커**는 API와 같은 이미지에서 `python -m footnote_rag.jobs.worker`로 돌며 여러 개를 띄워도 됩니다.
 - 외부 의존성(OpenDART, Voyage, Claude)은 모두 Protocol 뒤에 있고 `providers.py`가 실제/Fake 구현을 고릅니다. 테스트와 CI는 항상 Fake입니다.
+- **Ollama(호스트, 선택)**: `LLM_PROVIDER=local`이면 Claude 대신 호스트에서 도는 Ollama로 답변을 만듭니다. Citations API가 없으므로 번호 붙은 근거와 JSON 스키마 강제 출력으로 문장별 근거 번호를 받고, 서버가 검증한 뒤 같은 각주 흐름에 태웁니다(점선, [ADR 0008](adr/0008-local-llm-ollama.md)). 워커는 LLM을 호출하지 않으므로 compose의 `extra_hosts`는 api 서비스에만 있습니다. 상태는 `GET /llm/status`(admin)로 확인합니다.
 
 ## ERD
 
@@ -46,7 +48,7 @@ erDiagram
     jobs { uuid id PK  text type  jsonb payload  job_status status  int attempts  int max_attempts  timestamptz run_after  timestamptz locked_at  text locked_by  text last_error  jsonb result }
     questions { uuid id PK  uuid org_id FK  uuid asked_by FK  text text }
     answers { uuid id PK  uuid question_id FK  uuid org_id  text text  jsonb footnotes  answer_status status  text review_reason  uuid reviewed_by  timestamptz reviewed_at  text review_comment }
-    llm_calls { uuid id PK  uuid org_id  uuid answer_id FK  text model  int input_tokens  int output_tokens  int cache_read_input_tokens  int cache_creation_input_tokens  numeric cost_usd  int latency_ms  text stop_reason }
+    llm_calls { uuid id PK  uuid org_id  uuid answer_id FK  text model  int input_tokens  int output_tokens  int cache_read_input_tokens  int cache_creation_input_tokens  numeric cost_usd  int latency_ms  text stop_reason  int dropped_source_refs }
     audit_logs { uuid id PK  uuid org_id  uuid actor_user_id  text action  text target_type  text target_id  jsonb metadata  text request_id }
 ```
 
@@ -122,7 +124,9 @@ sequenceDiagram
     A-->>C: {answer_id, status, text, footnotes, usage, latency_ms}
 ```
 
-신뢰도 규칙(`REVIEW_MODE=on_low_confidence`): `refusal`, `no_retrieval_results`, `low_retrieval_score`(최고 유사도 < `MIN_RETRIEVAL_SCORE`), `no_citations` 중 하나라도 해당하면 `pending_review`입니다. `REVIEW_MODE=always`면 모든 답변이 검토 대기로 갑니다. member는 `pending_review` 답변의 본문을 볼 수 없습니다.
+`LLM_PROVIDER=local`이면 위 그림의 Claude 호출·응답 단계가 Ollama `POST /api/chat`(`stream:false`, `format`=JSON 스키마, `options.num_ctx`)로 바뀝니다. 응답 JSON을 검증해(실패 시 1회 재요청, 범위 밖 근거 번호 제거) Claude와 같은 모양의 citations로 바꾼 뒤 같은 각주 변환을 탑니다. 각주의 `citation_method`는 Claude가 `api_citation`, 로컬이 `model_reference`입니다.
+
+신뢰도 규칙(`REVIEW_MODE=on_low_confidence`): `refusal`, `no_retrieval_results`, `low_retrieval_score`(최고 유사도 < `MIN_RETRIEVAL_SCORE`), `no_citations`, `truncated`(로컬 모델이 출력 상한에 걸림) 중 하나라도 해당하면 `pending_review`입니다. `REVIEW_MODE=always`면 모든 답변이 검토 대기로 갑니다. member는 `pending_review` 답변의 본문을 볼 수 없습니다.
 
 ## 작업 상태 전이
 
