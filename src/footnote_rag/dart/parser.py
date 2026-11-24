@@ -1,4 +1,12 @@
-"""DART filing XML -> ordered sections with table-of-contents paths.
+"""DART 원문 XML을 목차 경로(section_path)가 붙은 섹션 목록으로 바꾸는 순수 함수.
+
+역할: ``SECTION-n``+``TITLE``로 경로를 만들고, 표는 행 단위 ``셀 | 셀``, 주석의 ``12. 리스`` 같은 문단은 하위 목차로 승격한다.
+주의: 실제 OpenDART 원문을 아직 받지 못해 아래 구조는 가정이며 합성 픽스처로만 검증했다(docs/data-sources.md).
+주요 요소: ``parse_document_zip``, ``parse_document_xml``, ``pick_main_member``, ``is_note_heading``, ``normalize_title``.
+호출 관계: ``jobs.handlers.handle_import_dart``, ``cli.cmd_dart_fetch``, ``evals.validate``가 호출한다.
+학습 문서: docs/study/07-dart-integration.md
+
+DART filing XML -> ordered sections with table-of-contents paths.
 
 Pure functions, no I/O. Input is the ZIP returned by ``/api/document.xml``.
 

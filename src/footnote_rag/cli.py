@@ -1,4 +1,12 @@
-"""Command line tools.
+"""명령줄 도구(seed, dart-find, dart-fetch, dart-import).
+
+역할: 첫 조직·관리자 생성, 접수번호 찾기, 원문 ZIP 받아 목차 출력(파서 확인용), 가져오기 작업 등록.
+주요 요소: ``cmd_seed``, ``cmd_dart_find``, ``cmd_dart_fetch``, ``cmd_dart_import``, ``build_parser``.
+호출 관계: ``orgs.service``, ``dart.corp_codes``, ``jobs.handlers.load_dart_zip``,
+``documents.service.request_dart_import``(API와 같은 서비스 함수)를 호출한다.
+학습 문서: docs/study/07-dart-integration.md (dart-fetch로 실제 구조 확인)
+
+Command line tools.
 
 python -m footnote_rag.cli seed --org "Demo" --admin-email a@example.com --admin-password ...
 python -m footnote_rag.cli dart-find --stock-codes 005930,035420,005380 --from 20260101 --to 20260531

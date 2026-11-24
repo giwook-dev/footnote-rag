@@ -1,4 +1,11 @@
-"""Claude citations -> numbered footnotes. Pure functions.
+"""Claude 응답의 citations를 번호 각주 ``[n]``으로 바꾸는 순수 함수.
+
+역할: text 블록을 이어 붙이고 인용이 달린 블록 뒤에 ``[n]``을 붙이며, 각주 목록(문서·목차 경로·인용문)을 만든다.
+주요 요소: ``build_footnotes``, ``SourceRef``(검색 청크 메타데이터), ``FootnotedAnswer``.
+호출 관계: ``answering.service.ask_question``이 호출한다. I/O가 없어 tests/test_footnotes.py로 단위 테스트한다.
+학습 문서: docs/study/06-claude-citations.md (각주 번호 매기기 알고리즘)
+
+Claude citations -> numbered footnotes. Pure functions.
 
 Rules:
 * text blocks are concatenated in order; non-text blocks (thinking, fallback, ...) are ignored
@@ -54,6 +61,7 @@ def build_footnotes(content: list[dict[str, Any]], sources: list[SourceRef]) -> 
                     ref = sources[idx]
             if ref is None:
                 continue
+            # 번호는 청크 기준: 처음 보는 청크면 새 번호와 각주 항목을 만들고, 이미 본 청크면 번호만 재사용한다.
             if ref.chunk_id not in numbers:
                 n = len(numbers) + 1
                 numbers[ref.chunk_id] = n

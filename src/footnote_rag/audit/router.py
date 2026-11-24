@@ -1,4 +1,12 @@
-"""GET /audit-logs (admin only, own organization, paginated)."""
+"""감사 로그 조회 엔드포인트 ``GET /audit-logs``.
+
+역할: admin이 자기 조직의 감사 로그를 action·기간으로 걸러 페이지 단위로 본다.
+주요 요소: ``list_audit_logs``, ``AuditLogOut``, ``AuditPage``.
+호출 관계: ``auth.deps.require_role(ADMINS)``로 보호되고 ``db.models.AuditLog``를 읽기만 한다.
+학습 문서: docs/study/08-review-audit-usage.md
+
+GET /audit-logs (admin only, own organization, paginated).
+"""
 
 from __future__ import annotations
 

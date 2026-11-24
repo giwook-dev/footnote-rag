@@ -1,4 +1,11 @@
-"""Document import requests. Used by both the HTTP API and the CLI.
+"""문서 가져오기 요청 서비스(HTTP API와 CLI가 같이 쓴다).
+
+역할: 문서 행(queued)·작업 행·감사 로그를 한 트랜잭션으로 만든다. 같은 조직의 같은 ``rcept_no``는 기존 문서를 돌려준다.
+주요 요소: ``request_dart_import``, ``create_text_upload``, ``ImportResult``, ``InvalidRceptNoError``.
+호출 관계: ``documents.router``, ``cli.cmd_dart_import``, ``evals.run``이 호출하고 ``jobs.queue.enqueue``를 부른다.
+학습 문서: docs/study/02-request-walkthrough.md, docs/study/04-job-queue.md
+
+Document import requests. Used by both the HTTP API and the CLI.
 
 Duplicate DART imports: if the organization already has a document for the same
 ``rcept_no`` the existing document is returned (HTTP 200, ``duplicate: true``) and no new

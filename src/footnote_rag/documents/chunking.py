@@ -1,4 +1,11 @@
-"""Section-aware chunking.
+"""섹션 단위 청킹(문자 기준 크기와 겹침).
+
+역할: 섹션(목차 경로) 경계를 넘지 않게 줄 단위로 청크를 채우고, 앞 청크 꼬리를 다음 청크에 겹쳐 넣는다.
+주요 요소: ``chunk_sections``, ``chunk_section_text``, ``ChunkDraft``.
+호출 관계: ``jobs.handlers._embed_and_store``가 ``CHUNK_SIZE``·``CHUNK_OVERLAP`` 설정으로 호출한다.
+학습 문서: docs/study/05-rag-retrieval.md (청킹 크기·겹침)
+
+Section-aware chunking.
 
 Chunks never cross section boundaries, so every chunk keeps its ``section_path``.
 Inside a section, text is packed line by line (table rows are lines, so tables are cut

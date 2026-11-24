@@ -1,4 +1,12 @@
-"""OpenDART API client.
+"""OpenDART API 클라이언트(Protocol 뒤의 HTTP 실제 구현과 합성 데이터 Fake).
+
+역할: ``list.json``(공시 목록, 페이지 반복), ``document.xml``(원문 ZIP), ``corpCode.xml``(고유번호 ZIP)을 호출하고,
+OpenDART ``status`` 코드와 HTTP 오류를 재시도 가능/불가 ``DartError``로 분류한다. 로그 URL의 ``crtfc_key``는 가린다.
+주요 요소: ``DartClient``, ``HttpDartClient``, ``FakeDartClient``, ``classify_status``, ``parse_error_body``.
+호출 관계: ``providers.make_dart_client``가 만들고 ``jobs.handlers``, ``dart.corp_codes``, ``cli``가 쓴다.
+학습 문서: docs/study/07-dart-integration.md
+
+OpenDART API client.
 
 ``DartClient`` is a Protocol so the worker and CLI can run against ``FakeDartClient``
 (synthetic data, no network) or ``HttpDartClient`` (real OpenDART).

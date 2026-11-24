@@ -1,4 +1,11 @@
-"""MCP server (stdio) exposing footnote-rag to MCP clients such as Claude Code.
+"""MCP 서버(stdio): Claude Code 같은 MCP 클라이언트에 검색·질문 도구를 노출한다.
+
+역할: DB를 직접 만지지 않고 사용자 JWT로 HTTP API를 호출해 권한 검사와 조직 격리를 그대로 유지한다.
+주요 요소: 도구 ``search_documents``(→ ``POST /search``), ``ask``(→ ``POST /questions``), ``_post``.
+호출 관계: MCP 클라이언트가 도구를 호출하고, 이 모듈은 ``answering/router.py``의 엔드포인트를 부른다.
+학습 문서: docs/study/10-eval-and-mcp.md
+
+MCP server (stdio) exposing footnote-rag to MCP clients such as Claude Code.
 
 It does not touch the database: every tool call goes through the HTTP API with the
 caller's access token, so the same authentication, role checks and organization isolation

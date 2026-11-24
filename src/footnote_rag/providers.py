@@ -1,4 +1,13 @@
-"""Factories that pick the real or fake implementation of each external dependency."""
+"""외부 의존성(OpenDART, Voyage, Claude)의 실제/Fake 구현을 고르는 팩토리.
+
+역할: 설정의 ``dart_mode``·``embedder_mode``·``llm_mode``를 보고 구현체를 만든다. real인데 키가 없으면
+``MissingKeyError``.
+주요 요소: ``make_dart_client``, ``make_embedder``, ``make_llm``.
+호출 관계: ``main.lifespan``, ``jobs.worker._main``, ``cli``, ``evals.run``이 호출한다.
+학습 문서: docs/study/09-testing-and-ops.md (실제/Fake 제공자 선택 구조)
+
+Factories that pick the real or fake implementation of each external dependency.
+"""
 
 from __future__ import annotations
 

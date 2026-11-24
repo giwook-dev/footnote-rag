@@ -1,4 +1,11 @@
-"""Polling worker: ``python -m footnote_rag.jobs.worker``.
+"""폴링 워커 프로세스(``python -m footnote_rag.jobs.worker``).
+
+역할: 작업을 하나씩 claim해 핸들러를 실행하고, 실패를 큐·문서·감사 로그에 기록하며, 주기적으로 멈춘 작업을 복구한다.
+주요 요소: ``Worker``(``run_once``, ``run_forever``, ``recover``, ``_execute``, ``_record_failure``), ``_main``.
+호출 관계: Docker Compose ``worker`` 서비스가 실행하고, ``jobs.queue``와 ``jobs.handlers.HANDLERS``를 호출한다.
+학습 문서: docs/study/04-job-queue.md (재시도 분류, 종료 처리)
+
+Polling worker: ``python -m footnote_rag.jobs.worker``.
 
 Several workers can run at once; ``FOR UPDATE SKIP LOCKED`` guarantees one claimer per job.
 On SIGTERM/SIGINT the worker finishes the job in hand and exits.
@@ -76,6 +83,8 @@ class Worker:
             result = await handler(self.context, job)
             log.info("job.succeeded", job_id=str(job.id), type=job.type, **_loggable(result))
         except Exception as exc:  # noqa: BLE001 - every failure must be recorded
+            # 재시도 분류: 핸들러가 RetryableJobError/PermanentJobError로 명시한 것만 그 값을 따르고,
+            # 예상하지 못한 예외는 재시도 불가로 보고 바로 failed 처리한다(로그에 스택을 남김).
             retryable = exc.retryable if isinstance(exc, JobError | _Permanent) else False
             if not isinstance(exc, JobError | _Permanent):
                 log.exception("job.unexpected_error", job_id=str(job.id))

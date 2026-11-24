@@ -1,4 +1,12 @@
-"""Fixed system prompt and request construction with ``search_result`` blocks."""
+"""고정 시스템 프롬프트와 ``search_result`` 블록 요청 구성.
+
+역할: 검색 청크마다 ``search_result`` 블록(source, title, content, citations on)을 만들고 끝에 질문을 붙인다.
+주요 요소: ``SYSTEM_PROMPT``, ``build_messages``, ``source_id``(``doc:{document_id}#chunk:{chunk_id}``).
+호출 관계: ``answering.service``가 호출하고, ``source_id``는 각주 변환 때 청크를 다시 찾는 키가 된다.
+학습 문서: docs/study/06-claude-citations.md (프롬프트 설계)
+
+Fixed system prompt and request construction with ``search_result`` blocks.
+"""
 
 from __future__ import annotations
 

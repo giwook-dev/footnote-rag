@@ -1,4 +1,11 @@
-"""Embedding providers behind a Protocol.
+"""임베딩 제공자(Protocol 뒤의 Voyage 실제 구현과 해시 기반 Fake).
+
+역할: 문서 청크는 ``input_type="document"``, 질문은 ``"query"``로 임베딩하고, 개수·토큰 한도로 배치를 나눈다.
+주요 요소: ``Embedder``(Protocol), ``VoyageEmbedder``, ``FakeEmbedder``, ``iter_batches``, ``EmbeddingError``(retryable).
+호출 관계: ``providers.make_embedder``가 만들고 ``jobs.handlers``(문서)와 ``answering.service.retrieve``(질문)가 쓴다.
+학습 문서: docs/study/05-rag-retrieval.md
+
+Embedding providers behind a Protocol.
 
 Documents are embedded with ``input_type="document"``, questions with ``input_type="query"``.
 Voyage limits each request to 1,000 texts and a per-model token budget, so documents are

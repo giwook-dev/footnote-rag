@@ -1,4 +1,12 @@
-"""Job handlers: ``import_dart`` and ``ingest_text``.
+"""작업 핸들러: ``import_dart``(OpenDART 원문)와 ``ingest_text``(업로드 파일).
+
+역할: 다운로드·파싱·청킹·임베딩은 트랜잭션 밖에서 하고, 결과 저장(청크 삭제 후 재삽입, 문서 ready,
+작업 succeeded, 감사)은 한 트랜잭션으로 한다. 외부 오류를 재시도 가능/불가 작업 오류로 바꾼다.
+주요 요소: ``handle_import_dart``, ``handle_ingest_text``, ``_embed_and_store``, ``load_dart_zip``, ``HANDLERS``.
+호출 관계: ``jobs.worker.Worker``가 작업 type으로 골라 호출하고, ``dart``·``documents.chunking``·``retrieval.embedder``를 부른다.
+학습 문서: docs/study/02-request-walkthrough.md, docs/study/04-job-queue.md
+
+Job handlers: ``import_dart`` and ``ingest_text``.
 
 Each handler downloads/parses/chunks/embeds outside any transaction, then writes the
 result in ONE transaction: delete old chunks -> insert new chunks -> document ready ->
