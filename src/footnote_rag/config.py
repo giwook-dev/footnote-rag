@@ -1,6 +1,6 @@
 """애플리케이션 설정(환경변수 → ``Settings``).
 
-역할: 모든 설정값과 기본값, Claude 가격표(``DEFAULT_LLM_PRICES``), 제공자 모드(auto/fake/real) 해석.
+역할: 모든 설정값과 기본값, Claude 가격표(``DEFAULT_LLM_PRICES``), 제공자 모드(auto/fake/real, LLM은 local 추가) 해석.
 주요 요소: ``Settings``, ``ModelPrice``, ``load_settings``, ``get_settings``(lru_cache).
 호출 관계: 거의 모든 모듈이 ``get_settings()``를 읽는다. ``providers``가 ``*_mode``로 실제/Fake를 고른다.
 학습 문서: docs/study/09-testing-and-ops.md (SecretStr, Fake 모드)
@@ -24,6 +24,13 @@ from pydantic import BaseModel, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderChoice = Literal["auto", "fake", "real"]
+# The LLM additionally accepts "local" (Ollama on the host). Never chosen by "auto".
+LLMProviderChoice = Literal["auto", "fake", "real", "local"]
+LLMMode = Literal["fake", "real", "local"]
+
+# llm_calls.model prefix for local (Ollama) models. Local inference costs nothing per token,
+# so usage.pricing prices every model with this prefix at 0 (see compute_cost).
+LOCAL_MODEL_PREFIX = "ollama:"
 
 
 class ModelPrice(BaseModel):
@@ -97,7 +104,7 @@ class Settings(BaseSettings):
     opendart_api_key: SecretStr | None = None
 
     # --- provider selection: auto = real if the key is set, else fake ---
-    llm_provider: ProviderChoice = "auto"
+    llm_provider: LLMProviderChoice = "auto"
     embedder: ProviderChoice = "auto"
     dart_provider: ProviderChoice = "auto"
 
@@ -107,6 +114,15 @@ class Settings(BaseSettings):
     claude_max_tokens: int = 16000
     claude_timeout_seconds: float = 120.0
     llm_prices: dict[str, ModelPrice] = DEFAULT_LLM_PRICES
+
+    # --- local LLM (Ollama on the host, LLM_PROVIDER=local) ---
+    local_llm_base_url: str = "http://host.docker.internal:11434"
+    local_llm_model: str = "qwen3:14b"
+    local_llm_num_ctx: int = 16384
+    local_llm_max_tokens: int = 2048
+    local_llm_timeout_seconds: float = 180.0
+    local_llm_think: bool = False
+    local_llm_temperature: float = 0.0
 
     # --- embeddings ---
     embedding_model: str = "voyage-4"
@@ -152,7 +168,9 @@ class Settings(BaseSettings):
         return choice
 
     @property
-    def llm_mode(self) -> Literal["fake", "real"]:
+    def llm_mode(self) -> LLMMode:
+        if self.llm_provider == "local":
+            return "local"
         return self._resolve(self.llm_provider, self.anthropic_api_key)
 
     @property

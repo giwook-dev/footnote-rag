@@ -13,6 +13,8 @@
   const REPROCESSABLE_STATUSES = ["ready", "failed"];
   const AUDIT_REPORT_DETAILS = ["F001", "F002"];
   const ANNUAL_REPORT_HINT = "상장사는 감사보고서를 사업보고서(A001)에 포함해 공시합니다.";
+  const MODEL_REFERENCE = "model_reference";
+  const MODEL_REFERENCE_NOTICE = "로컬 모델이 지정한 근거 — 인용문은 근사 매칭";
 
   const state = {
     user: null,
@@ -235,9 +237,10 @@
     state.history = [];
     state.active = null;
     state.dartReports = [];
-    for (const id of ["answer-area", "history", "reviews-list", "usage-stats", "question-docs"]) {
+    for (const id of ["answer-area", "history", "reviews-list", "usage-stats", "question-docs", "llm-status"]) {
       $(id).replaceChildren();
     }
+    $("llm-status-detail").hidden = true;
     for (const id of ["dart-results", "docs-table", "audit-table"]) {
       $(id).querySelector("tbody").replaceChildren();
     }
@@ -792,6 +795,10 @@
     container.append(body);
 
     if (items.size > 0) {
+      // 로컬 모델은 Citations API가 없어 근거 번호만 고르고, 인용문은 서버가 근사 매칭으로 고른다.
+      if (notes.some((f) => f.citation_method === MODEL_REFERENCE)) {
+        container.append(el("p", { className: "note fn-method", text: MODEL_REFERENCE_NOTICE }));
+      }
       container.append(list);
     } else if (status === "pending_review" && state.user && state.user.role === "member") {
       container.append(
@@ -893,7 +900,36 @@
       $("usage-from").value = dateInputValue(weekAgo);
       $("usage-to").value = dateInputValue(today);
     }
-    await Promise.all([loadUsage(), loadAudit()]);
+    await Promise.all([loadLlmStatus(), loadUsage(), loadAudit()]);
+  }
+
+  const PROVIDER_LABELS = { fake: "Fake", real: "Claude API", local: "로컬(Ollama)" };
+
+  function yesNo(value, unknown) {
+    if (value === true) return "예";
+    if (value === false) return "아니요";
+    return unknown;
+  }
+
+  async function loadLlmStatus() {
+    const { data } = await api("/llm/status");
+    const stats = [
+      ["제공자", PROVIDER_LABELS[data.provider] || String(data.provider || "—")],
+      ["모델", String(data.model || "—")],
+      ["연결", yesNo(data.connected, "확인 안 함")],
+      ["모델 있음", yesNo(data.model_available, "—")],
+    ];
+    $("llm-status").replaceChildren(
+      ...stats.map(([label, value]) =>
+        el("div", {}, [el("dt", { text: label }), el("dd", { text: value })]),
+      ),
+    );
+    const detail = $("llm-status-detail");
+    const parts = [];
+    if (data.base_url) parts.push(`주소: ${data.base_url}`);
+    if (data.detail) parts.push(String(data.detail));
+    detail.textContent = parts.join(" · ");
+    detail.hidden = parts.length === 0;
   }
 
   async function loadUsage() {
@@ -1014,6 +1050,7 @@
 
     $("reviews-refresh").addEventListener("click", guard(loadReviews));
 
+    $("llm-status-refresh").addEventListener("click", guard(loadLlmStatus));
     $("usage-form").addEventListener("submit", (ev) => {
       ev.preventDefault();
       guard(loadUsage)();

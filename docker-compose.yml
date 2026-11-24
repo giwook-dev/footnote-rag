@@ -42,6 +42,10 @@ services:
     command: ["uvicorn", "footnote_rag.main:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
+    # LLM_PROVIDER=local: reach Ollama running on the host (Docker Desktop resolves this name
+    # already; host-gateway makes it work on Linux too). The worker never calls the LLM.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       migrate:
         condition: service_completed_successfully

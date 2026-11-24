@@ -1,7 +1,7 @@
 """외부 의존성(OpenDART, Voyage, Claude)의 실제/Fake 구현을 고르는 팩토리.
 
 역할: 설정의 ``dart_mode``·``embedder_mode``·``llm_mode``를 보고 구현체를 만든다. real인데 키가 없으면
-``MissingKeyError``.
+``MissingKeyError``. ``llm_mode == "local"``이면 키 없이 ``OllamaClient``(호스트 Ollama)를 만든다.
 주요 요소: ``make_dart_client``, ``make_embedder``, ``make_llm``.
 호출 관계: ``main.lifespan``, ``jobs.worker._main``, ``cli``, ``evals.run``이 호출한다.
 학습 문서: docs/study/09-testing-and-ops.md (실제/Fake 제공자 선택 구조)
@@ -70,6 +70,19 @@ def make_llm(settings: Settings | None = None) -> LLMClient:
     s = settings or get_settings()
     if s.llm_mode == "fake":
         return FakeLLM()
+    if s.llm_mode == "local":
+        from footnote_rag.answering.local_llm import OllamaClient
+
+        # Ollama on the host: no API key needed.
+        return OllamaClient(
+            base_url=s.local_llm_base_url,
+            model=s.local_llm_model,
+            num_ctx=s.local_llm_num_ctx,
+            max_tokens=s.local_llm_max_tokens,
+            timeout=s.local_llm_timeout_seconds,
+            think=s.local_llm_think,
+            temperature=s.local_llm_temperature,
+        )
     return ClaudeClient(
         api_key=_require(s.anthropic_api_key, "ANTHROPIC_API_KEY"),
         model=s.claude_model,

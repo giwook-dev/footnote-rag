@@ -78,7 +78,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         llm=settings.llm_mode,
         embedder=settings.embedder_mode,
         dart=settings.dart_mode,
-        model=settings.claude_model,
+        model=getattr(app.state.llm, "model", None),
     )
     yield
     await dispose_engine()

@@ -40,7 +40,7 @@
 1. 임시 조직과 관리자를 만든다(`seed_org`).
 2. 데이터셋에 나온 `rcept_no`마다 `request_dart_import`로 가져오기를 등록하고, `Worker.run_once`를 반복해 큐를 비운다. **API·워커와 같은 서비스 함수**를 쓰므로 Eval이 따로 노는 코드가 아니다.
 3. 질문마다 `retrieve`로 검색 결과를, `ask_question`으로 답변을 얻는다.
-4. 결과를 `ItemResult`로 모아 Markdown 리포트(`evals/reports/{timestamp}-{mode}.md`)를 쓴다.
+4. 결과를 `ItemResult`로 모아 Markdown 리포트(`evals/reports/{timestamp}-{mode}[-{provider}]-{model}.md`)를 쓴다. 머리말과 파일명에 LLM 제공자·모델·`citation_method`가 들어가 Claude(`api_citation`)와 로컬 Ollama(`model_reference`) 결과를 비교할 수 있다(`src/footnote_rag/evals/run.py::report_filename`).
 
 지표 계산 위치(`src/footnote_rag/evals/run.py::EvalSummary`):
 

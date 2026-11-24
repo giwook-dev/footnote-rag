@@ -1,6 +1,7 @@
 """LLM 클라이언트(Protocol 뒤의 Claude 실제 구현과 Fake).
 
 역할: Claude Messages API 요청을 만들고, 오류를 502/503으로 바꾸고, 응답을 ``LLMResponse``(dict 블록)로 정규화한다.
+로컬 모델(Ollama) 구현은 ``answering/local_llm.py``의 ``OllamaClient``다.
 주요 요소: ``LLMClient``(Protocol), ``ClaudeClient``(``request_params``, ``answer``), ``FakeLLM``, ``LLMError``.
 호출 관계: ``providers.make_llm``이 만들고 ``answering.service.ask_question``이 ``answer``를 호출한다.
 학습 문서: docs/study/06-claude-citations.md
@@ -34,8 +35,12 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 NO_EVIDENCE_TEXT = "제공된 문서에서 근거를 찾지 못했습니다."
 
 
+CITATION_API = "api_citation"  # Claude Citations API (search_result blocks)
+CITATION_MODEL_REFERENCE = "model_reference"  # local model picked source numbers itself
+
+
 class LLMError(Exception):
-    """Upstream LLM failure mapped to an HTTP status for the client (502 / 503)."""
+    """Upstream LLM failure mapped to an HTTP status for the client (502 / 503 / 504)."""
 
     def __init__(self, status_code: int, public_message: str) -> None:
         super().__init__(public_message)
@@ -58,6 +63,12 @@ class LLMResponse:
     content: list[dict[str, Any]] = field(default_factory=list)
     usage: LLMUsage = field(default_factory=LLMUsage)
     latency_ms: int = 0
+    # How the citations in ``content`` were produced; copied onto every footnote.
+    citation_method: str = CITATION_API
+    # Source numbers the model returned that were outside 1..k and were dropped (local only).
+    dropped_source_refs: int = 0
+    # Extra review-gate reasons decided by the client (e.g. "truncated" for local models).
+    review_flags: list[str] = field(default_factory=list)
 
 
 class LLMClient(Protocol):
@@ -65,6 +76,9 @@ class LLMClient(Protocol):
 
 
 class ClaudeClient:
+    provider = "real"
+    citation_method = CITATION_API
+
     def __init__(
         self,
         *,
@@ -83,6 +97,17 @@ class ClaudeClient:
         self.model = model
         self.effort = effort
         self.max_tokens = max_tokens
+
+    async def status(self) -> dict[str, Any]:
+        # No probe call: it would spend tokens (and the key) just to render an admin card.
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "base_url": None,
+            "connected": None,
+            "model_available": None,
+            "detail": "Claude API는 상태 확인용 호출을 하지 않습니다(호출 비용 방지).",
+        }
 
     def request_params(self, *, system: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
         return {
@@ -139,11 +164,23 @@ class FakeLLM:
     """
 
     model = "fake-llm"
+    provider = "fake"
+    citation_method = CITATION_API
 
     def __init__(self, *, stop_reason: str = "end_turn", model: str = "fake-llm") -> None:
         self.stop_reason = stop_reason
         self.model = model
         self.calls: list[dict[str, Any]] = []
+
+    async def status(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "base_url": None,
+            "connected": True,
+            "model_available": True,
+            "detail": "Fake 모드: 외부 호출 없이 합성 답변을 만듭니다.",
+        }
 
     async def answer(self, *, system: str, messages: list[dict[str, Any]]) -> LLMResponse:
         self.calls.append({"system": system, "messages": messages})
