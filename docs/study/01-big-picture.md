@@ -155,7 +155,7 @@ MCP 서버는 서비스 계층을 import하지 않고 HTTP로만 들어온다는
 **한계 (사실 그대로)**
 - **실제 DART 데이터를 아직 받지 못했다.** 작업 환경에서 `OPENDART_API_KEY`가 인식되지 않았다([docs/data-sources.md](../data-sources.md)).
 - 그래서 **DART XML 파서 구조는 가정**이며 합성 픽스처(`tests/fixtures/synthetic_audit_report.xml`, `src/footnote_rag/dart/fake_data.py`)로만 검증했다([07. OpenDART 연동](07-dart-integration.md)).
-- **Eval 데이터셋은 형식 예시 행만 있다**(`evals/dataset.jsonl`). 검색 품질·답변 품질을 수치로 말할 근거가 아직 없다([10. Eval과 MCP](10-eval-and-mcp.md)).
+- **Eval 실측은 로컬 모델 한 번뿐이다**(`evals/dataset.jsonl` 25문항, `ollama:qwen3:14b`). Claude 결과는 아직 없다([10. Eval과 MCP](10-eval-and-mcp.md)).
 - 성능(지연시간, 처리량)을 측정한 기록이 없다. 면접에서 숫자를 묻는다면 "측정하지 않았다"가 정확한 답이다.
 
 ## 확인 질문
@@ -181,5 +181,5 @@ MCP 서버는 서비스 계층을 import하지 않고 HTTP로만 들어온다는
 4. 이 저장소의 검색·답변 품질을 수치로 말할 수 있나?
    <details><summary>답</summary>
 
-   아니다. 실제 DART 보고서를 받지 못했고 Eval 데이터셋에 예시 행만 있어서 측정한 수치가 없다. Eval 실행기와 지표 계산 코드는 있지만, 실제 데이터로 돌린 결과는 없다.
+   일부만 말할 수 있다. 실제 사업보고서 3건으로 만든 25문항을 로컬 모델(`ollama:qwen3:14b`)로 한 번 돌린 결과가 있다(recall@8 95.2%, 인용 정확도 61.3%, 답할 수 없는 질문 거절 100%, 평균 11,639ms). Claude로는 아직 측정하지 않았다. 수치와 리포트 링크는 [README "Eval 결과 (실측)"](../../README.md#eval-결과-실측)에 있다.
    </details>

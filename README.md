@@ -19,6 +19,31 @@
 
 설계 근거는 [docs/architecture.md](docs/architecture.md)와 [docs/adr/](docs/adr/)에 있습니다.
 
+## Eval 결과 (실측)
+
+**데이터**: 실제 2025 사업연도 사업보고서(A001) 3건(삼성전자 `20260310002820`, NAVER `20260313001021`, 현대자동차 `20260318001394`)으로 만든 25문항([`evals/dataset.jsonl`](evals/dataset.jsonl)). 회사별 5~6문항(삼성전자 6, NAVER 6, 현대자동차 5), 두 회사 이상 비교 4문항, 문서에 근거가 없어 답하면 안 되는 질문 4문항입니다. 답할 수 있는 문항의 근거 인용문(`evidence_quote`)이 이 저장소 파서가 만든 원문 텍스트의 기대 목차 아래에 그대로 있는지 `python -m footnote_rag.evals.validate`로 확인했습니다(지어낸 인용문이면 실패).
+
+**측정 결과**: 2026-11-24, `python -m footnote_rag.evals.run --live`, 검색 상위 k=8. 로컬 모델은 Ollama `qwen3:14b`를 AMD RX 9070 XT(16GB)에서 실행했습니다. 리포트: [evals/reports/20261124T160504Z-live-local-qwen3-14b.md](evals/reports/20261124T160504Z-live-local-qwen3-14b.md)
+
+| 지표 | 로컬 `ollama:qwen3:14b` | Claude `claude-sonnet-5-5` |
+| --- | --- | --- |
+| 검색 recall@8 (답할 수 있는 21문항) | 95.2% | 미측정 |
+| 인용 정확도 (기대 목차를 가리키는 각주 비율) | 61.3% | 미측정 |
+| 답할 수 없는 질문 거절 (4문항) | 100% | 미측정 |
+| 답할 수 있는데 거절 (리포트 문항 표 기준) | 2/21 (`compare-02`, `compare-04`) | 미측정 |
+| 평균 지연 / 질문 | 11,639 ms | 미측정 |
+| 비용 | $0 (로컬) | 미측정 |
+
+Claude는 API 크레딧이 없어 아직 돌리지 않았습니다. 크레딧을 충전한 뒤 `LLM_PROVIDER=real`로 같은 명령을 실행하면 같은 형식의 리포트(`…-live-real-claude-sonnet-5-5.md`)가 생겨 나란히 비교할 수 있습니다.
+
+**해석**
+
+- **검색은 양호합니다.** 답할 수 있는 21문항 중 기대 목차가 상위 8개 검색 결과에 없었던 문항은 `naver-02` 하나입니다.
+- **약점은 모델이 근거 번호를 고르는 단계입니다.** `samsung-04`, `naver-01`, `naver-04`, `hyundai-03`은 기대 목차가 검색됐는데도 각주가 모두 다른 목차를 가리켰고, 비교 질문 `compare-03`은 각주 5개 중 1개만 맞았습니다. 로컬 모델은 Citations API 없이 근거 번호를 직접 고릅니다([ADR 0008](docs/adr/0008-local-llm-ollama.md)). 다음 실행부터는 리포트의 "Citation diagnostics" 표(기대 목차, 검색 상위 k의 경로·유사도, 모델이 인용한 경로)로 문항별 원인을 바로 확인할 수 있습니다.
+- 비교 질문 `compare-02`, `compare-04`는 검색은 성공했지만 검토 대기(`pending_review`)로 가서 답하지 않았습니다. 리포트의 새 지표 "answerable answered rate"·"false abstentions"가 이 경우를 따로 셉니다.
+- **파서 수정의 효과**: 원문 XML 오류 문자를 정리하기 전에는 NAVER 보고서가 11개, 현대차 보고서가 6개 섹션으로 무너져 한 섹션에 수십만 자가 들어갔고, 목차 경로가 근거 위치를 가리키지 못했습니다. 수정 후 삼성전자 110개, NAVER 117개, 현대자동차 125개 섹션으로 나뉩니다([docs/data-sources.md](docs/data-sources.md)).
+- 이 리포트의 "Import failures"(`20260318001394: processing None`)는 Eval과 compose의 `worker` 서비스가 같은 큐를 처리하면서 생긴 오판입니다. 현대차 문항은 정상 채점됐습니다. 지금은 Eval이 등록한 문서가 모두 `ready`/`failed`가 될 때까지 기다립니다([Eval](#eval)).
+
 ## 빠른 시작
 
 ### 1) Fake 모드 (키 없이)
@@ -303,9 +328,36 @@ python -m footnote_rag.cli dart-reprocess --org-admin-email ... (--rcept-no <rce
 python -m footnote_rag.evals.validate            # evidence_quote가 파서 출력에 그대로 있는지 검사
 python -m footnote_rag.evals.run                 # Fake 모드(기본): 비용 없음
 python -m footnote_rag.evals.run --live          # 설정한 제공자(LLM_PROVIDER=real → Claude, local → Ollama)
+python -m footnote_rag.evals.run --live --import-timeout 3600   # 가져오기 대기 상한(초, 기본 1800)
 ```
 
-리포트는 `evals/reports/{timestamp}-{mode}[-{provider}]-{model}.md`로 저장됩니다(예: `20261124T120000Z-live-local-qwen3-14b.md`, `…-live-real-claude-sonnet-5-5.md`, `…-fake-fake-llm.md`). 머리말에 제공자·모델·`citation_method`(`api_citation` / `model_reference`)가 적혀 있어 Claude와 로컬 결과를 나란히 비교할 수 있습니다. 지표는 검색 recall@k, 인용 정확도, 답하지 말아야 할 질문의 거절 비율, 평균 비용·지연시간입니다. CI에서는 돌리지 않습니다. 현재 `evals/dataset.jsonl`에는 형식 예시(`_example: true`)만 있습니다. 이유는 [docs/data-sources.md](docs/data-sources.md)를 보세요.
+**Docker로 실행하기**: `evals/`는 이미지에 들어 있지 않으므로 볼륨으로 마운트합니다. `data/`(원문 ZIP 캐시)는 compose 설정이 이미 마운트합니다. `db`가 떠 있어야 합니다(`docker compose up -d`). 로컬 LLM이면 호스트의 Ollama에 닿도록 `extra_hosts`가 있는 `api` 서비스로 실행합니다.
+
+bash:
+
+```bash
+docker compose run --rm --no-deps -v "$PWD/evals:/app/evals" api python -m footnote_rag.evals.validate
+docker compose run --rm --no-deps -v "$PWD/evals:/app/evals" api python -m footnote_rag.evals.run --live
+```
+
+PowerShell:
+
+```powershell
+docker compose run --rm --no-deps -v "${PWD}/evals:/app/evals" api python -m footnote_rag.evals.validate
+docker compose run --rm --no-deps -v "${PWD}/evals:/app/evals" api python -m footnote_rag.evals.run --live
+```
+
+출력을 파일로 남기려면 `… | tee evals/reports/live-run.log`(PowerShell은 `| Tee-Object evals/reports/live-run.log`)처럼 쓰세요. `evals/reports/*.log`는 커밋되지 않습니다.
+
+실행기는 임시 조직을 만들어 데이터셋의 공시를 정상 서비스로 가져오기 등록하고, 자체 워커로 큐를 처리합니다. compose의 `worker` 서비스가 같은 DB에서 작업을 먼저 가져갈 수 있으므로, 큐가 비어도 **등록한 문서가 모두 `ready` 또는 `failed`가 될 때까지 2초 간격으로 DB를 확인하며 기다립니다**(그동안 자체 워커도 계속 큐를 처리하므로 서비스 워커가 없어도 됩니다). `--import-timeout`을 넘기면 그 문서는 "Import failures"에 `timeout(<상태>)`로 기록됩니다.
+
+리포트는 `evals/reports/{timestamp}-{mode}[-{provider}]-{model}.md`로 저장됩니다(예: `20261124T120000Z-live-local-qwen3-14b.md`, `…-live-real-claude-sonnet-5-5.md`, `…-fake-fake-llm.md`). 머리말에 제공자·모델·`citation_method`(`api_citation` / `model_reference`)와 문서별 가져오기 결과(섹션 수, 청크 수, 임베딩 토큰, 캐시 적중·미스. 값은 `jobs.result`)가 적혀 있어 Claude와 로컬 결과를 나란히 비교할 수 있습니다. 리포트 내용:
+
+- **Metrics**: 검색 recall@k, 인용 정확도, 답하지 말아야 할 질문의 거절 비율, 평균 비용·지연시간, 그리고 answerable answered rate(답할 수 있는 질문 중 거절하지 않고 각주가 1개 이상인 비율), false abstentions(답할 수 있는데 거절한 문항 수와 id), 검색 성공 문항만으로 계산한 인용 정확도, 지연 p50/p95(nearest-rank).
+- **Metrics by question type**: 같은 지표를 문항 유형(id 접두어 `samsung`/`naver`/`hyundai`/`compare`/`unans`, 데이터셋에 `category` 필드가 있으면 그 값)별로 나눈 표.
+- **Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`. "정답이 검색됐는데 다른 근거를 골랐다"와 "정답이 검색되지 않았다"를 구분합니다. 본문 텍스트는 넣지 않습니다.
+
+CI에서는 돌리지 않습니다. 데이터셋 구성과 측정 결과는 위 [Eval 결과 (실측)](#eval-결과-실측)을 보세요.
 
 ## MCP 서버 (Claude Code 연결)
 

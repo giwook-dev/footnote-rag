@@ -9,7 +9,7 @@
 > **먼저 알아 둘 사실**
 > - 실제 DART 데이터를 아직 받지 못했다([docs/data-sources.md](../data-sources.md)).
 > - DART XML 파서 구조는 가정이며 합성 픽스처로만 검증했다([07](07-dart-integration.md)).
-> - Eval 데이터셋에는 형식 예시 행만 있다. 검색·답변 품질과 성능을 측정한 수치는 없다([10](10-eval-and-mcp.md)).
+> - Eval 실측은 로컬 모델(`ollama:qwen3:14b`) 한 번뿐이고 Claude 결과는 없다([10](10-eval-and-mcp.md), [README "Eval 결과 (실측)"](../../README.md#eval-결과-실측)).
 
 ## 읽는 순서
 

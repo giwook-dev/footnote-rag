@@ -1,14 +1,17 @@
-"""Eval 실행기(recall@k, 인용 정확도, 거절 비율, 평균 비용·지연시간).
+"""Eval 실행기(recall@k, 인용 정확도, 거절 비율, 과도한 거절, 비용·지연시간, 인용 진단).
 
-역할: 임시 조직을 만들어 데이터셋의 공시를 정상 서비스·워커로 가져오고, 질문마다 검색·답변 결과를 채점해
-Markdown 리포트를 쓴다. 기본은 Fake 모드(비용 없음), ``--live``는 실제 제공자.
-주요 요소: ``run_eval``, ``EvalSummary``(지표 속성), ``render_report``, ``write_report``, ``main``.
+역할: 임시 조직을 만들어 데이터셋의 공시를 정상 서비스·워커로 가져오고, 등록한 문서가 모두 ``ready``/``failed``가
+될 때까지 기다린 뒤(``wait_for_imports``) 질문마다 검색·답변 결과를 채점해 Markdown 리포트를 쓴다.
+기본은 Fake 모드(비용 없음), ``--live``는 실제 제공자.
+주요 요소: ``run_eval``, ``wait_for_imports``, ``EvalSummary``(지표 속성), ``ItemResult``, ``DocumentImport``,
+``item_category``, ``percentile``, ``render_report``, ``write_report``, ``main``.
 호출 관계: ``documents.service``, ``jobs.worker.Worker``, ``answering.service``를 그대로 호출한다.
 학습 문서: docs/study/10-eval-and-mcp.md
 
 Eval runner.
 
     python -m footnote_rag.evals.run [--dataset evals/dataset.jsonl] [--live] [--out evals/reports]
+                                     [--import-timeout 1800]
 
 Default is fake mode (FakeEmbedder / FakeLLM / FakeDartClient): no network, no cost; it
 exercises the pipeline mechanics. ``--live`` uses the configured providers, including the LLM
@@ -21,34 +24,60 @@ answering service and measures:
 
 * retrieval recall@k   - an expected-section chunk is among the top-k results
 * citation accuracy    - share of footnotes whose section_path matches an expected prefix
+  (also computed over retrieval-hit items only, to separate retrieval from model errors)
 * abstention           - unanswerable questions were not answered (no footnotes, "근거 없음",
                          or routed to review)
-* average cost / latency per question
+* answered rate        - answerable questions answered with >= 1 footnote; the rest are
+                         false abstentions (listed by id)
+* average cost, average / p50 / p95 latency per question
+
+Another worker on the same database (e.g. the compose ``worker`` service) may claim the import
+jobs first, so after draining the queue itself the runner polls the documents until every one
+it registered is ``ready`` or ``failed`` (``--import-timeout``); a document still busy then is
+reported as ``timeout(<status>)``.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import re
 import sys
+import time
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from footnote_rag.answering.llm import CITATION_API, NO_EVIDENCE_TEXT, LLMClient
 from footnote_rag.answering.service import ask_question, retrieve
 from footnote_rag.config import LOCAL_MODEL_PREFIX, Settings, get_settings
 from footnote_rag.dart.client import DartClient
 from footnote_rag.db.models import Document, User
-from footnote_rag.documents.service import request_dart_import
+from footnote_rag.documents.service import latest_jobs_for_documents, request_dart_import
 from footnote_rag.evals.dataset import DEFAULT_DATASET, EvalItem, load_dataset
 from footnote_rag.jobs.handlers import JobContext
 from footnote_rag.jobs.worker import Worker
 from footnote_rag.orgs.service import seed_org
 from footnote_rag.retrieval.embedder import Embedder
+
+DEFAULT_IMPORT_TIMEOUT_SECONDS = 1800.0
+IMPORT_POLL_SECONDS = 2.0
+TERMINAL_DOCUMENT_STATUSES = frozenset({"ready", "failed"})
+
+
+@dataclass
+class RetrievedRef:
+    """One top-k search hit, reduced to what the diagnostics show (no chunk text)."""
+
+    section_path: str
+    score: float
+    expected: bool
 
 
 @dataclass
@@ -62,6 +91,106 @@ class ItemResult:
     cost_usd: Decimal | None
     latency_ms: int
     answer_preview: str
+    retrieved: list[RetrievedRef] = field(default_factory=list)
+    cited_paths: list[str] = field(default_factory=list)
+
+    @property
+    def answered(self) -> bool:
+        """Not abstained and cites at least one footnote."""
+        return not self.abstained and self.footnotes_total > 0
+
+    @property
+    def has_wrong_citation(self) -> bool:
+        """An answerable item with a footnote outside the expected sections (unanswerable items
+        have no expected section; their citations are not scored, as in citation accuracy)."""
+        return self.item.answerable and self.footnotes_matching < self.footnotes_total
+
+
+@dataclass
+class DocumentImport:
+    """Per-filing import outcome; counts come from the import job's ``jobs.result``."""
+
+    rcept_no: str
+    corp_name: str | None
+    status: str
+    section_count: int | None = None
+    chunk_count: int | None = None
+    embedding_tokens: int | None = None
+    cache_hits: int | None = None
+    cache_misses: int | None = None
+    error: str | None = None
+
+
+def item_category(item: EvalItem) -> str:
+    """Question type for the per-type table.
+
+    The dataset's ``category`` field if present, else the id prefix (``samsung-01`` ->
+    ``samsung``, ``compare-03`` -> ``compare``, ``unans-02`` -> ``unans``), else derived from
+    the row (``unans`` / ``compare`` / first company name).
+    """
+    explicit = item.raw.get("category") if isinstance(item.raw, dict) else None
+    if explicit:
+        return str(explicit)
+    m = re.fullmatch(r"([A-Za-z]+)-\d+", item.id)
+    if m:
+        return m.group(1)
+    if not item.answerable:
+        return "unans"
+    if item.is_comparison:
+        return "compare"
+    return item.corp_names[0] if item.corp_names else "other"
+
+
+def percentile(values: Sequence[float], pct: float) -> float | None:
+    """Nearest-rank percentile (``pct`` in 0-100): the smallest value with at least pct% of
+    the values <= it. None for an empty input."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(pct / 100 * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+# ---- metrics over any list of results (whole run or one question type) ----
+
+
+def _answerable(rows: Sequence[ItemResult]) -> list[ItemResult]:
+    return [r for r in rows if r.item.answerable]
+
+
+def recall_at_k(rows: Sequence[ItemResult]) -> float | None:
+    scored = [r for r in _answerable(rows) if r.retrieval_hit is not None]
+    return sum(r.retrieval_hit for r in scored) / len(scored) if scored else None
+
+
+def citation_accuracy(rows: Sequence[ItemResult]) -> float | None:
+    answerable = _answerable(rows)
+    total = sum(r.footnotes_total for r in answerable)
+    return sum(r.footnotes_matching for r in answerable) / total if total else None
+
+
+def citation_accuracy_retrieval_hit(rows: Sequence[ItemResult]) -> float | None:
+    """Citation accuracy over answerable items whose expected section was retrieved."""
+    return citation_accuracy([r for r in rows if r.retrieval_hit is True])
+
+
+def abstention_rate(rows: Sequence[ItemResult]) -> float | None:
+    unanswerable = [r for r in rows if not r.item.answerable]
+    return sum(r.abstained for r in unanswerable) / len(unanswerable) if unanswerable else None
+
+
+def answered_rate(rows: Sequence[ItemResult]) -> float | None:
+    answerable = _answerable(rows)
+    return sum(r.answered for r in answerable) / len(answerable) if answerable else None
+
+
+def false_abstentions(rows: Sequence[ItemResult]) -> list[str]:
+    """Ids of answerable questions that were not answered (abstained or no footnote)."""
+    return [r.item.id for r in _answerable(rows) if not r.answered]
+
+
+def latency_percentile(rows: Sequence[ItemResult], pct: float) -> float | None:
+    return percentile([r.latency_ms for r in rows], pct)
 
 
 @dataclass
@@ -72,28 +201,35 @@ class EvalSummary:
     results: list[ItemResult] = field(default_factory=list)
     skipped_examples: int = 0
     import_failures: list[str] = field(default_factory=list)
+    imports: list[DocumentImport] = field(default_factory=list)
     # Which LLM produced the answers, so Claude and local (Ollama) reports can be compared.
     provider: str = "unknown"
     model: str = "unknown"
     citation_method: str = CITATION_API
 
-    def _answerable(self) -> list[ItemResult]:
-        return [r for r in self.results if r.item.answerable]
-
     @property
     def recall_at_k(self) -> float | None:
-        rows = [r for r in self._answerable() if r.retrieval_hit is not None]
-        return sum(r.retrieval_hit for r in rows) / len(rows) if rows else None
+        return recall_at_k(self.results)
 
     @property
     def citation_accuracy(self) -> float | None:
-        total = sum(r.footnotes_total for r in self._answerable())
-        return sum(r.footnotes_matching for r in self._answerable()) / total if total else None
+        return citation_accuracy(self.results)
+
+    @property
+    def citation_accuracy_retrieval_hit(self) -> float | None:
+        return citation_accuracy_retrieval_hit(self.results)
 
     @property
     def abstention_rate(self) -> float | None:
-        rows = [r for r in self.results if not r.item.answerable]
-        return sum(r.abstained for r in rows) / len(rows) if rows else None
+        return abstention_rate(self.results)
+
+    @property
+    def answered_rate(self) -> float | None:
+        return answered_rate(self.results)
+
+    @property
+    def false_abstentions(self) -> list[str]:
+        return false_abstentions(self.results)
 
     @property
     def avg_cost_usd(self) -> Decimal | None:
@@ -107,6 +243,20 @@ class EvalSummary:
     @property
     def avg_latency_ms(self) -> float | None:
         return sum(r.latency_ms for r in self.results) / len(self.results) if self.results else None
+
+    @property
+    def latency_p50_ms(self) -> float | None:
+        return latency_percentile(self.results, 50)
+
+    @property
+    def latency_p95_ms(self) -> float | None:
+        return latency_percentile(self.results, 95)
+
+    def by_category(self) -> dict[str, list[ItemResult]]:
+        groups: dict[str, list[ItemResult]] = {}
+        for r in self.results:
+            groups.setdefault(item_category(r.item), []).append(r)
+        return groups
 
 
 def _matches(path: str, prefixes: list[str]) -> bool:
@@ -132,11 +282,132 @@ def report_filename(summary: EvalSummary, stamp: str) -> str:
     return "-".join(parts) + ".md"
 
 
+# ---- rendering ----
+
+
 def _pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 100:.1f}%"
 
 
+def _ms(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.0f}"
+
+
+def _opt(value: object) -> str:
+    return "-" if value is None else str(value)
+
+
+def _cell(text: str) -> str:
+    """Make a value safe inside a Markdown table cell."""
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _ratio(rate: float | None, rows: Sequence[ItemResult]) -> str:
+    answerable = _answerable(rows)
+    if rate is None:
+        return "n/a"
+    return f"{_pct(rate)} ({sum(r.answered for r in answerable)}/{len(answerable)})"
+
+
+def _render_imports(summary: EvalSummary) -> list[str]:
+    if not summary.imports:
+        return []
+    lines = [
+        "## Imports",
+        "",
+        "| rcept_no | company | status | sections | chunks | embedding tokens "
+        "| cache hits | cache misses |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for d in summary.imports:
+        lines.append(
+            f"| {d.rcept_no} | {_cell(d.corp_name or '-')} | {d.status} | {_opt(d.section_count)} "
+            f"| {_opt(d.chunk_count)} | {_opt(d.embedding_tokens)} | {_opt(d.cache_hits)} "
+            f"| {_opt(d.cache_misses)} |"
+        )
+    return [*lines, ""]
+
+
+def _render_categories(summary: EvalSummary) -> list[str]:
+    groups = summary.by_category()
+    if not groups:
+        return []
+    lines = [
+        "## Metrics by question type",
+        "",
+        f"| type | items | recall@{summary.k} | citation accuracy | citation acc. (retrieval hit) "
+        "| answered (answerable) | false abstentions | unanswerable abstained "
+        "| latency p50 ms | latency p95 ms |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for name, rows in groups.items():
+        false_ids = false_abstentions(rows)
+        lines.append(
+            f"| {_cell(name)} | {len(rows)} | {_pct(recall_at_k(rows))} "
+            f"| {_pct(citation_accuracy(rows))} | {_pct(citation_accuracy_retrieval_hit(rows))} "
+            f"| {_ratio(answered_rate(rows), rows)} "
+            f"| {len(false_ids) if _answerable(rows) else '-'} "
+            f"| {_pct(abstention_rate(rows))} "
+            f"| {_ms(latency_percentile(rows, 50))} | {_ms(latency_percentile(rows, 95))} |"
+        )
+    return [*lines, ""]
+
+
+def _diagnosis(r: ItemResult) -> str:
+    expected_ranks = [i for i, ref in enumerate(r.retrieved, start=1) if ref.expected]
+    if expected_ranks:
+        ranks = ", ".join(str(i) for i in expected_ranks)
+        return f"expected section retrieved (rank {ranks}); the model cited other evidence"
+    return "expected section not in top-k; retrieval miss"
+
+
+def _render_diagnostics(summary: EvalSummary) -> list[str]:
+    wrong = [r for r in summary.results if r.has_wrong_citation]
+    lines = [
+        "## Citation diagnostics",
+        "",
+        "Answerable items with at least one footnote outside the expected sections. Paths and similarity "
+        "scores only (no document text). `✓` = path starts with an expected prefix.",
+        "",
+    ]
+    if not wrong:
+        return [*lines, "No wrong citations.", ""]
+    for r in wrong:
+        prefixes = ", ".join(f"`{p}`" for p in r.item.expected_section_prefixes) or "-"
+        lines += [
+            f"### {r.item.id}",
+            "",
+            f"- expected section prefixes: {prefixes}",
+            f"- cited ok/total: {r.footnotes_matching}/{r.footnotes_total}",
+            f"- diagnosis: {_diagnosis(r)}",
+            "",
+            f"| top-{summary.k} rank | score | expected | retrieved section_path |",
+            "| --- | --- | --- | --- |",
+        ]
+        if r.retrieved:
+            lines += [
+                f"| {i} | {ref.score:.3f} | {'✓' if ref.expected else ''} "
+                f"| {_cell(ref.section_path)} |"
+                for i, ref in enumerate(r.retrieved, start=1)
+            ]
+        else:
+            lines.append("| - | - | - | (no results) |")
+        prefixes_list = r.item.expected_section_prefixes
+        lines += [
+            "",
+            "| footnote | expected | cited section_path |",
+            "| --- | --- | --- |",
+        ]
+        lines += [
+            f"| [{i}] | {'✓' if _matches(path, prefixes_list) else ''} | {_cell(path)} |"
+            for i, path in enumerate(r.cited_paths, start=1)
+        ]
+        lines.append("")
+    return lines
+
+
 def render_report(summary: EvalSummary) -> str:
+    false_ids = summary.false_abstentions
     lines = [
         f"# Eval report ({summary.mode}, {summary.provider}, {summary.model})",
         "",
@@ -148,6 +419,7 @@ def render_report(summary: EvalSummary) -> str:
         f"- evaluated rows: {len(summary.results)} (skipped `_example` rows: {summary.skipped_examples})",
         f"- k: {summary.k}",
         "",
+        *_render_imports(summary),
         "## Metrics",
         "",
         "| metric | value |",
@@ -160,6 +432,14 @@ def render_report(summary: EvalSummary) -> str:
         f"| avg latency (ms) | {summary.avg_latency_ms:.0f} |"
         if summary.avg_latency_ms is not None
         else "| avg latency (ms) | n/a |",
+        f"| answerable answered rate | {_ratio(summary.answered_rate, summary.results)} |",
+        f"| false abstentions (answerable, not answered) | {len(false_ids)}"
+        + (f" ({', '.join(false_ids)})" if false_ids else "")
+        + " |",
+        f"| citation accuracy (retrieval-hit items only) "
+        f"| {_pct(summary.citation_accuracy_retrieval_hit)} |",
+        f"| latency p50 (ms) | {_ms(summary.latency_p50_ms)} |",
+        f"| latency p95 (ms) | {_ms(summary.latency_p95_ms)} |",
         "",
     ]
     if summary.mode == "fake":
@@ -168,6 +448,7 @@ def render_report(summary: EvalSummary) -> str:
             "> not answer quality.",
             "",
         ]
+    lines += _render_categories(summary)
     if summary.import_failures:
         lines += ["## Import failures", ""] + [f"- {f}" for f in summary.import_failures] + [""]
     lines += [
@@ -183,7 +464,96 @@ def render_report(summary: EvalSummary) -> str:
             f"{r.footnotes_matching}/{r.footnotes_total} | {r.abstained} | "
             f"{r.cost_usd if r.cost_usd is not None else 'n/a'} | {r.latency_ms} |"
         )
-    return "\n".join(lines) + "\n"
+    lines.append("")
+    lines += _render_diagnostics(summary)
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+# ---- import wait ----
+
+
+async def _document_statuses(
+    sm: async_sessionmaker[AsyncSession], doc_ids: dict[str, uuid.UUID]
+) -> dict[str, Document | None]:
+    async with sm() as session:
+        return {
+            rcept_no: await session.get(Document, doc_id) for rcept_no, doc_id in doc_ids.items()
+        }
+
+
+async def wait_for_imports(
+    sm: async_sessionmaker[AsyncSession],
+    worker: Worker,
+    doc_ids: dict[str, uuid.UUID],
+    *,
+    timeout_seconds: float = DEFAULT_IMPORT_TIMEOUT_SECONDS,
+    poll_seconds: float = IMPORT_POLL_SECONDS,
+    max_worker_loops: int = 1000,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+) -> list[str]:
+    """Run ``worker`` and poll until every document is ``ready`` or ``failed``.
+
+    Another worker may hold some of the jobs, so an empty queue does not mean the imports are
+    done. Between polls our own worker keeps draining whatever is runnable (a retry whose
+    backoff expired, or every job when no service worker is running). Returns the import
+    failure lines: ``"{rcept_no}: failed {error}"`` or ``"{rcept_no}: timeout({status})"``.
+    """
+    started = clock()
+    while True:
+        for _ in range(max_worker_loops):
+            if not await worker.run_once():
+                break
+        docs = await _document_statuses(sm, doc_ids)
+        pending = {
+            r: d for r, d in docs.items() if d is None or d.status not in TERMINAL_DOCUMENT_STATUSES
+        }
+        if not pending:
+            break
+        if clock() - started >= timeout_seconds:
+            return [
+                *_failed_lines(docs),
+                *(
+                    f"{r}: timeout({d.status if d else 'missing'}) after {timeout_seconds:.0f}s"
+                    for r, d in pending.items()
+                ),
+            ]
+        await sleep(poll_seconds)
+    return _failed_lines(docs)
+
+
+def _failed_lines(docs: dict[str, Document | None]) -> list[str]:
+    return [
+        f"{r}: failed {d.error or ''}".rstrip()
+        for r, d in docs.items()
+        if d and d.status == "failed"
+    ]
+
+
+async def _collect_imports(
+    sm: async_sessionmaker[AsyncSession], org_id: uuid.UUID, doc_ids: dict[str, uuid.UUID]
+) -> list[DocumentImport]:
+    async with sm() as session:
+        jobs = await latest_jobs_for_documents(session, org_id, list(doc_ids.values()))
+        out = []
+        for rcept_no, doc_id in doc_ids.items():
+            doc = await session.get(Document, doc_id)
+            job = jobs.get(doc_id)
+            result = job.result if job is not None and isinstance(job.result, dict) else {}
+            out.append(
+                DocumentImport(
+                    rcept_no=rcept_no,
+                    corp_name=(doc.meta or {}).get("corp_name") if doc else None,
+                    status=doc.status if doc else "missing",
+                    section_count=result.get("section_count"),
+                    chunk_count=result.get("chunk_count"),
+                    embedding_tokens=result.get("embedding_tokens"),
+                    cache_hits=result.get("embedding_cache_hits"),
+                    cache_misses=result.get("embedding_cache_misses"),
+                    error=doc.error if doc else None,
+                )
+            )
+    return out
 
 
 async def run_eval(
@@ -196,6 +566,8 @@ async def run_eval(
     mode: str,
     dataset_name: str,
     max_worker_loops: int = 1000,
+    import_timeout_seconds: float = DEFAULT_IMPORT_TIMEOUT_SECONDS,
+    import_poll_seconds: float = IMPORT_POLL_SECONDS,
 ) -> EvalSummary:
     from footnote_rag.db.session import get_sessionmaker
 
@@ -222,6 +594,7 @@ async def run_eval(
             admin_email=f"eval-{run_id}@eval.local",
             admin_password=uuid.uuid4().hex,
         )
+    org_id = admin.org_id
     rcept_to_doc: dict[str, uuid.UUID] = {}
     async with sm() as session:
         user = await session.get(User, admin.id)
@@ -235,16 +608,15 @@ async def run_eval(
         context=JobContext(sm, settings, embedder, dart_client),
         worker_id=f"eval-{run_id}",
     )
-    for _ in range(max_worker_loops):
-        if not await worker.run_once():
-            break
-    async with sm() as session:
-        for rcept_no, doc_id in rcept_to_doc.items():
-            doc = await session.get(Document, doc_id)
-            if doc is None or doc.status != "ready":
-                summary.import_failures.append(
-                    f"{rcept_no}: {doc.status if doc else 'missing'} {doc.error if doc else ''}"
-                )
+    summary.import_failures = await wait_for_imports(
+        sm,
+        worker,
+        rcept_to_doc,
+        timeout_seconds=import_timeout_seconds,
+        poll_seconds=import_poll_seconds,
+        max_worker_loops=max_worker_loops,
+    )
+    summary.imports = await _collect_imports(sm, org_id, rcept_to_doc)
 
     for item in runnable:
         doc_ids = [rcept_to_doc[r] for r in item.rcept_nos if r in rcept_to_doc]
@@ -272,7 +644,8 @@ async def run_eval(
                 settings=settings,
             )
         prefixes = item.expected_section_prefixes
-        matching = sum(1 for f in ask.footnotes if _matches(f.get("section_path", ""), prefixes))
+        cited_paths = [str(f.get("section_path", "")) for f in ask.footnotes]
+        matching = sum(1 for p in cited_paths if _matches(p, prefixes))
         abstained = (
             not ask.footnotes
             or ask.answer.status == "pending_review"
@@ -292,6 +665,15 @@ async def run_eval(
                 cost_usd=Decimal(cost) if cost is not None else None,
                 latency_ms=ask.latency_ms,
                 answer_preview=ask.answer.text[:80],
+                retrieved=[
+                    RetrievedRef(
+                        h.section_path,
+                        h.score,
+                        bool(prefixes) and _matches(h.section_path, prefixes),
+                    )
+                    for h in hits
+                ],
+                cited_paths=cited_paths,
             )
         )
     return summary
@@ -333,6 +715,7 @@ async def _amain(args: argparse.Namespace) -> int:
             dart_client=dart,
             mode=mode,
             dataset_name=str(args.dataset),
+            import_timeout_seconds=args.import_timeout,
         )
     finally:
         await dispose_engine()
@@ -349,6 +732,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--live", action="store_true", help="use real providers (costs money)")
     parser.add_argument("--out", type=Path, default=Path("evals/reports"))
+    parser.add_argument(
+        "--import-timeout",
+        type=float,
+        default=DEFAULT_IMPORT_TIMEOUT_SECONDS,
+        help="seconds to wait for every imported filing to become ready/failed (default 1800)",
+    )
     return asyncio.run(_amain(parser.parse_args(argv)))
 
 
