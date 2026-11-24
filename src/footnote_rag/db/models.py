@@ -1,4 +1,13 @@
-"""ORM models. The schema itself is created by Alembic (see alembic/versions)."""
+"""SQLAlchemy ORM 모델(테이블 매핑). 스키마 생성은 Alembic 마이그레이션이 맡는다.
+
+역할: organizations, users, documents, chunks(pgvector), jobs, questions, answers, llm_calls,
+audit_logs 테이블과 상태 enum 값을 정의한다.
+주요 요소: ``Document``, ``Chunk``, ``Job``, ``Answer``, ``LlmCall``, ``AuditLog``, ``ANSWER_STATUSES`` 등.
+호출 관계: 서비스·라우터·워커가 import해 쿼리한다. 실제 DDL은 alembic/versions/0001_initial.py.
+학습 문서: docs/study/01-big-picture.md, ERD는 docs/architecture.md
+
+ORM models. The schema itself is created by Alembic (see alembic/versions).
+"""
 
 from __future__ import annotations
 

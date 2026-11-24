@@ -1,4 +1,12 @@
-"""/documents and /jobs endpoints."""
+"""문서·작업 엔드포인트(``POST /documents/dart``, ``POST /documents/upload``, ``GET /documents``, ``GET /jobs/{id}``).
+
+역할: 요청을 검증(``rcept_no`` 14자리)하고 서비스에 넘기며, 처음 요청은 202, 중복 요청은 200을 돌려준다.
+주요 요소: ``import_dart``, ``upload_text``, ``list_documents``, ``get_document``, ``get_job``.
+호출 관계: ``documents.service``의 ``request_dart_import``·``create_text_upload``를 호출한다.
+학습 문서: docs/study/02-request-walkthrough.md
+
+/documents and /jobs endpoints.
+"""
 
 from __future__ import annotations
 

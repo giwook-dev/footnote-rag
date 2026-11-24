@@ -205,3 +205,4 @@ claude mcp add footnote-rag \
 - [docs/adr/](docs/adr/): 기술 결정 기록
 - [docs/data-sources.md](docs/data-sources.md): 사용한 공시와 수집 방법
 - [docs/ai-usage.md](docs/ai-usage.md): AI 활용 내역(초안)
+- [docs/study/README.md](docs/study/README.md): 학습 자료. 코드를 읽는 순서, 요청 흐름 해설, 설계 이유·대안·한계, 면접 Q&A, 용어집, 실습

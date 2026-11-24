@@ -1,4 +1,11 @@
-"""Append-only audit trail.
+"""감사 로그 기록(append-only).
+
+역할: 호출자 세션에 감사 행을 *추가만* 해서 업무 변경과 같은 트랜잭션으로 커밋(또는 롤백)되게 한다.
+주요 요소: ``record``, action 이름 모음 ``Actions``, 금지 metadata 키 ``FORBIDDEN_METADATA_KEYS``.
+호출 관계: auth·orgs·documents·jobs·answering·reviews가 호출한다. UPDATE/DELETE 거부는 DB 트리거 몫.
+학습 문서: docs/study/08-review-audit-usage.md
+
+Append-only audit trail.
 
 ``record`` only *adds* a row to the caller's session, so the audit entry commits (or rolls
 back) together with the business change it describes. Never put passwords, tokens, API

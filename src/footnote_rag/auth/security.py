@@ -1,4 +1,13 @@
-"""Password hashing (argon2) and JWT access tokens."""
+"""비밀번호 해시(argon2, pwdlib)와 JWT 발급·검증.
+
+역할: 비밀번호를 해시·검증하고(없는 이메일도 더미 해시로 비슷한 시간 소비), HS256 JWT를 만들고 푼다.
+주요 요소: ``hash_password``, ``verify_password``, ``create_access_token``, ``decode_access_token``,
+``TokenClaims``(sub=user_id, org_id, role).
+호출 관계: ``auth.router.login``과 ``auth.deps.get_current_user``가 호출한다.
+학습 문서: docs/study/03-auth-rbac-isolation.md
+
+Password hashing (argon2) and JWT access tokens.
+"""
 
 from __future__ import annotations
 

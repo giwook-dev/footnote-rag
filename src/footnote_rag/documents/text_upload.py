@@ -1,4 +1,12 @@
-"""TXT / Markdown uploads -> sections. Markdown ``#`` headings become the section path."""
+"""TXT·Markdown 업로드를 섹션으로 나누는 파서.
+
+역할: UTF-8(BOM 허용) 또는 CP949로 디코드하고, Markdown ``#`` 제목을 목차 경로로 쓴다(코드 블록 안은 무시).
+주요 요소: ``decode_upload``, ``parse_text_document``, ``ALLOWED_EXTENSIONS``, ``UploadParseError``.
+호출 관계: ``documents.service.create_text_upload``(확장자 검사)와 ``jobs.handlers.handle_ingest_text``가 쓴다.
+학습 문서: docs/study/02-request-walkthrough.md
+
+TXT / Markdown uploads -> sections. Markdown ``#`` headings become the section path.
+"""
 
 from __future__ import annotations
 

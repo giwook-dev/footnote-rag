@@ -1,4 +1,12 @@
-"""Structured JSON logging, request IDs and secret masking."""
+"""구조화 로그(structlog JSON), request_id 전파, 비밀값 마스킹.
+
+역할: 로그 이벤트에 ``request_id``를 붙이고 비밀번호·토큰·``crtfc_key`` 값을 ``***``로 가린다.
+주요 요소: ``configure_logging``, ``get_logger``, ``mask_url``, ``request_id_var``(ContextVar).
+호출 관계: ``main``의 미들웨어가 ``request_id_var``를 설정하고, ``audit.service.record``가 그 값을 읽는다.
+학습 문서: docs/study/09-testing-and-ops.md (관측성), docs/study/07-dart-integration.md (키 마스킹)
+
+Structured JSON logging, request IDs and secret masking.
+"""
 
 from __future__ import annotations
 

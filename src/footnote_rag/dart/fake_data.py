@@ -1,4 +1,11 @@
-"""Synthetic DART data for fake mode and tests. NOT real filings.
+"""Fake 모드와 테스트용 합성 DART 데이터. 실제 공시가 아니다.
+
+역할: ``(합성)`` 표시가 붙은 가상 회사 3곳의 공시 목록, 원문 XML/ZIP(첨부 XML 포함), corpCode ZIP을 만든다.
+주요 요소: ``FAKE_CORPS``, ``FAKE_REPORTS``, ``build_document_xml``, ``build_document_zip``, ``build_corp_code_zip``.
+호출 관계: ``dart.client.FakeDartClient``가 호출한다. 파서는 이 데이터와 테스트 픽스처로만 검증됐다.
+학습 문서: docs/study/07-dart-integration.md, docs/study/09-testing-and-ops.md
+
+Synthetic DART data for fake mode and tests. NOT real filings.
 
 Company names carry the "(합성)" marker and corp codes start with 99 so nobody mistakes
 this for real disclosure data.

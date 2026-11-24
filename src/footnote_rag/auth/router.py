@@ -1,4 +1,12 @@
-"""/auth/token and /users endpoints."""
+"""로그인(``POST /auth/token``)과 사용자 엔드포인트(``/users/me``, ``POST /users``).
+
+역할: OAuth2 password flow로 이메일·비밀번호를 검증해 JWT를 발급하고, 성공·실패를 감사 로그에 남긴다.
+주요 요소: ``login``, ``me``, ``create_user_endpoint``.
+호출 관계: ``orgs.service``(사용자 조회·생성), ``auth.security``(해시 검증·토큰 생성), ``audit.service.record``.
+학습 문서: docs/study/03-auth-rbac-isolation.md
+
+/auth/token and /users endpoints.
+"""
 
 from __future__ import annotations
 

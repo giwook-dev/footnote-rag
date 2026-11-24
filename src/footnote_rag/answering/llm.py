@@ -1,4 +1,11 @@
-"""LLM clients behind a Protocol.
+"""LLM 클라이언트(Protocol 뒤의 Claude 실제 구현과 Fake).
+
+역할: Claude Messages API 요청을 만들고, 오류를 502/503으로 바꾸고, 응답을 ``LLMResponse``(dict 블록)로 정규화한다.
+주요 요소: ``LLMClient``(Protocol), ``ClaudeClient``(``request_params``, ``answer``), ``FakeLLM``, ``LLMError``.
+호출 관계: ``providers.make_llm``이 만들고 ``answering.service.ask_question``이 ``answer``를 호출한다.
+학습 문서: docs/study/06-claude-citations.md
+
+LLM clients behind a Protocol.
 
 ``ClaudeClient`` uses the official ``anthropic`` SDK only:
 

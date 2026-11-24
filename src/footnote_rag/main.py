@@ -1,4 +1,12 @@
-"""FastAPI application."""
+"""FastAPI 앱 진입점.
+
+역할: 라우터를 묶고, 요청마다 ``X-Request-ID``를 붙이는 미들웨어와 ``/healthz``·``/readyz``를 둔다.
+주요 요소: ``create_app``(앱 조립), ``lifespan``(로깅 설정, 운영 JWT 검사, 임베더·LLM 생성).
+호출 관계: uvicorn이 ``app``을 띄우고, 앱은 각 ``*/router.py``와 ``providers``를 호출한다.
+학습 문서: docs/study/01-big-picture.md, docs/study/09-testing-and-ops.md
+
+FastAPI application.
+"""
 
 from __future__ import annotations
 

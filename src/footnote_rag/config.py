@@ -1,4 +1,11 @@
-"""Application settings.
+"""애플리케이션 설정(환경변수 → ``Settings``).
+
+역할: 모든 설정값과 기본값, Claude 가격표(``DEFAULT_LLM_PRICES``), 제공자 모드(auto/fake/real) 해석.
+주요 요소: ``Settings``, ``ModelPrice``, ``load_settings``, ``get_settings``(lru_cache).
+호출 관계: 거의 모든 모듈이 ``get_settings()``를 읽는다. ``providers``가 ``*_mode``로 실제/Fake를 고른다.
+학습 문서: docs/study/09-testing-and-ops.md (SecretStr, Fake 모드)
+
+Application settings.
 
 Values come from environment variables and (unless disabled) the repository ``.env``
 file. API keys are held as ``SecretStr`` so they never appear in ``repr()`` or logs.

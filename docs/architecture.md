@@ -1,5 +1,7 @@
 # 아키텍처
 
+> 이 문서의 그림을 코드 위치와 함께 단계별로 해설한 학습 자료는 [docs/study/README.md](study/README.md)에 있습니다.
+
 ## 구성도
 
 ```mermaid

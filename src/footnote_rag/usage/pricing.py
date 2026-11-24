@@ -1,4 +1,13 @@
-"""Token cost calculation from the configured price table (USD per 1M tokens)."""
+"""LLM 토큰 비용 계산.
+
+역할: 설정 가격표(USD/1M 토큰)로 input·output·cache read·cache write 토큰 비용을 더한다.
+가격표에 없는 모델은 ``None``과 경고 로그.
+주요 요소: ``compute_cost``.
+호출 관계: ``answering.service.ask_question``이 응답의 실제 ``model``과 ``usage``로 호출한다.
+학습 문서: docs/study/08-review-audit-usage.md (비용 계산)
+
+Token cost calculation from the configured price table (USD per 1M tokens).
+"""
 
 from __future__ import annotations
 

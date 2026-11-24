@@ -1,4 +1,12 @@
-"""GET /usage (admin): LLM call counts, tokens, cost and latency percentiles per organization."""
+"""사용량 엔드포인트 ``GET /usage``(admin).
+
+역할: 조직의 ``llm_calls``를 기간으로 걸러 호출 수, 토큰 합계, 비용, 지연시간 p50/p95, 모델별 합계를 낸다.
+주요 요소: ``get_usage``(Postgres ``percentile_cont``), ``UsageOut``, ``ModelUsage``.
+호출 관계: ``auth.deps.require_role(ADMINS)``로 보호되고 ``db.models.LlmCall``을 집계한다.
+학습 문서: docs/study/08-review-audit-usage.md
+
+GET /usage (admin): LLM call counts, tokens, cost and latency percentiles per organization.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,12 @@
-"""/questions, /answers and /search endpoints."""
+"""질문·답변·검색 엔드포인트(``POST /questions``, ``GET /answers/{id}``, ``POST /search``).
+
+역할: 서비스 예외를 HTTP 상태(404/503/502)로 바꾸고, member에게는 검토 대기 답변 본문을 숨긴다.
+주요 요소: ``post_question``, ``get_answer``, ``search``, ``_visible_to``, ``get_embedder``·``get_llm``(app.state).
+호출 관계: ``answering.service``의 ``ask_question``·``retrieve``를 호출한다. ``mcp_server``도 이 API를 쓴다.
+학습 문서: docs/study/02-request-walkthrough.md
+
+/questions, /answers and /search endpoints.
+"""
 
 from __future__ import annotations
 

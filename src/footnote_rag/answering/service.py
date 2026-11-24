@@ -1,4 +1,12 @@
-"""Question answering: retrieve -> Claude with search_result citations -> footnotes -> review gate.
+"""질문 답변 서비스: 검색 → Claude(search_result + citations) → 각주 → 검토 게이트 → 저장.
+
+역할: 질문 하나를 끝까지 처리하고 questions·answers·llm_calls·감사 로그 두 건을 한 트랜잭션으로 커밋한다.
+주요 요소: ``ask_question``, ``retrieve``, ``review_reasons``(신뢰도 규칙), ``to_source_refs``.
+호출 관계: ``answering.router``와 ``evals.run``이 호출하고, ``retrieval.search``, ``answering.llm``,
+``answering.footnotes``, ``usage.pricing``, ``audit.service``를 호출한다.
+학습 문서: docs/study/02-request-walkthrough.md, docs/study/06-claude-citations.md
+
+Question answering: retrieve -> Claude with search_result citations -> footnotes -> review gate.
 
 Review gate (``REVIEW_MODE=on_low_confidence``): an answer goes to ``pending_review`` when
   * the model refused (``refusal``),

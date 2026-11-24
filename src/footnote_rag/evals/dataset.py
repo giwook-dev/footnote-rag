@@ -1,4 +1,11 @@
-"""Eval dataset (JSONL) loading.
+"""Eval 데이터셋(JSONL) 로더.
+
+역할: 한 줄 한 질문 형식을 읽어 ``EvalItem``으로 바꾼다(단일 값과 목록을 모두 허용, 비교 질문 판별).
+주요 요소: ``load_dataset``, ``EvalItem``(``is_comparison``), ``DEFAULT_DATASET``.
+호출 관계: ``evals.run``과 ``evals.validate``가 호출한다. 현재 evals/dataset.jsonl에는 ``_example`` 행만 있다.
+학습 문서: docs/study/10-eval-and-mcp.md
+
+Eval dataset (JSONL) loading.
 
 Row format::
 
