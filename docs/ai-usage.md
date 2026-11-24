@@ -22,6 +22,7 @@
   - 테스트: `tests/` (합성 픽스처만 사용)
   - 실행 환경: `Dockerfile`, `docker-compose.yml`, `.github/workflows/ci.yml`
   - 문서: `README.md`, `docs/architecture.md`, `docs/adr/`, `docs/data-sources.md`, 이 초안
+- Eval 질문 초안을 AI가 작성, 근거 인용은 validate로 자동 검증
 - 커밋 이력: [직접 확인 필요] `git log`로 어떤 커밋이 AI 생성인지(`Co-Authored-By` 표기) 확인해 적기.
 
 ## 검증 방법

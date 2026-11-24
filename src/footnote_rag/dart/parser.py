@@ -3,8 +3,12 @@
 역할: ``SECTION-n``+``TITLE``로 경로를 만들고, 표는 행 단위 ``셀 | 셀``로 바꾼다. 주석 섹션 안에서는
 섹션 제목 뒤의 추가 ``TITLE``(실제 사업보고서의 주석 번호별 소제목)을 하위 목차로 만들고, 그런 ``TITLE``이
 없을 때만 ``12. 리스`` 같은 짧은 번호 문단을 하위 목차로 승격한다.
-구조 확인: 삼성전자 2025 사업보고서(20260310002820) 원문으로 확인한 내용은 docs/data-sources.md에 있다.
-주요 요소: ``parse_document_zip``, ``parse_document_xml``, ``pick_main_member``, ``is_note_heading``, ``normalize_title``.
+DART 원문은 올바른 XML이 아니어서(본문의 맨 ``&``, 글자 그대로의 ``<``, 큰따옴표가 겹친 속성값,
+``<Manufacturing Excellence>`` 같은 가짜 태그) 파싱 전에 ``sanitize_dart_xml``로 정리한다. 그러지 않으면
+lxml 복구 모드가 그 뒤의 ``SECTION``/``TITLE`` 구조를 잃거나, 루트가 일찍 닫혀 뒤쪽 텍스트를 통째로 버린다.
+구조 확인: 삼성전자·NAVER·현대자동차 2025 사업보고서 원문으로 확인한 내용은 docs/data-sources.md에 있다.
+주요 요소: ``parse_document_zip``, ``parse_document_xml``, ``sanitize_dart_xml``, ``is_parse_suspicious``,
+``pick_main_member``, ``is_note_heading``, ``normalize_title``.
 호출 관계: ``jobs.handlers.handle_import_dart``, ``cli.cmd_dart_fetch``, ``evals.validate``가 호출한다.
 학습 문서: docs/study/07-dart-integration.md
 
@@ -41,6 +45,13 @@ Structure handled (DART "dart3.xsd" style documents):
 * Container tags without a TITLE (``LIBRARY`` etc.) are descended into transparently.
 * The main document is ``{rcept_no}.xml`` when present, otherwise the largest XML member.
   Other XML members (attachments such as 외부감사 실시내용) are *not* included.
+* Before parsing, bare ``&`` (``Place&JAPAN``) and literal ``<`` that cannot start a tag
+  (``<개정 2015.03.20>``) are escaped (``sanitize_dart_xml``). Without this, lxml's recover mode
+  drops the structure after the first such character and whole chapters collapse into one section.
+  Two generic rules follow: an attribute value opened with a doubled quote (``ENG=""Snow``) and a
+  "start tag" whose first attribute has no ``=`` (``<Manufacturing Excellence>``, never valid XML).
+  Left alone, both make libxml2 close the root element early and recover mode discards every
+  chapter after it; that case is logged as ``dart.parse_truncated``.
 """
 
 from __future__ import annotations
@@ -51,8 +62,27 @@ from dataclasses import dataclass, field
 from lxml import etree
 
 from footnote_rag.dart.client import read_zip_members
+from footnote_rag.observability import get_logger
+
+log = get_logger(__name__)
 
 PATH_SEP = " > "
+# Byte patterns: they only look at ASCII "&" / "<", which never occur inside multi-byte
+# characters in UTF-8 or EUC-KR/CP949, so they are safe to apply before decoding.
+# "&" not starting a named/numeric entity reference ("Place&JAPAN", "S&P(미국)").
+_BARE_AMP_RE = re.compile(rb"&(?!(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#x[0-9A-Fa-f]+);)")
+# "<" not starting a tag, end tag, comment/CDATA/doctype or processing instruction
+# ("<개정 2015.03.20>", "< TV 시장점유율 추이 >").
+_BARE_LT_RE = re.compile(rb"<(?!/?[A-Za-z][A-Za-z0-9_.:-]*(?:[\s/>])|!|\?)")
+# Attribute value opened with a doubled quote: ENG=""Snow Corporation" -> ENG="&quot;Snow ...".
+_BAD_ATTR_QUOTE_RE = re.compile(rb'=""(?=[^"\s>])')
+# Text that looks like an English start tag whose first "attribute" has no "=" - never valid
+# XML, so it is caption text: <Manufacturing Excellence>, <Advanced Tech &amp; SDV>.
+_PSEUDO_TAG_RE = re.compile(rb"<(?=[A-Za-z][A-Za-z0-9_.:-]*\s+[^\s=/>]+(?:\s+[^\s=/>]+)*\s*>)")
+# Parse-quality warning: a filing whose largest section holds most of the text while there are
+# only a few sections has most likely lost its structure.
+SUSPICIOUS_LARGEST_SHARE = 0.5
+SUSPICIOUS_MAX_SECTIONS = 20
 _SECTION_RE = re.compile(r"^SECTION-\d+$")
 # Top-level note heading: "12. 리스", "3. 중요한 회계정책". Not "(1) ..." / "1) ..." sub-items,
 # not numbers like "1.5", and not full sentences (which end in "다." in Korean filings).
@@ -90,6 +120,46 @@ class ParsedDocument:
     document_name: str
     main_member: str
     sections: list[Section] = field(default_factory=list)
+    # Fixes applied by ``sanitize_dart_xml``:
+    # {"bare_amp": n, "bare_lt": n, "bad_attr_quote": n, "pseudo_tag": n}.
+    sanitized: dict[str, int] = field(default_factory=dict)
+    # True when libxml2 still closed the root early and discarded the rest (ERR_DOCUMENT_END).
+    truncated: bool = False
+
+
+def sanitize_dart_xml(raw: bytes) -> tuple[bytes, dict[str, int]]:
+    """Make a DART filing parseable without losing structure or text.
+
+    * bare ``&`` -> ``&amp;``; ``<`` that cannot start markup -> ``&lt;``
+    * attribute value opened with a doubled quote (``=""Snow``) -> ``="&quot;Snow``
+    * pseudo start tag whose first attribute has no ``=`` (``<Manufacturing Excellence>``)
+      -> ``&lt;Manufacturing Excellence>``
+
+    Valid entity references (``&amp;``, ``&lt;``, ``&#39;``, ``&#x27;``) and real markup
+    (tags with ``NAME="value"`` attributes, ``<!-- -->``, ``<![CDATA[``, ``<?xml``) are left
+    unchanged, so applying it to an already well-formed document is a no-op.
+    Returns the fixed bytes and the count per rule.
+    """
+    fixed, bare_amp = _BARE_AMP_RE.subn(b"&amp;", raw)
+    fixed, bare_lt = _BARE_LT_RE.subn(b"&lt;", fixed)
+    fixed, bad_attr_quote = _BAD_ATTR_QUOTE_RE.subn(b'="&quot;', fixed)
+    fixed, pseudo_tag = _PSEUDO_TAG_RE.subn(b"&lt;", fixed)
+    return fixed, {
+        "bare_amp": bare_amp,
+        "bare_lt": bare_lt,
+        "bad_attr_quote": bad_attr_quote,
+        "pseudo_tag": pseudo_tag,
+    }
+
+
+def is_parse_suspicious(sections: list[Section]) -> bool:
+    """True when the largest section holds more than half of the text and there are fewer
+    than 20 sections - the signature of a filing whose structure was lost while parsing."""
+    if not sections or len(sections) >= SUSPICIOUS_MAX_SECTIONS:
+        return False
+    total = sum(len(s.text) for s in sections)
+    largest = max(len(s.text) for s in sections)
+    return total > 0 and largest > total * SUSPICIOUS_LARGEST_SHARE
 
 
 def normalize_ws(text: str) -> str:
@@ -232,7 +302,9 @@ def _walk(el: etree._Element, path: list[str], out: _Collector, *, own_title: bo
         out.add(current(), text)
 
 
-def _decode_xml(xml_bytes: bytes) -> etree._Element:
+def _decode_xml(xml_bytes: bytes) -> tuple[etree._Element, etree._LogEntry | None]:
+    """Parse in recover mode. Also returns the ``ERR_DOCUMENT_END`` entry ("Extra content at
+    the end of the document") when libxml2 closed the root early and dropped the rest."""
     parser = etree.XMLParser(recover=True, huge_tree=True, resolve_entities=False, no_network=True)
     head = xml_bytes[:200].lower()
     if b"encoding=" in head:
@@ -245,7 +317,8 @@ def _decode_xml(xml_bytes: bytes) -> etree._Element:
         root = etree.fromstring(text.encode("utf-8"), parser=parser)
     if root is None:
         raise DartParseError("XML could not be parsed")
-    return root
+    truncated = next((e for e in parser.error_log if e.type_name == "ERR_DOCUMENT_END"), None)
+    return root, truncated
 
 
 def pick_main_member(members: dict[str, bytes], rcept_no: str | None) -> str:
@@ -260,7 +333,21 @@ def pick_main_member(members: dict[str, bytes], rcept_no: str | None) -> str:
 
 
 def parse_document_xml(xml_bytes: bytes, *, main_member: str = "") -> ParsedDocument:
-    root = _decode_xml(xml_bytes)
+    # The single place where filing bytes are cleaned: every caller (ZIP import, CLI, eval
+    # validator) goes through here. Recover mode stays on for the remaining errors.
+    clean, sanitized = sanitize_dart_xml(xml_bytes)
+    if any(sanitized.values()):
+        log.info("dart.sanitized", main_member=main_member, **sanitized)
+    root, truncated = _decode_xml(clean)
+    if truncated is not None:
+        # Not a failure: the text before this point is still usable, but everything after
+        # the reported line is missing from the sections.
+        log.warning(
+            "dart.parse_truncated",
+            main_member=main_member,
+            line=truncated.line,
+            message=truncated.message.strip(),
+        )
     doc_name_el = next((e for e in root.iter() if _tag(e) == "DOCUMENT-NAME"), None)
     company_el = next((e for e in root.iter() if _tag(e) == "COMPANY-NAME"), None)
     document_name = normalize_title(_text_of(doc_name_el)) if doc_name_el is not None else ""
@@ -273,6 +360,16 @@ def parse_document_xml(xml_bytes: bytes, *, main_member: str = "") -> ParsedDocu
     sections = out.sections()
     if not any(s.text.strip() for s in sections):
         raise DartParseError("document has no extractable text")
+    if is_parse_suspicious(sections):
+        largest = max(sections, key=lambda s: len(s.text))
+        log.warning(
+            "dart.parse_suspicious",
+            main_member=main_member,
+            sections=len(sections),
+            total_chars=sum(len(s.text) for s in sections),
+            largest_chars=len(largest.text),
+            largest_path=largest.path,
+        )
     title = " ".join(p for p in (company_name, document_name) if p) or "DART 문서"
     return ParsedDocument(
         title=title,
@@ -281,6 +378,8 @@ def parse_document_xml(xml_bytes: bytes, *, main_member: str = "") -> ParsedDocu
         document_name=document_name,
         main_member=main_member,
         sections=sections,
+        sanitized=sanitized,
+        truncated=truncated is not None,
     )
 
 
