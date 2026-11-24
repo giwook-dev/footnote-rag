@@ -2,7 +2,7 @@
 
 역할: OpenDART 회사 목록 ZIP을 받아 상장사만 JSON으로 저장하고, 파일 수정 시각이 TTL(기본 7일) 안이면 재사용한다.
 주요 요소: ``CorpCodeCache``(``by_stock_code``), ``parse_corp_code_zip``, ``CorpInfo``.
-호출 관계: ``cli.cmd_dart_find``와 ``jobs.handlers._lookup_stock_code``가 쓰고, ``dart.client``를 호출한다.
+호출 관계: ``dart.service.find_reports``(CLI ``dart-find``·``GET /dart/reports``)와 ``jobs.handlers._lookup_stock_code``가 쓰고, ``dart.client``를 호출한다.
 학습 문서: docs/study/07-dart-integration.md (캐시 전략)
 
 corpCode.xml download + local JSON cache (TTL) for stock_code -> corp_code lookups.

@@ -6,6 +6,8 @@
 
 ```mermaid
 flowchart LR
+    browser["브라우저"] --> webui["Web UI (/ui)<br/>정적 HTML·JS·CSS"]
+    webui -->|"fetch + JWT (sessionStorage)"| api
     client["Client / MCP 서버"] -->|"JWT"| api["FastAPI API<br/>auth · RBAC · org 격리"]
     reviewer["Reviewer"] -->|"approve / reject"| api
     api <--> db[("PostgreSQL 16 + pgvector<br/>chunks · jobs · audit_logs · llm_calls")]
@@ -17,6 +19,7 @@ flowchart LR
     worker <--> cache[("data/dart<br/>ZIP · corpCode 캐시")]
 ```
 
+- **Web UI**는 FastAPI가 `/ui`에서 직접 서빙하는 빌드 없는 정적 파일(`src/footnote_rag/web/static/`)입니다. 브라우저에서 같은 출처의 HTTP API를 Bearer 토큰으로 호출하므로 권한 검사·조직 격리는 API와 같습니다. `/ui` 응답에만 CSP(`script-src 'self'` 등)·`nosniff`·`Referrer-Policy` 헤더를 붙입니다. 종목코드 검색은 CLI `dart-find`와 같은 서비스 함수(`dart/service.py::find_reports`)를 쓰는 `GET /dart/reports`가 제공합니다.
 - **API**는 요청마다 `X-Request-ID`를 붙이고(없으면 생성) 처리 시간을 JSON 로그로 남깁니다. 감사 로그 행에도 같은 request_id가 저장됩니다.
 - **워커**는 API와 같은 이미지에서 `python -m footnote_rag.jobs.worker`로 돌며 여러 개를 띄워도 됩니다.
 - 외부 의존성(OpenDART, Voyage, Claude)은 모두 Protocol 뒤에 있고 `providers.py`가 실제/Fake 구현을 고릅니다. 테스트와 CI는 항상 Fake입니다.

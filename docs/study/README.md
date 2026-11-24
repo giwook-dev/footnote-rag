@@ -2,6 +2,8 @@
 
 이 폴더는 이 저장소의 코드를 **스스로 이해하고 면접에서 설명하기 위한** 학습 자료다. "무엇이 있나"는 [README](../../README.md)와 [docs/architecture.md](../architecture.md)에 있고, 여기서는 "왜 이렇게 동작하나", "어떤 순서로 읽나", "대안과 한계는 무엇인가", "면접에서 어떻게 설명하나"를 다룬다.
 
+웹 화면: 브라우저로 직접 눌러 보며 확인하려면 `docker compose up` 후 http://localhost:8000/ui 를 연다(절차는 [README의 "웹 화면으로 테스트하기"](../../README.md#웹-화면으로-테스트하기), 코드는 `src/footnote_rag/web/static/`).
+
 대상 독자: Python 백엔드 경험은 있지만 RAG, pgvector, Claude API, OpenDART는 처음인 개발자. 처음 나오는 용어는 [용어집](glossary.md)에 정의가 있다.
 
 > **먼저 알아 둘 사실**

@@ -31,6 +31,7 @@ class Actions:
     LOGIN_SUCCEEDED = "auth.login_succeeded"
     LOGIN_FAILED = "auth.login_failed"
     USER_CREATED = "user.created"
+    DART_SEARCH = "dart.search"
     DART_IMPORT_REQUESTED = "document.dart_import_requested"
     TEXT_UPLOADED = "document.text_uploaded"
     INGEST_SUCCEEDED = "document.ingest_succeeded"
