@@ -102,12 +102,43 @@ def test_example_only_dataset_validates_trivially(tmp_path, zip_dir):
     assert main(["--dataset", str(path), "--zip-dir", str(zip_dir)]) == 0
 
 
-def test_repository_dataset_is_valid(zip_dir):
-    """evals/dataset.jsonl must always pass the validator (example rows are skipped)."""
-    path = Path(__file__).parent.parent / "evals" / "dataset.jsonl"
-    items = load_dataset(path)
-    report = validate(items, Path("data/dart"))
+REPO_ROOT = Path(__file__).parent.parent
+
+
+def test_repository_dataset_is_valid(tmp_path):
+    """evals/dataset.jsonl must pass the validator when the filings are cached in data/dart.
+
+    CI has no filings (they are never committed): then the only allowed errors are "missing"
+    ZIPs - coverage rules and row checks that do not need the text must still pass."""
+    items = load_dataset(REPO_ROOT / "evals" / "dataset.jsonl")
+    report = validate(items, REPO_ROOT / "data" / "dart")
     assert report.ok or all("missing" in e for e in report.errors), report.errors
+    without_filings = validate(items, tmp_path)  # what CI sees, even when data/dart exists
+    assert without_filings.errors and all("missing" in e for e in without_filings.errors)
+
+
+def test_repository_dataset_composition():
+    import re
+
+    items = load_dataset(REPO_ROOT / "evals" / "dataset.jsonl")
+    assert not any(i.example for i in items)
+    assert len(items) >= 18
+    assert len({i.id for i in items}) == len(items)
+    assert all(re.fullmatch(r"(samsung|naver|hyundai|compare|unans)-\d{2}", i.id) for i in items)
+    single = [i for i in items if i.answerable and not i.is_comparison]
+    for company in ("삼성전자", "NAVER", "현대자동차"):
+        assert sum(1 for i in single if i.corp_names == [company]) >= 4, company
+    comparisons = [i for i in items if i.answerable and i.is_comparison]
+    assert len(comparisons) >= 2
+    assert all(i.id.startswith("compare-") for i in comparisons)
+    assert all(len(i.rcept_nos) == len(i.corp_names) >= 2 for i in comparisons)
+    unanswerable = [i for i in items if not i.answerable]
+    assert len(unanswerable) >= 3
+    assert all(i.id.startswith("unans-") and not i.evidence_quotes for i in unanswerable)
+    for item in items:
+        if item.answerable:
+            assert item.expected_section_prefixes, item.id
+            assert all(20 <= len(q) <= 150 for q in item.evidence_quotes), item.id
 
 
 async def test_eval_runner_fake_mode_writes_markdown_report(
@@ -166,6 +197,17 @@ async def test_cli_dart_find_prints_reports(capsys, settings, monkeypatch, tmp_p
     out = capsys.readouterr().out
     assert "20260310900001" in out and "20260310900003" in out
     assert "가람전자(합성)" in out and "감사보고서 (2025.12)" in out
+
+
+async def test_cli_dart_fetch_prints_sanitized_counts(capsys, settings, monkeypatch, tmp_path):
+    from footnote_rag import cli
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    args = cli.build_parser().parse_args(["dart-fetch", "--rcept-no", "20260310900001"])
+    assert await cli.cmd_dart_fetch(args) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.startswith("== 20260310900001: ")
+    assert first.endswith("sections) (sanitized &:0 <:0 attr:0 tag:0)")
 
 
 async def test_cli_dart_import_uses_the_service(capsys, make_org, sessionmaker, monkeypatch):

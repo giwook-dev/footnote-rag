@@ -86,7 +86,13 @@ async def cmd_dart_fetch(args: argparse.Namespace) -> int:
     for rcept_no in [r.strip() for r in args.rcept_no.split(",") if r.strip()]:
         content = await load_dart_zip(client, dart_cache_dir(s.dart_dir, client), rcept_no)
         parsed = parse_document_zip(content, rcept_no)
-        print(f"== {rcept_no}: {parsed.title} ({len(parsed.sections)} sections)")
+        fixes = parsed.sanitized
+        print(
+            f"== {rcept_no}: {parsed.title} ({len(parsed.sections)} sections) "
+            f"(sanitized &:{fixes.get('bare_amp', 0)} <:{fixes.get('bare_lt', 0)} "
+            f"attr:{fixes.get('bad_attr_quote', 0)} tag:{fixes.get('pseudo_tag', 0)})"
+            + (" TRUNCATED" if parsed.truncated else "")
+        )
         for section in parsed.sections:
             print(f"  [{len(section.text):>6} chars] {section.path}")
     return 0

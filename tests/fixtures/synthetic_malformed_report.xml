@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SYNTHETIC test fixture written by hand. Not a real DART filing.
+     Real annual reports are not well-formed XML: text contains bare ampersands
+     (Place-and-JAPAN, S-and-P) and literal less-than signs (amendment dates, chart captions).
+     Korean letters are valid in XML names, so a caption such as the "new clause" marker below
+     reads as an unclosed start tag and, without sanitizing, every later SECTION is nested under
+     "5. 정관에 관한 사항" (the symptom seen in a real 2025 annual report).
+     Two more error kinds seen in real filings follow: an attribute value opened with a doubled
+     quote (ENG on the TE cell) and an English caption written like a start tag whose words are
+     not NAME="value" attributes. Left alone they make the parser close the root early and drop
+     the later chapters.
+     Intentional errors: 2 bare ampersands, 3 bare less-than signs, 1 doubled attribute quote,
+     2 pseudo tags. -->
+<DOCUMENT>
+<DOCUMENT-NAME ACODE="11011">사업보고서</DOCUMENT-NAME>
+<COMPANY-NAME AREGCIK="99000789">오류문자전자(합성)</COMPANY-NAME>
+<BODY>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">I. 회사의 개요</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">1. 회사의 개요</TITLE>
+<P>회사는 합성 데이터 시험용으로 설립되었습니다.</P>
+<TABLE><TR><TD>종속기업</TD><TE>Place&JAPAN Co., Ltd</TE></TR></TABLE>
+</SECTION-2>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">2. 회사의 연혁</TITLE>
+<P>정상 엔티티: R&amp;D 센터, 비율 1 &lt; 2, 회사&#39;s 브랜드</P>
+</SECTION-2>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">5. 정관에 관한 사항</TITLE>
+<P><개정 2015.03.20></P>
+<P><신  설></P>
+<P>제1조 (상호) 회사의 상호는 오류문자전자라 한다.</P>
+</SECTION-2>
+</SECTION-1>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">II. 사업의 내용</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">1. 사업의 개요</TITLE>
+<P>< TV 시장점유율 추이 ></P>
+<TABLE><TR><TD>신용평가기관</TD><TD>S&P(미국)</TD></TR></TABLE>
+</SECTION-2>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">5. 위험관리 및 파생거래</TITLE>
+<P>회사는 환율 변동 위험을 관리합니다.</P>
+<TABLE><TBODY>
+<TR><TD>종속기업</TD><TE ENG=""Snow Corporation" VALIGN="MIDDLE" WIDTH="111">스노우 주식회사</TE></TR>
+<TR><TD>지분율</TD><TE>100%</TE></TR>
+</TBODY></TABLE>
+</SECTION-2>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">7. 기타 참고사항</TITLE>
+<P USERMARK="B"><Manufacturing Excellence></P>
+<P>제조 경쟁력을 강화합니다.</P>
+<P USERMARK="B"><Advanced Tech &amp; SDV></P>
+<P>기타 참고사항 본문입니다.</P>
+</SECTION-2>
+</SECTION-1>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">V. 회계감사인의 감사의견 등</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">1. 외부감사에 관한 사항</TITLE>
+<P>감사인은 합성회계법인입니다.</P>
+</SECTION-2>
+</SECTION-1>
+<SECTION-1 ACLASS="MANDATORY">
+<TITLE ATOC="Y">VI. 이사회 등 회사의 기관에 관한 사항</TITLE>
+<SECTION-2 ACLASS="MANDATORY">
+<TITLE ATOC="Y">1. 이사회에 관한 사항</TITLE>
+<P>이사회는 합성 이사 5인으로 구성됩니다.</P>
+</SECTION-2>
+</SECTION-1>
+</BODY>
+</DOCUMENT>
