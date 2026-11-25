@@ -1,11 +1,11 @@
 """SQLAlchemy ORM 모델(테이블 매핑). 스키마 생성은 Alembic 마이그레이션이 맡는다.
 
 역할: organizations, users, documents, chunks(pgvector), embedding_cache(pgvector), jobs, questions,
-answers, llm_calls, audit_logs 테이블과 상태 enum 값을 정의한다.
+answers, llm_calls, audit_logs, note_comparisons, note_comparison_summaries 테이블과 상태 enum 값을 정의한다.
 주요 요소: ``Document``, ``Chunk``, ``EmbeddingCache``, ``Job``, ``Answer``, ``LlmCall``, ``AuditLog``,
-``ANSWER_STATUSES`` 등.
+``NoteComparison``, ``NoteComparisonSummary``, ``ANSWER_STATUSES`` 등.
 호출 관계: 서비스·라우터·워커가 import해 쿼리한다. 실제 DDL은 alembic/versions/0001_initial.py,
-0002_embedding_cache.py, 0003_llm_calls_dropped_refs.py.
+0002_embedding_cache.py, 0003_llm_calls_dropped_refs.py, 0004_note_comparisons.py.
 학습 문서: docs/study/01-big-picture.md, ERD는 docs/architecture.md
 
 ORM models. The schema itself is created by Alembic (see alembic/versions).
@@ -208,6 +208,56 @@ class LlmCall(Base):
     # Local models only: source numbers outside 1..k that were dropped (0 for Claude).
     dropped_source_refs: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
+    )
+    # Note change summaries (comparison.service.summarize_note): set instead of ``answer_id``.
+    note_comparison_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("note_comparisons.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = _created_at()
+
+
+class NoteComparison(Base):
+    """Prior vs current annual-report note comparison (``comparison.notes`` result as JSON)."""
+
+    __tablename__ = "note_comparisons"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    prior_document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False
+    )
+    current_document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False
+    )
+    scope: Mapped[str] = mapped_column(String(20), nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+
+SUMMARY_STATUSES = ("ok", "needs_review")
+
+
+class NoteComparisonSummary(Base):
+    """Local-model summary of one note's changes; regenerating adds a row (latest wins)."""
+
+    __tablename__ = "note_comparison_summaries"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    comparison_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("note_comparisons.id", ondelete="CASCADE"), nullable=False
+    )
+    org_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    note_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    note_key: Mapped[str] = mapped_column(Text, nullable=False)
+    bullets: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    ungrounded_numbers: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
     )
     created_at: Mapped[datetime] = _created_at()
 

@@ -39,6 +39,10 @@ erDiagram
     questions ||--|| answers : "answered by"
     answers ||--o{ llm_calls : "cost of"
     organizations ||--o{ audit_logs : "append-only"
+    organizations ||--o{ note_comparisons : owns
+    documents ||--o{ note_comparisons : "prior / current"
+    note_comparisons ||--o{ note_comparison_summaries : "summarized (latest per note)"
+    note_comparisons ||--o{ llm_calls : "cost of summaries"
 
     organizations { uuid id PK  text name  timestamptz created_at }
     users { uuid id PK  uuid org_id FK  text email UK  text password_hash  user_role role  bool is_active }
@@ -48,8 +52,10 @@ erDiagram
     jobs { uuid id PK  text type  jsonb payload  job_status status  int attempts  int max_attempts  timestamptz run_after  timestamptz locked_at  text locked_by  text last_error  jsonb result }
     questions { uuid id PK  uuid org_id FK  uuid asked_by FK  text text }
     answers { uuid id PK  uuid question_id FK  uuid org_id  text text  jsonb footnotes  answer_status status  text review_reason  uuid reviewed_by  timestamptz reviewed_at  text review_comment }
-    llm_calls { uuid id PK  uuid org_id  uuid answer_id FK  text model  int input_tokens  int output_tokens  int cache_read_input_tokens  int cache_creation_input_tokens  numeric cost_usd  int latency_ms  text stop_reason  int dropped_source_refs }
+    llm_calls { uuid id PK  uuid org_id  uuid answer_id FK  uuid note_comparison_id FK  text model  int input_tokens  int output_tokens  int cache_read_input_tokens  int cache_creation_input_tokens  numeric cost_usd  int latency_ms  text stop_reason  int dropped_source_refs }
     audit_logs { uuid id PK  uuid org_id  uuid actor_user_id  text action  text target_type  text target_id  jsonb metadata  text request_id }
+    note_comparisons { uuid id PK  uuid org_id FK  uuid created_by FK  uuid prior_document_id FK  uuid current_document_id FK  text scope  jsonb result  timestamptz created_at }
+    note_comparison_summaries { uuid id PK  uuid comparison_id FK  uuid org_id  int note_index  text note_key  jsonb bullets  text status  jsonb ungrounded_numbers  text model  uuid created_by FK  timestamptz created_at }
 ```
 
 - `documents`: `UNIQUE(org_id, source, source_ref)` — 같은 조직의 같은 접수번호는 하나만 존재합니다.
@@ -57,6 +63,7 @@ erDiagram
 - `embedding_cache`: 문서 임베딩 캐시. `key = sha256(model | dim | input_type | text)`이며 텍스트와 조직 ID는 저장하지 않습니다. 조직 간 공유 판단은 [ADR 0007](adr/0007-embedding-rate-limit-and-cache.md)을 보세요.
 - `jobs`: 조직 컬럼 대신 `payload.org_id`를 두고 `GET /jobs/{id}`가 이 값으로 범위를 제한합니다. 실행 중에는 `result.progress = {stage, done, total}`(진행률)만 담기고, claim할 때 비워집니다. 성공하면 수집 결과(청크 수, `embedding_tokens`(실제 청구 대상), `embedding_cache_hits`, `embedding_cache_misses`, 마지막 `progress`)로 바뀝니다.
 - `audit_logs`: `BEFORE UPDATE OR DELETE` 행 트리거와 `BEFORE TRUNCATE` 문장 트리거가 예외를 던집니다. 실패한 로그인처럼 조직을 알 수 없는 행은 `org_id`가 NULL입니다.
+- `note_comparisons`: 전년·당년 사업보고서의 주석 비교 결과(`comparison.notes.compare_documents`의 JSON, 숫자는 문자열). `note_comparison_summaries`: 주석 하나의 로컬 모델 요약(`status` = `ok` | `needs_review`, `comparison_id`는 `ON DELETE CASCADE`). 다시 생성하면 행을 추가하고 조회는 주석별 최신 행을 씁니다. 요약 호출의 `llm_calls` 행은 `answer_id`가 NULL이고 `note_comparison_id`가 채워집니다([ADR 0012](adr/0012-note-change-analysis.md)).
 
 ## 조직 격리
 

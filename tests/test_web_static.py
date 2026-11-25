@@ -122,6 +122,70 @@ def test_reprocess_button_is_admin_only_for_ready_or_failed_documents():
     assert "await loadDocuments();" in body
 
 
+def test_note_diff_tab_markup_follows_the_tab_pattern():
+    html = _read("index.html")
+    assert re.search(
+        r'<button type="button" role="tab" id="tab-diff" data-tab="diff" '
+        r'aria-controls="panel-diff" aria-selected="false">변동 분석</button>',
+        html,
+    )
+    assert re.search(
+        r'<section id="panel-diff" class="panel" role="tabpanel" aria-labelledby="tab-diff" hidden>',
+        html,
+    )
+    for element_id in (
+        "diff-form",
+        "diff-current",
+        "diff-prior",
+        "diff-btn",
+        "diff-prior-empty",
+        "diff-recent",
+        "diff-stats",
+        "diff-changed-only",
+        "diff-notes",
+        "diff-detail",
+    ):
+        assert f'id="{element_id}"' in html, element_id
+    assert re.search(r'<label for="diff-current">당년 보고서</label>', html)
+    assert re.search(r'<label for="diff-prior">전년 보고서[^<]*</label>', html)
+    assert 'name="diff-scope" value="consolidated" checked' in html
+    assert 'name="diff-scope" value="separate"' in html
+    assert re.search(r'<input id="diff-changed-only" type="checkbox" checked>', html)
+    assert "전년 보고서를 먼저 가져오세요" in html
+
+
+def test_note_diff_prior_report_choice_is_same_corp_and_earlier():
+    js = _read("app.js")
+    body = js[js.index("function priorCandidates(current, docs)") :]
+    body = body[: body.index("function fillSelect(")]
+    assert "d.meta.corp_code === meta.corp_code" in body
+    assert 'String(d.meta.rcept_dt || "") < String(meta.rcept_dt)' in body
+    assert "localeCompare" in body  # newest first
+    assert (
+        'const isComparable = (d) => d.status === "ready" && d.source === "dart" && d.meta;' in js
+    )
+    # the newest prior report is picked automatically
+    assert "candidates.length > 0 ? candidates[0].id : null" in js
+    assert "diff: () => loadDiffTab()," in js
+
+
+def test_note_diff_detail_shows_tables_lines_and_local_summary():
+    js = _read("app.js")
+    css = _read("style.css")
+    assert '"요약 생성 (로컬 LLM)"' in js and '"요약 다시 생성 (로컬 LLM)"' in js
+    assert 'const SUMMARY_NOTICE = "모델 요약 — 변동 판단은 담당자가 확정";' in js
+    assert '"● 숫자 원문 확인됨"' in js
+    assert "확인 필요: 원문에 없는 숫자 ${numbers}" in js
+    assert "const SUMMARY_ERROR_STATUSES = [501, 502, 503, 504];" in js
+    assert "전기 수치 불일치 — 당년 보고서의 전기 값 vs 전년 보고서의 당기 값" in js
+    assert '["표", "행", "전년", "당년", "증감", "증감률", "플래그"]' in js
+    assert 'el("details", { className: "fold-numbers" }' in js  # numbers-only lines folded
+    assert "scrollToLine(ref)" in js and "diff-line-${e.ref}" in js
+    assert ".difflines .del { background: var(--fail-bg); }" in css
+    assert ".difflines .add { background: var(--ok-bg); }" in css
+    assert "grid-template-columns: minmax(0, 1fr) minmax(0, 2fr)" in css  # list 1/3, detail 2/3
+
+
 def test_document_status_shows_progress_and_retry_wait_via_text_content():
     js = _read("app.js")
     body = js[js.index("function progressNote(d)") :]

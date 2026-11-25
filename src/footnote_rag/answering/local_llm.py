@@ -3,10 +3,10 @@
 역할: ``search_result`` 블록을 ``[n] 제목\\n본문`` 목록으로 바꿔 Ollama ``/api/chat``에 보내고, 문장별 근거 번호
 JSON을 검증해 Claude와 같은 모양의 text 블록 + ``search_result_location`` citations로 바꾼다. 그래서 각주 번호
 매기기(``footnotes.build_footnotes``)와 신뢰도·검토·감사·사용량 흐름을 그대로 탄다.
-주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``status``, ``warm_up``, ``loaded_models``, ``unload``),
-``parse_local_answer``, ``salvage_local_answer``, ``to_content_blocks``.
+주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``chat_json``, ``status``, ``warm_up``, ``loaded_models``,
+``unload``), ``parse_local_answer``, ``salvage_local_answer``, ``to_content_blocks``.
 호출 관계: ``providers.make_local_llm``이 만들고(``make_llm``·``make_fallback_llm``·비교 Eval) ``answering.service.ask_question``이
-``answer``를 호출한다. ``GET /llm/status``가 ``status``를, 비교 Eval이 ``status``(사전 점검), ``warm_up``(예열),
+``answer``를 호출한다. ``comparison.service.summarize_note``(주석 변동 요약)가 범용 ``chat_json``을 호출한다. ``GET /llm/status``가 ``status``를, 비교 Eval이 ``status``(사전 점검), ``warm_up``(예열),
 ``unload``(쓰지 않는 모델 내리기)와 ``loaded_models``(GPU 적재율)를 호출한다. 앱은 모델을 내리지 않는다.
 학습 문서: docs/study/06-claude-citations.md (로컬 모델 경로), docs/adr/0008-local-llm-ollama.md
 
@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +45,7 @@ from footnote_rag.answering.footnotes import select_cited_text
 from footnote_rag.answering.llm import (
     CITATION_MODEL_REFERENCE,
     NO_EVIDENCE_TEXT,
+    JsonResult,
     LLMError,
     LLMResponse,
     LLMUsage,
@@ -65,6 +67,7 @@ MAX_ATTEMPTS = 2  # first try + one retry on invalid JSON
 UNREACHABLE_MESSAGE = "로컬 LLM 서버(Ollama)에 연결할 수 없습니다"
 TIMEOUT_MESSAGE = "로컬 LLM 서버(Ollama) 응답 시간이 초과되었습니다"
 INVALID_OUTPUT_MESSAGE = "로컬 LLM 응답이 JSON 형식에 맞지 않습니다"
+JSON_RETRY_NOTE = "직전 응답이 요구한 JSON 스키마에 맞지 않았습니다. 스키마에 맞는 JSON 객체 하나만 다시 출력하세요."
 DONE_REASON_TO_STOP_REASON = {"stop": "end_turn", "length": "max_tokens"}
 # A model sometimes writes "[1]" into the sentence itself; those markers would collide with the
 # footnote numbers we assign, so they are stripped (numbers only count from ``sources``).
@@ -147,6 +150,14 @@ def salvage_local_answer(raw: str) -> LocalAnswer:
                 sentences.append(sentence)
     insufficient = re.search(r'"insufficient"\s*:\s*true', raw) is not None
     return LocalAnswer(insufficient=insufficient, sentences=sentences)
+
+
+def _json_object(raw: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def search_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -269,12 +280,15 @@ class OllamaClient:
             {"role": "user", "content": build_local_user_prompt(question_text(messages), sources)},
         ]
 
-    def request_body(self, chat: list[dict[str, str]]) -> dict[str, Any]:
+    def request_body(
+        self, chat: list[dict[str, str]], *, schema: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """``/api/chat`` body; ``schema`` (``format``) defaults to ``LOCAL_ANSWER_SCHEMA``."""
         return {
             "model": self.model,
             "messages": chat,
             "stream": False,
-            "format": LOCAL_ANSWER_SCHEMA,
+            "format": LOCAL_ANSWER_SCHEMA if schema is None else schema,
             "think": self.think,
             "options": {
                 "num_ctx": self.num_ctx,
@@ -410,6 +424,58 @@ class OllamaClient:
             review_flags=flags,
             # salvaged (truncated) output too: insufficient is read from the raw text
             abstained=parsed.insufficient,
+        )
+
+    async def chat_json(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: dict[str, Any],
+        validate: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> JsonResult:
+        """One schema-constrained JSON reply (``format: schema``) for a free-form task.
+
+        Same transport, error mapping (503/504/502), ``think``/``temperature``/``num_ctx``/
+        ``num_predict`` as ``answer``. A reply that is not a JSON object, or that ``validate``
+        rejects, is retried once with ``JSON_RETRY_NOTE``; a second failure -> ``LLMError(502)``.
+        """
+        chat = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        usage = LLMUsage()
+        started = time.perf_counter()
+        done_reason: str | None = None
+        parsed: dict[str, Any] | None = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            request_chat = (
+                chat if attempt == 1 else [*chat, {"role": "user", "content": JSON_RETRY_NOTE}]
+            )
+            data = await self._chat(self.request_body(request_chat, schema=schema))
+            usage.input_tokens += int(data.get("prompt_eval_count") or 0)
+            usage.output_tokens += int(data.get("eval_count") or 0)
+            done_reason = data.get("done_reason")
+            message = data.get("message")
+            raw = message.get("content") if isinstance(message, dict) else None
+            parsed = _json_object(raw if isinstance(raw, str) else "")
+            if parsed is not None and (validate is None or validate(parsed)):
+                break
+            parsed = None
+            log.warning(
+                "llm.local_invalid_json",
+                model=self.model,
+                attempt=attempt,
+                done_reason=done_reason,
+            )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        if parsed is None:
+            log.error("llm.local_invalid_json_final", model=self.model, attempts=MAX_ATTEMPTS)
+            raise LLMError(502, INVALID_OUTPUT_MESSAGE)
+        log.info("llm.local_json", model=self.model, done_reason=done_reason, latency_ms=latency_ms)
+        return JsonResult(
+            data=parsed,
+            usage=usage,
+            latency_ms=latency_ms,
+            done_reason=done_reason,
+            model_id=self.model_id,
         )
 
     async def loaded_models(self) -> list[dict[str, Any]]:

@@ -42,6 +42,8 @@ class Actions:
     QUESTION_FAILED = "question.failed"
     ANSWER_CREATED = "answer.created"
     REVIEW_DECIDED = "review.decided"
+    COMPARISON_CREATED = "comparison.created"
+    COMPARISON_SUMMARIZED = "comparison.summarized"
 
 
 def record(

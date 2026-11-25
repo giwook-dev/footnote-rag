@@ -176,7 +176,13 @@ async def test_markdown_upload_uses_headings_as_section_path(
     doc_id = uuid.UUID(resp.json()["document_id"])
     async with sessionmaker() as s:
         doc = await s.get(Document, doc_id)
-        paths = list(await s.scalars(select(Chunk.section_path).where(Chunk.document_id == doc_id)))
+        paths = list(
+            await s.scalars(
+                select(Chunk.section_path)
+                .where(Chunk.document_id == doc_id)
+                .order_by(Chunk.chunk_index)  # document order; without it the heap order decides
+            )
+        )
         audit = await s.scalar(
             select(AuditLog).where(
                 AuditLog.action == "document.text_uploaded", AuditLog.target_id == str(doc_id)

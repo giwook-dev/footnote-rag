@@ -4,7 +4,8 @@
 될 때까지 기다린 뒤(``wait_for_imports``) 질문마다 검색·답변 결과를 채점해 Markdown 리포트를 쓴다.
 기본은 Fake 모드(비용 없음), ``--live``는 실제 제공자. ``--live --local-models``/``--cascade``는 같은 데이터셋을 여러 로컬
 (Ollama) 구성에 돌려 구성별 리포트와 비교 리포트(``{stamp}-live-compare-local.md``)를 쓴다(가져오기·질문 임베딩은 한 번).
-주요 요소: ``run_eval``, ``run_eval_configs``, ``EvalConfig``, ``MemoizedQueryEmbedder``, ``wait_for_imports``,
+주요 요소: ``run_eval``, ``run_eval_configs``, ``EvalConfig``, ``MemoizedQueryEmbedder``, ``import_filings``(주석 변동
+Eval ``evals.note_diff``와 공유), ``wait_for_imports``,
 ``EvalSummary``(지표 속성), ``ItemResult``, ``DocumentImport``, ``score_citations``, ``item_category``, ``percentile``,
 ``render_report``, ``render_compare_report``, ``write_report``, ``write_compare_reports``, ``parse_model_spec``,
 ``preflight_local_models``, ``main``.
@@ -1021,6 +1022,73 @@ def _doc_ids(item: EvalItem, prepared: PreparedEval) -> list[uuid.UUID]:
     return [prepared.rcept_to_doc[r] for r in item.rcept_nos if r in prepared.rcept_to_doc]
 
 
+@dataclass
+class ImportedFilings:
+    """A throw-away organization with every filing imported (``import_filings``)."""
+
+    admin_id: uuid.UUID
+    org_id: uuid.UUID
+    rcept_to_doc: dict[str, uuid.UUID]
+    import_failures: list[str]
+    imports: list[DocumentImport]
+
+
+async def import_filings(
+    rcept_nos: Sequence[str],
+    *,
+    settings: Settings,
+    embedder: Embedder,
+    dart_client: DartClient,
+    label: str = "eval",
+    max_worker_loops: int = 1000,
+    import_timeout_seconds: float = DEFAULT_IMPORT_TIMEOUT_SECONDS,
+    import_poll_seconds: float = IMPORT_POLL_SECONDS,
+) -> ImportedFilings:
+    """Seed an org (``{label}-{run id}``), import every filing once through the normal service and
+    worker, and wait until each is ready/failed (``wait_for_imports``). Shared by the answer Eval
+    and the note change Eval (``evals.note_diff``)."""
+    from footnote_rag.db.session import get_sessionmaker
+
+    sm = get_sessionmaker()
+    run_id = uuid.uuid4().hex[:8]
+    async with sm() as session:
+        _org, admin = await seed_org(
+            session,
+            org_name=f"{label}-{run_id}",
+            admin_email=f"{label}-{run_id}@eval.local",
+            admin_password=uuid.uuid4().hex,
+        )
+    org_id = admin.org_id
+    rcept_to_doc: dict[str, uuid.UUID] = {}
+    async with sm() as session:
+        user = await session.get(User, admin.id)
+        assert user is not None
+        for rcept_no in sorted(set(rcept_nos)):
+            result = await request_dart_import(session, user=user, rcept_no=rcept_no)
+            rcept_to_doc[rcept_no] = result.document.id
+
+    worker = Worker(
+        sessionmaker=sm,
+        context=JobContext(sm, settings, embedder, dart_client),
+        worker_id=f"{label}-{run_id}",
+    )
+    failures = await wait_for_imports(
+        sm,
+        worker,
+        rcept_to_doc,
+        timeout_seconds=import_timeout_seconds,
+        poll_seconds=import_poll_seconds,
+        max_worker_loops=max_worker_loops,
+    )
+    return ImportedFilings(
+        admin_id=admin.id,
+        org_id=org_id,
+        rcept_to_doc=rcept_to_doc,
+        import_failures=failures,
+        imports=await _collect_imports(sm, org_id, rcept_to_doc),
+    )
+
+
 async def prepare_eval(
     items: list[EvalItem],
     *,
@@ -1041,43 +1109,24 @@ async def prepare_eval(
     if not runnable:
         return prepared
 
-    run_id = uuid.uuid4().hex[:8]
-    async with sm() as session:
-        _org, admin = await seed_org(
-            session,
-            org_name=f"eval-{run_id}",
-            admin_email=f"eval-{run_id}@eval.local",
-            admin_password=uuid.uuid4().hex,
-        )
-    org_id = admin.org_id
-    rcept_to_doc: dict[str, uuid.UUID] = {}
-    async with sm() as session:
-        user = await session.get(User, admin.id)
-        assert user is not None
-        for rcept_no in sorted({r for i in runnable for r in i.rcept_nos}):
-            result = await request_dart_import(session, user=user, rcept_no=rcept_no)
-            rcept_to_doc[rcept_no] = result.document.id
-
-    worker = Worker(
-        sessionmaker=sm,
-        context=JobContext(sm, settings, embedder, dart_client),
-        worker_id=f"eval-{run_id}",
-    )
-    prepared.admin_id, prepared.rcept_to_doc = admin.id, rcept_to_doc
-    prepared.import_failures = await wait_for_imports(
-        sm,
-        worker,
-        rcept_to_doc,
-        timeout_seconds=import_timeout_seconds,
-        poll_seconds=import_poll_seconds,
+    imported = await import_filings(
+        [r for i in runnable for r in i.rcept_nos],
+        settings=settings,
+        embedder=embedder,
+        dart_client=dart_client,
         max_worker_loops=max_worker_loops,
+        import_timeout_seconds=import_timeout_seconds,
+        import_poll_seconds=import_poll_seconds,
     )
-    prepared.imports = await _collect_imports(sm, org_id, rcept_to_doc)
+    admin_id = imported.admin_id
+    prepared.admin_id, prepared.rcept_to_doc = admin_id, imported.rcept_to_doc
+    prepared.import_failures = imported.import_failures
+    prepared.imports = imported.imports
 
     for item in runnable:
         doc_ids = _doc_ids(item, prepared)
         async with sm() as session:
-            user = await session.get(User, admin.id)
+            user = await session.get(User, admin_id)
             assert user is not None
             prepared.hits.append(
                 await retrieve(
