@@ -3,9 +3,9 @@
 역할: 사업보고서에는 같은 주석이 ``3. 연결재무제표 주석``과 ``5. 재무제표 주석``(별도) 아래에 두 번 나온다.
 번호(``35.`` vs ``33.``)나 제목 문구(``연결재무제표 작성기준 …`` vs ``재무제표 작성기준 …``)가 달라도 같은
 주석인지 비교할 키를 만든다.
-주요 요소: ``statement_scope``, ``note_key``, ``is_counterpart``, ``scope_label``.
+주요 요소: ``statement_scope``, ``note_key``, ``note_title``, ``is_counterpart``, ``scope_label``.
 호출 관계: ``retrieval.search.prefer_statement_scope``(검색 재정렬), ``answering.prompt``(근거 제목의
-``[연결]``/``[별도]`` 표시), ``evals.run``(대응 주석 인정 지표)이 호출한다.
+``[연결]``/``[별도]`` 표시), ``evals.run``(대응 주석 인정 지표), ``comparison.notes``(전기 대비 주석 짝짓기)가 호출한다.
 학습 문서: docs/study/05-rag-retrieval.md, docs/adr/0009-prefer-consolidated-notes.md
 
 Consolidated vs separate financial-statement notes, from ``section_path`` only.
@@ -91,6 +91,18 @@ def note_key(section_path: str) -> str | None:
     key = key.replace("연결재무제표", "재무제표").replace("별도재무제표", "재무제표")
     key = key.replace("연결", "")
     return key or None
+
+
+def note_title(section_path: str) -> str | None:
+    """The note heading right below the notes heading, as written (``12. 차입금 (연결)``), or None.
+
+    Display counterpart of ``note_key`` (same path component, nothing removed).
+    """
+    parts = _parts(section_path)
+    found = _notes_container(parts)
+    if found is None or found[1] + 1 >= len(parts):
+        return None
+    return parts[found[1] + 1] or None
 
 
 def is_counterpart(path_a: str, path_b: str) -> bool:

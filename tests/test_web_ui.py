@@ -41,6 +41,26 @@ async def test_ui_assets_are_served(client, path, content_type):
     assert resp.headers["x-content-type-options"] == "nosniff"
 
 
+async def test_ui_index_has_note_diff_tab(client):
+    resp = await client.get("/ui/")
+    assert resp.status_code == 200
+    assert 'id="tab-diff"' in resp.text and 'id="panel-diff"' in resp.text
+    assert "변동 분석" in resp.text
+
+
+async def test_fake_dart_find_lists_the_prior_annual_report(
+    capsys, settings, monkeypatch, tmp_path
+):
+    from footnote_rag import cli
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+    argv = ["dart-find", "--stock-codes", "990001", "--from", "20250101", "--to", "20260531"]
+    assert await cli.cmd_dart_find(cli.build_parser().parse_args(argv)) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "가람전자(합성)\t990001\t사업보고서 (2024.12)\t20250310900101\t20250310" in lines
+    assert "가람전자(합성)\t990001\t사업보고서 (2025.12)\t20260310900101\t20260310" in lines
+
+
 async def test_root_redirects_to_ui(client):
     resp = await client.get("/")
     assert resp.status_code == 307

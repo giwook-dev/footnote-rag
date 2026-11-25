@@ -27,6 +27,7 @@
 | 8 | [08. 검토·감사·사용량](08-review-audit-usage.md) | HITL, 조건부 UPDATE, append-only, 비용, 답변 상태도 | 45분 |
 | 9 | [09. 테스트와 운영](09-testing-and-ops.md) | Protocol+Fake, 실제 Postgres 테스트, 비밀값, Docker, CI, 제공자 선택도 | 45분 |
 | 10 | [10. Eval과 MCP](10-eval-and-mcp.md) | 지표 정의, 검증기, 데이터셋 상태, MCP 구조 | 30분 |
+| 11 | [11. 전기 대비 주석 변동 분석](11-note-change-analysis.md) | 코드가 탐지하고 모델은 요약만: 주석 짝짓기, 기간 블록 표, 전기 수치 불일치, 요약 숫자 검증 | 30분 |
 | 복습 | [면접 Q&A](interview-qa.md) | 질문 32개: 요점, 근거, 꼬리 질문 | 60분 |
 | 복습 | [실습](exercises.md) | 직접 고치고 깨뜨려 보는 실습 10개 | 실습당 20~60분 |
 | 참고 | [용어집](glossary.md) | 용어 40여 개 | 필요할 때 |
