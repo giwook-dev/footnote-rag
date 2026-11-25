@@ -49,6 +49,7 @@
 | 지표 | 코드 | 정의 |
 | --- | --- | --- |
 | recall@k | `src/footnote_rag/evals/run.py::EvalSummary.recall_at_k` | 답할 수 있는 질문 중, 상위 `TOP_K` 검색 결과에 `expected_section_prefixes`로 시작하는 청크가 하나라도 있는 비율 |
+| recall@k (every document) | `src/footnote_rag/evals/run.py::recall_at_k_every_document`, `src/footnote_rag/evals/run.py::every_document_hit` | 같은 비율이지만, 여러 회사 비교 문항은 `rcept_nos`의 **모든 문서**마다 기대 섹션 청크가 상위 k에 있어야 성공. 문서가 하나인 문항은 recall@k와 같다. recall@k와의 차이가 "한 회사만 검색된" 비교 문항이다([ADR 0011](../adr/0011-balanced-multi-document-retrieval.md)) |
 | 인용 정확도 | `src/footnote_rag/evals/run.py::EvalSummary.citation_accuracy` | 답할 수 있는 질문들의 전체 각주 중 `section_path`가 기대 접두어로 시작하는 각주의 비율 |
 | 거절 비율 | `src/footnote_rag/evals/run.py::EvalSummary.abstention_rate` | 답할 수 없는 질문 중 "거절"로 본 비율. 거절 = 각주 없음 **또는** `pending_review` **또는** 답에 "근거를 찾지 못했습니다" 문구 포함 |
 | 평균 비용·지연 | `EvalSummary.avg_cost_usd`, `EvalSummary.avg_latency_ms` | 질문당 평균. 비용은 가격표에 있는 모델만 |
@@ -62,7 +63,7 @@
 
 **Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`를 보여 준다(`src/footnote_rag/evals/run.py::_render_diagnostics`). 기대 목차가 상위 k에 있었으면 "검색됐는데 다른 근거를 골랐다", 없으면 "검색 실패"로 구분된다. 각주 표의 `counterpart` 열은 같은 주석의 별도재무제표 판을 인용한 경우를 표시하고, 진단 문구도 "separate-statement counterpart cited"로 따로 적는다. 본문 텍스트는 넣지 않는다.
 
-**False abstention diagnostics**: 답할 수 있는데 거절한 문항마다 답변 상태, `review_reason`(예: `no_citations`는 모델이 쓸 만한 근거 번호를 내지 않음, `low_retrieval_score`는 신뢰도 규칙), 검색 상위 k 표를 보여 준다(`src/footnote_rag/evals/run.py::_render_abstention_diagnostics`). 머리말에는 `prefer_consolidated`·`retrieval_candidates`가 적혀 설정별 리포트를 비교할 수 있다. 테스트: `tests/test_eval_report.py::test_counterpart_metric_accepts_the_nine_separate_note_citations`, `tests/test_eval_report.py::test_false_abstentions_get_review_reason_and_top_k`.
+**False abstention diagnostics**: 답할 수 있는데 거절한 문항마다 답변 상태, `review_reason`(예: `no_citations`는 모델이 쓸 만한 근거 번호를 내지 않음, `low_retrieval_score`는 신뢰도 규칙), 검색 상위 k 표를 보여 준다(`src/footnote_rag/evals/run.py::_render_abstention_diagnostics`). 두 진단의 검색 결과 표에는 `document` 열(회사명, 없으면 rcept_no)이 있어 비교 문항에서 어느 회사 청크가 자리를 차지했는지 보인다. 머리말에는 `prefer_consolidated`·`retrieval_candidates`가 적혀 설정별 리포트를 비교할 수 있다. 테스트: `tests/test_eval_report.py::test_counterpart_metric_accepts_the_nine_separate_note_citations`, `tests/test_eval_report.py::test_false_abstentions_get_review_reason_and_top_k`.
 
 기본은 Fake 모드(비용 없음)이며 리포트에 "Fake mode … not answer quality"라는 경고가 붙는다. `--live`는 설정된 실제 제공자를 쓰고 비용이 발생한다. 테스트: `tests/test_evals_cli_mcp.py::test_eval_runner_fake_mode_writes_markdown_report`.
 
@@ -77,8 +78,11 @@
 | escalation rate | `src/footnote_rag/evals/run.py::escalation_rate` | 상향 구성에서 fallback을 부른 문항 / 전체 문항. 상향 구성이 아니면 `n/a` |
 | ungrounded number answers | `src/footnote_rag/evals/run.py::ungrounded_answer_count` | 인용한 청크에 없는 숫자가 하나라도 든 답변 수(`src/footnote_rag/answering/number_check.py::ungrounded_numbers`) |
 | errors | `src/footnote_rag/evals/run.py::error_count` | `LLMError`로 `error` 처리된 문항 수 |
+| GPU share | `src/footnote_rag/evals/run.py::measure_gpu_share` | 예열 직후 Ollama `/api/ps`의 `size_vram / size`(상향 구성의 fallback은 실행 뒤 다시 잼). 100% 미만이면 그 구성의 지연에 CPU 처리가 섞여 있다 |
 
-상향 자체는 `src/footnote_rag/answering/service.py::ask_question`의 `fallback_llm` 인자다. `refusal`·`truncated`·`no_citations`·`ungrounded_number`나 primary의 502일 때만 fallback을 한 번 부르고, 검색 사유(`low_retrieval_score` 등)와 503/504는 상향하지 않는다([ADR 0009 로컬 상향·숫자 검증](../adr/0009-local-cascade-and-number-grounding.md)). 비교 리포트의 문항별 행렬에서 상향된 문항은 `↑`로 표시된다. 상향 구성의 정확도가 큰 모델 단독과 비슷하면서 p50 지연이 작은 모델에 가깝다면 상향이 제값을 하는 것이다. 테스트: `tests/test_eval_compare.py::test_configs_share_one_import_and_one_query_embedding_per_question`, `tests/test_cascade.py::test_no_citations_escalates_and_fallback_publishes`.
+구성마다 예열 전에 `src/footnote_rag/evals/run.py::unload_unused_models`가 그 구성이 쓰지 않는 로드된 모델을 내린다(`src/footnote_rag/answering/local_llm.py::OllamaClient.unload`). 앞 구성의 큰 모델이 VRAM에 남아 있으면 다음 모델 일부가 CPU로 밀려 지연이 부풀기 때문이다. 앱은 모델을 내리지 않는다.
+
+상향 자체는 `src/footnote_rag/answering/service.py::ask_question`의 `fallback_llm` 인자다. `refusal`·`truncated`·`no_citations`·`ungrounded_number`나 primary의 502일 때만 fallback을 한 번 부르고, 검색 사유(`low_retrieval_score` 등)와 503/504는 상향하지 않는다([ADR 0010 로컬 상향·숫자 검증](../adr/0010-local-cascade-and-number-grounding.md)). 모델이 스스로 "근거 없음"(`insufficient: true`, `LLMResponse.abstained`)이라고 답해 생긴 `no_citations`만으로는 상향하지 않는다(`src/footnote_rag/answering/service.py::escalation_triggers`). 답할 수 없는 질문의 올바른 거절을 큰 모델에 다시 물어도 지연만 늘었기 때문이다. 비교 리포트의 문항별 행렬에서 상향된 문항은 `↑`로 표시된다. 상향 구성의 정확도가 큰 모델 단독과 비슷하면서 p50 지연이 작은 모델에 가깝다면 상향이 제값을 하는 것이다. 테스트: `tests/test_eval_compare.py::test_configs_share_one_import_and_one_query_embedding_per_question`, `tests/test_cascade.py::test_no_citations_escalates_and_fallback_publishes`.
 
 지표의 해석 주의:
 - 판정이 **목차 접두어 일치**라서, 다른 목차에도 같은 내용이 있으면 정답인데도 오답으로 셀 수 있다. 연결↔별도 대응 주석은 보조 지표가 따로 세지만, 그 밖의 중복(예: `XI. 그 밖에 … > 우발부채 등에 관한 사항`)은 여전히 오답으로 센다.

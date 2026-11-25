@@ -15,7 +15,7 @@ from sqlalchemy import select
 
 from footnote_rag.answering.llm import NO_EVIDENCE_TEXT, LLMError, LLMResponse, LLMUsage
 from footnote_rag.answering.local_llm import OllamaClient
-from footnote_rag.answering.service import ask_question, review_reasons
+from footnote_rag.answering.service import ask_question, escalation_triggers, review_reasons
 from footnote_rag.config import Settings
 from footnote_rag.db.models import AuditLog, LlmCall, User
 from footnote_rag.providers import make_fallback_llm, make_llm
@@ -65,11 +65,14 @@ def converted_amount(messages) -> list[dict[str, Any]]:
 class ScriptedLLM:
     provider = "local"
 
-    def __init__(self, model: str, script, *, flags: list[str] | None = None) -> None:
+    def __init__(
+        self, model: str, script, *, flags: list[str] | None = None, abstained: bool = False
+    ) -> None:
         self.model = model
         self.model_id = f"ollama:{model}"
         self.script = script
         self.flags = flags or []
+        self.abstained = abstained
         self.calls = 0
 
     async def answer(self, *, system: str, messages: list[dict[str, Any]]) -> LLMResponse:
@@ -84,6 +87,7 @@ class ScriptedLLM:
             latency_ms=3,
             citation_method="model_reference",
             review_flags=list(self.flags),
+            abstained=self.abstained,
         )
 
 
@@ -225,6 +229,71 @@ async def test_other_model_reasons_escalate(
     assert fallback.calls == 1 and result.escalated
     assert reason in result.escalation_reasons
     assert result.answer.status == "published"
+
+
+async def test_explicit_abstention_alone_does_not_escalate(
+    org, sessionmaker, fake_embedder, settings
+):
+    """unans-01~04 on 2026-11-25: the small model said "insufficient" (the right answer) and the
+    cascade still called the big model. ``no_citations`` of an explicit abstention stays put."""
+    primary = ScriptedLLM("small", no_evidence, abstained=True)
+    fallback = ScriptedLLM("big", cite_first)
+    result = await _ask(sessionmaker, org, fake_embedder, settings, primary, fallback)
+    assert (primary.calls, fallback.calls) == (1, 0)
+    assert result.escalated is False and result.escalation_reasons == []
+    assert result.models == ["ollama:small"]
+    # the review gate is unchanged: the abstention still goes to review
+    assert result.answer.status == "pending_review"
+    assert result.answer.review_reason == "no_citations"
+    calls = await _calls(sessionmaker, result.answer.id)
+    assert [c.model for c in calls] == ["ollama:small"]
+    meta = await _asked(sessionmaker, result.answer.question_id)
+    assert meta["escalated"] is False and meta["escalation_reasons"] == []
+
+
+@pytest.mark.parametrize(
+    ("script", "flags", "reason"),
+    [(no_evidence, ["truncated"], "truncated"), (converted_amount, [], "ungrounded_number")],
+    ids=["truncated", "ungrounded-number"],
+)
+async def test_abstention_with_another_reason_still_escalates(
+    org, sessionmaker, fake_embedder, settings, script, flags, reason
+):
+    primary = ScriptedLLM("small", script, flags=flags, abstained=True)
+    fallback = ScriptedLLM("big", cite_first)
+    result = await _ask(sessionmaker, org, fake_embedder, settings, primary, fallback)
+    assert fallback.calls == 1 and result.escalated is True
+    assert reason in result.escalation_reasons
+    assert result.answer.status == "published"
+    assert len(await _calls(sessionmaker, result.answer.id)) == 2
+
+
+async def test_dropped_source_numbers_without_abstention_still_escalate(
+    org, sessionmaker, fake_embedder, settings
+):
+    """The model answered but every source number was out of range (``abstained=False``)."""
+
+    def out_of_range(messages):
+        return [{"type": "text", "text": NO_EVIDENCE_TEXT}]
+
+    primary = ScriptedLLM("small", out_of_range, abstained=False)
+    fallback = ScriptedLLM("big", cite_first)
+    result = await _ask(sessionmaker, org, fake_embedder, settings, primary, fallback)
+    assert fallback.calls == 1 and result.escalation_reasons == ["no_citations"]
+    assert result.answer.status == "published"
+
+
+def test_escalation_triggers():
+    def response(abstained: bool) -> LLMResponse:
+        return LLMResponse("m", "end_turn", abstained=abstained)
+
+    assert escalation_triggers(response(False), ["no_citations"]) == ["no_citations"]
+    assert escalation_triggers(response(True), ["no_citations"]) == []
+    assert escalation_triggers(response(True), ["truncated", "no_citations"]) == ["truncated"]
+    assert escalation_triggers(response(True), ["low_retrieval_score", "no_citations"]) == []
+    assert escalation_triggers(response(False), ["low_retrieval_score"]) == []
+    # Claude / Fake responses keep the default
+    assert LLMResponse("m", "end_turn").abstained is False
 
 
 async def test_refusal_escalates(org, sessionmaker, fake_embedder, settings):
@@ -406,6 +475,114 @@ async def test_warm_up_failure_never_raises(outcome):
         return outcome
 
     assert await _ollama(handler).warm_up() is False
+
+
+def _chat_reply(content: str, done_reason: str = "stop"):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"message": {"content": content}, "done_reason": done_reason}
+        )
+
+    return handler
+
+
+ONE_SOURCE = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "search_result",
+                "source": "doc:1#chunk:1",
+                "title": "t",
+                "content": [{"type": "text", "text": "리스부채 1,234"}],
+            },
+            {"type": "text", "text": "리스부채는?"},
+        ],
+    }
+]
+
+
+@pytest.mark.parametrize(
+    ("content", "done_reason", "abstained"),
+    [
+        ('{"insufficient": true, "sentences": []}', "stop", True),
+        (
+            '{"insufficient": false, "sentences": [{"text": "1,234", "sources": [1]}]}',
+            "stop",
+            False,
+        ),
+        # out-of-range source numbers only: not an abstention (the cascade still escalates)
+        (
+            '{"insufficient": false, "sentences": [{"text": "1,234", "sources": [9]}]}',
+            "stop",
+            False,
+        ),
+        # cut off by num_predict: insufficient is read from the salvaged text
+        ('{"insufficient": true, "sentences": [', "length", True),
+    ],
+    ids=["insufficient", "answered", "dropped-refs", "truncated-insufficient"],
+)
+async def test_ollama_insufficient_sets_abstained(content, done_reason, abstained):
+    llm = _ollama(_chat_reply(content, done_reason))
+    response = await llm.answer(system="", messages=ONE_SOURCE)
+    assert response.abstained is abstained
+
+
+async def test_ollama_loaded_models_reads_api_ps():
+    seen: list[httpx.Request] = []
+    ps = {
+        "models": [
+            {"name": "qwen3:14b", "model": "qwen3:14b", "size": 1000, "size_vram": 780},
+            {"model": "qwen3.5:9b", "size": 500, "size_vram": 500},
+            {"size": 1},  # no name: skipped
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=ps)
+
+    assert await _ollama(handler).loaded_models() == [
+        {"name": "qwen3:14b", "size": 1000, "size_vram": 780},
+        {"name": "qwen3.5:9b", "size": 500, "size_vram": 500},
+    ]
+    assert seen[0].method == "GET" and seen[0].url == "http://ollama.test:11434/api/ps"
+
+
+async def test_ollama_unload_posts_keep_alive_zero():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"done": True, "done_reason": "unload"})
+
+    assert await _ollama(handler, model="qwen3.5:9b").unload("qwen3:14b") is True
+    assert seen[0].method == "POST"
+    assert seen[0].url == "http://ollama.test:11434/api/generate"
+    assert json.loads(seen[0].content) == {"model": "qwen3:14b", "keep_alive": 0}
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        httpx.ConnectError("refused"),
+        httpx.ReadTimeout("slow"),
+        httpx.Response(500),
+        httpx.Response(200, text="not json"),
+        RuntimeError(),
+    ],
+    ids=["refused", "timeout", "server-error", "bad-json", "unexpected"],
+)
+async def test_ollama_loaded_models_and_unload_never_raise(outcome):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    llm = _ollama(handler)
+    assert await llm.loaded_models() == []
+    expected_unload = isinstance(outcome, httpx.Response) and outcome.status_code < 400
+    assert await llm.unload("qwen3:14b") is expected_unload
 
 
 # ---- settings and factories ----

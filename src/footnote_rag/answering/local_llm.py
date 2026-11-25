@@ -3,10 +3,11 @@
 역할: ``search_result`` 블록을 ``[n] 제목\\n본문`` 목록으로 바꿔 Ollama ``/api/chat``에 보내고, 문장별 근거 번호
 JSON을 검증해 Claude와 같은 모양의 text 블록 + ``search_result_location`` citations로 바꾼다. 그래서 각주 번호
 매기기(``footnotes.build_footnotes``)와 신뢰도·검토·감사·사용량 흐름을 그대로 탄다.
-주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``status``, ``warm_up``), ``parse_local_answer``,
-``salvage_local_answer``, ``to_content_blocks``.
+주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``status``, ``warm_up``, ``loaded_models``, ``unload``),
+``parse_local_answer``, ``salvage_local_answer``, ``to_content_blocks``.
 호출 관계: ``providers.make_local_llm``이 만들고(``make_llm``·``make_fallback_llm``·비교 Eval) ``answering.service.ask_question``이
-``answer``를 호출한다. ``GET /llm/status``가 ``status``를, 비교 Eval이 ``status``(사전 점검)와 ``warm_up``(예열)을 호출한다.
+``answer``를 호출한다. ``GET /llm/status``가 ``status``를, 비교 Eval이 ``status``(사전 점검), ``warm_up``(예열),
+``unload``(쓰지 않는 모델 내리기)와 ``loaded_models``(GPU 적재율)를 호출한다. 앱은 모델을 내리지 않는다.
 학습 문서: docs/study/06-claude-citations.md (로컬 모델 경로), docs/adr/0008-local-llm-ollama.md
 
 Ollama-backed ``LLMClient``.
@@ -16,6 +17,10 @@ Ollama-backed ``LLMClient``.
   ``format: LOCAL_ANSWER_SCHEMA``, ``options: {num_ctx, num_predict, temperature}``, ``think``
   (a bool, or a level string such as ``"low"`` for gpt-oss, sent as-is)
 * ``warm_up``: ``POST {base}/api/generate`` with an empty prompt loads the model; never raises
+* ``loaded_models``: ``GET {base}/api/ps`` -> ``[{name, size, size_vram}]`` (``[]`` on failure);
+  ``unload``: ``POST {base}/api/generate`` with ``keep_alive: 0``; neither raises (Eval only)
+* ``insufficient: true`` -> ``LLMResponse.abstained`` (the cascade does not escalate an explicit
+  "no evidence" answer for ``no_citations`` alone)
 * invalid JSON / schema -> one retry; a second failure -> ``LLMError(502)``.
   ``done_reason == "length"`` is not retried: complete sentences are salvaged and the answer is
   flagged ``truncated`` (pending review)
@@ -84,6 +89,10 @@ class LocalAnswer:
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _int_or_zero(value: Any) -> int:
+    return value if _is_int(value) else 0
 
 
 def _sentence_from(obj: Any) -> LocalSentence | None:
@@ -399,7 +408,51 @@ class OllamaClient:
             citation_method=CITATION_MODEL_REFERENCE,
             dropped_source_refs=converted.dropped_source_refs,
             review_flags=flags,
+            # salvaged (truncated) output too: insufficient is read from the raw text
+            abstained=parsed.insufficient,
         )
+
+    async def loaded_models(self) -> list[dict[str, Any]]:
+        """Models the Ollama server holds in memory (``GET /api/ps``) as
+        ``[{name, size, size_vram}]``. Never raises: any failure returns ``[]``."""
+        try:
+            async with self._client(httpx.Timeout(STATUS_TIMEOUT_SECONDS)) as client:
+                resp = await client.get("/api/ps")
+            if resp.status_code != 200:
+                log.warning("llm.local_ps_failed", status=resp.status_code)
+                return []
+            models = resp.json().get("models") or []
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            log.warning("llm.local_ps_failed", error=type(exc).__name__)
+            return []
+        out: list[dict[str, Any]] = []
+        for m in models if isinstance(models, list) else []:
+            if not isinstance(m, dict) or not (m.get("name") or m.get("model")):
+                continue
+            out.append(
+                {
+                    "name": str(m.get("name") or m.get("model")),
+                    "size": _int_or_zero(m.get("size")),
+                    "size_vram": _int_or_zero(m.get("size_vram")),
+                }
+            )
+        return out
+
+    async def unload(self, model: str) -> bool:
+        """Ask Ollama to drop ``model`` from memory now (``POST /api/generate`` with
+        ``keep_alive: 0``). Never raises: a failure is logged as a warning and returns False."""
+        body = {"model": model, "keep_alive": 0}
+        try:
+            async with self._client(self._request_timeout()) as client:
+                resp = await client.post("/api/generate", json=body)
+        except Exception as exc:  # noqa: BLE001 - unloading is best effort
+            log.warning("llm.local_unload_failed", model=model, error=type(exc).__name__)
+            return False
+        if resp.status_code >= 400:
+            log.warning("llm.local_unload_failed", model=model, status=resp.status_code)
+            return False
+        log.info("llm.local_unload", model=model)
+        return True
 
     async def status(self) -> dict[str, Any]:
         """Reachability and model presence via ``GET {base}/api/tags`` (3 s timeout)."""

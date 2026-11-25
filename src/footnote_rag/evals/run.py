@@ -9,7 +9,8 @@
 ``render_report``, ``render_compare_report``, ``write_report``, ``write_compare_reports``, ``parse_model_spec``,
 ``preflight_local_models``, ``main``.
 호출 관계: ``documents.service``, ``jobs.worker.Worker``, ``answering.service``를 그대로 호출한다.
-학습 문서: docs/study/10-eval-and-mcp.md, docs/adr/0009-local-cascade-and-number-grounding.md
+학습 문서: docs/study/10-eval-and-mcp.md, docs/adr/0010-local-cascade-and-number-grounding.md,
+docs/adr/0011-balanced-multi-document-retrieval.md
 
 Eval runner.
 
@@ -26,8 +27,13 @@ built, with the ``LOCAL_LLM_*`` base_url / num_ctx / max_tokens / timeout / temp
 Every model is checked first (``OllamaClient.status``); an unreachable server or a missing model
 prints ``ollama pull`` hints and exits with 2 before anything is imported. The filings are imported
 once, each question is embedded once (``MemoizedQueryEmbedder``) and every config answers the same
-questions in the same order. Single-model configs are warmed up (``OllamaClient.warm_up``) before
-timing; a cascade warms only its primary (swapping models on escalation is a real cost).
+questions in the same order. Before each config, every loaded model the config does not use is
+unloaded (``OllamaClient.unload``; a cascade uses both its models), so a previous config's model
+cannot push this one partly onto the CPU. Single-model configs are then warmed up
+(``OllamaClient.warm_up``) before timing; a cascade warms only its primary (swapping models on
+escalation is a real cost). The GPU share (``size_vram / size`` from ``OllamaClient.loaded_models``)
+of each config model is measured after the warm-up (a cascade's fallback again after the run) and
+written in the per-config header and the comparison's ``GPU share`` column.
 
 An ``LLMError`` on one question is recorded as status ``error`` (abstained, no footnotes) and the
 run goes on (single-config runs too).
@@ -42,12 +48,14 @@ dataset through the normal service + worker, then asks each question through the
 answering service and measures:
 
 * retrieval recall@k   - an expected-section chunk is among the top-k results
+* recall@k (every document) - the same, but a multi-document (comparison) item counts only if
+  every one of its documents has an expected-section chunk in the top-k (docs/adr/0011)
 * citation accuracy    - share of footnotes whose section_path matches an expected prefix
   (also computed over retrieval-hit items only, to separate retrieval from model errors)
 * citation accuracy (consolidated/separate counterpart accepted) - the same, but a footnote on
   the counterpart note of an expected section (``dart.sections.is_counterpart``: the separate
   ``5. 재무제표 주석 > 12. 차입금`` for ``3. 연결재무제표 주석 > 12. 차입금 (연결)``) also counts.
-  A supplementary metric; the strict one above is unchanged (docs/adr/0009)
+  A supplementary metric; the strict one above is unchanged (docs/adr/0009-prefer-consolidated-notes.md)
 * abstention           - unanswerable questions were not answered (no footnotes, "근거 없음",
                          or routed to review)
 * answered rate        - answerable questions answered with >= 1 footnote; the rest are
@@ -56,7 +64,7 @@ answering service and measures:
 
 Diagnostics list, per wrong citation, the retrieved top-k and the cited paths (with a
 ``counterpart`` column), and, per false abstention, the retrieved top-k and the answer's
-``review_reason``. The header records ``PREFER_CONSOLIDATED`` / ``RETRIEVAL_CANDIDATES``.
+``review_reason``; the retrieved rows name their document (company or rcept_no). The header records ``PREFER_CONSOLIDATED`` / ``RETRIEVAL_CANDIDATES``.
 
 Another worker on the same database (e.g. the compose ``worker`` service) may claim the import
 jobs first, so after draining the queue itself the runner polls the documents until every one
@@ -118,6 +126,14 @@ class RetrievedRef:
     section_path: str
     score: float
     expected: bool
+    # The hit's document: rcept_no (document id when unknown) and company name, if known.
+    document: str | None = None
+    corp_name: str | None = None
+
+    @property
+    def document_label(self) -> str:
+        """Company name, else rcept_no / document id, else ``-`` (diagnostics column)."""
+        return self.corp_name or self.document or "-"
 
 
 @dataclass
@@ -144,6 +160,9 @@ class ItemResult:
     footnote_ungrounded: list[list[str]] = field(default_factory=list)
     # ``LLMError.public_message`` when ``status == "error"``.
     error: str | None = None
+    # Every document of the item (``rcept_nos``) has an expected-section chunk in the top-k.
+    # Equals ``retrieval_hit`` for a single-document item; None = not scored.
+    retrieval_hit_every_document: bool | None = None
 
     @property
     def footnotes_accepted(self) -> int:
@@ -217,6 +236,13 @@ def _answerable(rows: Sequence[ItemResult]) -> list[ItemResult]:
 def recall_at_k(rows: Sequence[ItemResult]) -> float | None:
     scored = [r for r in _answerable(rows) if r.retrieval_hit is not None]
     return sum(r.retrieval_hit for r in scored) / len(scored) if scored else None
+
+
+def recall_at_k_every_document(rows: Sequence[ItemResult]) -> float | None:
+    """recall@k where a multi-document item counts only if *every* document's expected section
+    is in the top-k (``recall_at_k`` counts any one). Same as ``recall_at_k`` for one document."""
+    scored = [r for r in _answerable(rows) if r.retrieval_hit_every_document is not None]
+    return sum(r.retrieval_hit_every_document for r in scored) / len(scored) if scored else None
 
 
 def citation_accuracy(rows: Sequence[ItemResult]) -> float | None:
@@ -317,6 +343,9 @@ class EvalSummary:
     think: ThinkSetting | None = None
     fallback_model: str | None = None
     fallback_think: ThinkSetting | None = None
+    # Local comparison runs only: GPU share (``size_vram / size`` from Ollama ``/api/ps``) of each
+    # model of the config, ``(model, share)`` in config order; share None = not loaded / unknown.
+    gpu_share: list[tuple[str, float | None]] | None = None
 
     @property
     def is_cascade(self) -> bool:
@@ -347,6 +376,10 @@ class EvalSummary:
     @property
     def recall_at_k(self) -> float | None:
         return recall_at_k(self.results)
+
+    @property
+    def recall_at_k_every_document(self) -> float | None:
+        return recall_at_k_every_document(self.results)
 
     @property
     def citation_accuracy_counterpart(self) -> float | None:
@@ -511,16 +544,18 @@ def _render_categories(summary: EvalSummary) -> list[str]:
     lines = [
         "## Metrics by question type",
         "",
-        f"| type | items | recall@{summary.k} | citation accuracy | citation acc. (retrieval hit) "
+        f"| type | items | recall@{summary.k} | recall@{summary.k} (every document) "
+        "| citation accuracy | citation acc. (retrieval hit) "
         "| answered (answerable) | false abstentions | unanswerable abstained "
         "| latency p50 ms | latency p95 ms "
         "| citation acc. (counterpart accepted) | citation acc. (retrieval hit, counterpart accepted) |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for name, rows in groups.items():
         false_ids = false_abstentions(rows)
         lines.append(
             f"| {_cell(name)} | {len(rows)} | {_pct(recall_at_k(rows))} "
+            f"| {_pct(recall_at_k_every_document(rows))} "
             f"| {_pct(citation_accuracy(rows))} | {_pct(citation_accuracy_retrieval_hit(rows))} "
             f"| {_ratio(answered_rate(rows), rows)} "
             f"| {len(false_ids) if _answerable(rows) else '-'} "
@@ -575,16 +610,17 @@ def _diagnosis(r: ItemResult) -> str:
 
 def _render_retrieved_table(summary: EvalSummary, r: ItemResult) -> list[str]:
     lines = [
-        f"| top-{summary.k} rank | score | expected | retrieved section_path |",
-        "| --- | --- | --- | --- |",
+        f"| top-{summary.k} rank | score | expected | retrieved section_path | document |",
+        "| --- | --- | --- | --- | --- |",
     ]
     if r.retrieved:
         lines += [
-            f"| {i} | {ref.score:.3f} | {'✓' if ref.expected else ''} | {_cell(ref.section_path)} |"
+            f"| {i} | {ref.score:.3f} | {'✓' if ref.expected else ''} | {_cell(ref.section_path)} "
+            f"| {_cell(ref.document_label)} |"
             for i, ref in enumerate(r.retrieved, start=1)
         ]
     else:
-        lines.append("| - | - | - | (no results) |")
+        lines.append("| - | - | - | (no results) | - |")
     return lines
 
 
@@ -732,7 +768,25 @@ def _local_config_header(summary: EvalSummary) -> list[str]:
         lines.append(f"- fallback model (cascade): `{summary.fallback_model}`")
         if summary.fallback_think is not None:
             lines.append(f"- fallback think: {_think_text(summary.fallback_think)}")
+    if summary.gpu_share is not None:
+        lines.append(
+            f"- GPU share (Ollama size_vram / size, after warm-up): {gpu_share_text(summary)}"
+        )
     return lines
+
+
+def _share(value: float | None) -> str:
+    return "n/a" if value is None else f"{value * 100:.0f}%"
+
+
+def gpu_share_text(summary: EvalSummary) -> str:
+    """``100%`` (one model) or ``qwen3.5:9b 100% / qwen3:14b 78%`` (cascade); ``n/a`` if not
+    measured."""
+    if not summary.gpu_share:
+        return "n/a"
+    if len(summary.gpu_share) == 1:
+        return _share(summary.gpu_share[0][1])
+    return " / ".join(f"{model} {_share(share)}" for model, share in summary.gpu_share)
 
 
 def _optional_metric_rows(summary: EvalSummary) -> list[str]:
@@ -773,6 +827,8 @@ def render_report(summary: EvalSummary) -> str:
         "| metric | value |",
         "| --- | --- |",
         f"| retrieval recall@{summary.k} | {_pct(summary.recall_at_k)} |",
+        f"| retrieval recall@{summary.k} (every document) "
+        f"| {_pct(summary.recall_at_k_every_document)} |",
         f"| citation accuracy | {_pct(summary.citation_accuracy)} |",
         f"| unanswerable correctly abstained | {_pct(summary.abstention_rate)} |",
         f"| avg cost / question (USD) | {summary.avg_cost_usd if summary.avg_cost_usd is not None else 'n/a'} |",
@@ -1037,24 +1093,51 @@ async def prepare_eval(
     return prepared
 
 
-def _retrieval_fields(item: EvalItem, hits: list[RetrievedChunk]) -> dict:
+def _hit_document(hit: RetrievedChunk, rcept_of: dict[uuid.UUID, str] | None) -> str:
+    """rcept_no of a hit's document (the Eval's import map, then the document meta), else its id."""
+    known = (rcept_of or {}).get(hit.document_id)
+    return str(known or hit.document_meta.get("rcept_no") or hit.document_id)
+
+
+def every_document_hit(item: EvalItem, refs: Sequence[RetrievedRef]) -> bool | None:
+    """Each of the item's documents (``rcept_nos``) has an expected-section hit among ``refs``.
+    None for unscored items; any expected hit for a single-document item (= ``retrieval_hit``)."""
+    if not (item.answerable and item.expected_section_prefixes):
+        return None
+    if len(set(item.rcept_nos)) <= 1:
+        return any(ref.expected for ref in refs)
+    return all(any(ref.expected and ref.document == r for ref in refs) for r in item.rcept_nos)
+
+
+def _retrieval_fields(
+    item: EvalItem, hits: list[RetrievedChunk], rcept_of: dict[uuid.UUID, str] | None = None
+) -> dict:
     prefixes = item.expected_section_prefixes
+    refs = [
+        RetrievedRef(
+            h.section_path,
+            h.score,
+            bool(prefixes) and _matches(h.section_path, prefixes),
+            document=_hit_document(h, rcept_of),
+            corp_name=h.document_meta.get("corp_name") or None,
+        )
+        for h in hits
+    ]
     return {
         "retrieval_hit": any(_matches(h.section_path, prefixes) for h in hits)
         if item.answerable and prefixes
         else None,
-        "retrieved": [
-            RetrievedRef(
-                h.section_path,
-                h.score,
-                bool(prefixes) and _matches(h.section_path, prefixes),
-            )
-            for h in hits
-        ],
+        "retrieved": refs,
+        "retrieval_hit_every_document": every_document_hit(item, refs),
     }
 
 
-def _item_result(item: EvalItem, hits: list[RetrievedChunk], ask: AskResult) -> ItemResult:
+def _item_result(
+    item: EvalItem,
+    hits: list[RetrievedChunk],
+    ask: AskResult,
+    rcept_of: dict[uuid.UUID, str] | None = None,
+) -> ItemResult:
     prefixes = item.expected_section_prefixes
     cited_paths = [str(f.get("section_path", "")) for f in ask.footnotes]
     matching, counterpart = score_citations(cited_paths, prefixes)
@@ -1083,12 +1166,16 @@ def _item_result(item: EvalItem, hits: list[RetrievedChunk], ask: AskResult) -> 
             list(dict.fromkeys(u.text for u in ask.ungrounded_numbers if src in u.sources))
             for src in footnote_sources
         ],
-        **_retrieval_fields(item, hits),
+        **_retrieval_fields(item, hits, rcept_of),
     )
 
 
 def _error_result(
-    item: EvalItem, hits: list[RetrievedChunk], exc: LLMError, latency_ms: int
+    item: EvalItem,
+    hits: list[RetrievedChunk],
+    exc: LLMError,
+    latency_ms: int,
+    rcept_of: dict[uuid.UUID, str] | None = None,
 ) -> ItemResult:
     return ItemResult(
         item=item,
@@ -1100,7 +1187,7 @@ def _error_result(
         latency_ms=latency_ms,
         answer_preview="",
         error=exc.public_message,
-        **_retrieval_fields(item, hits),
+        **_retrieval_fields(item, hits, rcept_of),
     )
 
 
@@ -1123,6 +1210,59 @@ def _new_summary(
     )
 
 
+# ---- Ollama memory: unload other models, GPU share (local comparison only, never in the app) ----
+
+
+def _config_models(config: EvalConfig) -> list[str]:
+    """Ollama model names a config uses (primary, then the cascade fallback), deduplicated."""
+    names = [
+        str(getattr(llm, "model", "") or "")
+        for llm in (config.llm, config.fallback_llm)
+        if llm is not None
+    ]
+    return list(dict.fromkeys(n for n in names if n))
+
+
+def _same_model(loaded: str, wanted: str) -> bool:
+    """``/api/ps`` names carry a tag: ``qwen3`` is loaded as ``qwen3:latest``."""
+    return loaded == wanted or (":" not in wanted and loaded == f"{wanted}:latest")
+
+
+async def unload_unused_models(config: EvalConfig) -> list[str]:
+    """Unload (``OllamaClient.unload``) every loaded model the config does not use; a cascade
+    uses both its primary and its fallback. Returns the unloaded names. No-op for clients
+    without ``loaded_models``/``unload`` (Claude, Fake)."""
+    loaded_models = getattr(config.llm, "loaded_models", None)
+    unload = getattr(config.llm, "unload", None)
+    if not (callable(loaded_models) and callable(unload)):
+        return []
+    used = _config_models(config)
+    unloaded: list[str] = []
+    for loaded in await loaded_models():
+        name = str(loaded.get("name") or "")
+        if name and not any(_same_model(name, u) for u in used):
+            await unload(name)
+            unloaded.append(name)
+    if unloaded:
+        log.info("eval.models_unloaded", config=used, unloaded=unloaded)
+    return unloaded
+
+
+async def measure_gpu_share(config: EvalConfig) -> dict[str, float | None] | None:
+    """``size_vram / size`` of each config model as Ollama reports it now (None = not loaded);
+    None when the client cannot tell (no ``loaded_models``)."""
+    loaded_models = getattr(config.llm, "loaded_models", None)
+    if not callable(loaded_models):
+        return None
+    loaded = await loaded_models()
+    shares: dict[str, float | None] = {}
+    for model in _config_models(config):
+        match = next((m for m in loaded if _same_model(str(m.get("name") or ""), model)), None)
+        size = int(match.get("size") or 0) if match else 0
+        shares[model] = (int(match.get("size_vram") or 0) / size) if match and size > 0 else None
+    return shares
+
+
 async def run_config(
     prepared: PreparedEval,
     config: EvalConfig,
@@ -1133,7 +1273,13 @@ async def run_config(
     dataset_name: str,
     warm_up: bool = False,
 ) -> EvalSummary:
-    """Ask every prepared question with one config. ``LLMError`` -> an ``error`` row, go on."""
+    """Ask every prepared question with one config. ``LLMError`` -> an ``error`` row, go on.
+
+    ``warm_up`` (local comparison): first unload every loaded Ollama model this config does not
+    use (``unload_unused_models``), so the previous config's model cannot push this one partly
+    onto the CPU; then warm up the primary and record the GPU share. A cascade's fallback may
+    load only on escalation, so its share is measured again after the run.
+    """
     from footnote_rag.db.session import get_sessionmaker
 
     sm = get_sessionmaker()
@@ -1143,9 +1289,14 @@ async def run_config(
     summary.imports = list(prepared.imports)
     if not prepared.runnable:
         return summary
-    warm = getattr(config.llm, "warm_up", None)
-    if warm_up and callable(warm):
-        await warm()  # primary only: a cascade's model swap on escalation is a real cost
+    rcept_of = {doc_id: rcept_no for rcept_no, doc_id in prepared.rcept_to_doc.items()}
+    shares_after_warm_up: dict[str, float | None] | None = None
+    if warm_up:
+        await unload_unused_models(config)
+        warm = getattr(config.llm, "warm_up", None)
+        if callable(warm):
+            await warm()  # primary only: a cascade's model swap on escalation is a real cost
+        shares_after_warm_up = await measure_gpu_share(config)
     for item, hits in zip(prepared.runnable, prepared.hits, strict=True):
         doc_ids = _doc_ids(item, prepared)
         started = time.perf_counter()
@@ -1168,9 +1319,20 @@ async def run_config(
                 log.warning(
                     "eval.item_error", item=item.id, model=summary.label, status=exc.status_code
                 )
-                summary.results.append(_error_result(item, hits, exc, latency_ms))
+                summary.results.append(_error_result(item, hits, exc, latency_ms, rcept_of))
                 continue
-        summary.results.append(_item_result(item, hits, ask))
+        summary.results.append(_item_result(item, hits, ask, rcept_of))
+    if shares_after_warm_up is not None:
+        shares_after_run = (
+            await measure_gpu_share(config) if config.fallback_llm is not None else None
+        )
+        summary.gpu_share = [
+            (
+                model_label(model),
+                share if share is not None else (shares_after_run or {}).get(model),
+            )
+            for model, share in shares_after_warm_up.items()
+        ]
     return summary
 
 
@@ -1298,18 +1460,20 @@ def render_compare_report(
         "",
         "## Configs",
         "",
-        f"| config | recall@{k} | citation acc. | citation acc. (hit) | answered (answerable) "
+        f"| config | recall@{k} | recall@{k} (every document) | citation acc. "
+        "| citation acc. (hit) | answered (answerable) "
         "| false abst. | unans. abstained | ungrounded number answers | escalation rate | errors "
-        "| p50 ms | p95 ms | cost USD |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| p50 ms | p95 ms | GPU share | cost USD |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for label, s in zip(labels, summaries, strict=True):
         lines.append(
-            f"| {label} | {_pct(s.recall_at_k)} | {_pct(s.citation_accuracy)} "
+            f"| {label} | {_pct(s.recall_at_k)} | {_pct(s.recall_at_k_every_document)} "
+            f"| {_pct(s.citation_accuracy)} "
             f"| {_pct(s.citation_accuracy_retrieval_hit)} | {_ratio(s.answered_rate, s.results)} "
             f"| {len(s.false_abstentions)} | {_pct(s.abstention_rate)} | {s.ungrounded_answers} "
             f"| {_escalation_cell(s)} | {s.error_count} | {_ms(s.latency_p50_ms)} "
-            f"| {_ms(s.latency_p95_ms)} | {s.total_cost_usd:.4f} |"
+            f"| {_ms(s.latency_p95_ms)} | {_cell(gpu_share_text(s))} | {s.total_cost_usd:.4f} |"
         )
     header = "| id | " + " | ".join(labels) + " |"
     separator = "| --- |" + " --- |" * len(labels)

@@ -1,8 +1,11 @@
 """답변 숫자 근거 검증: 인용이 달린 문장의 숫자가 그 문장이 인용한 검색 청크 원문에 실제로 있는지 확인하는 순수 함수.
 
 역할: 모델이 직접 계산하거나 단위를 환산한 숫자(예: ``1,234,567백만원`` → ``약 1.2조 원``)를 잡아낸다. 계산은 모델이
-아니라 코드가 해야 한다는 원칙이라 단위 환산은 일부러 하지 않는다(docs/adr/0009-local-cascade-and-number-grounding.md).
-주요 요소: ``ungrounded_numbers``, ``UngroundedNumber``, ``extract_numbers``, ``contains_number``.
+아니라 코드가 해야 한다는 원칙이라 단위 환산은 일부러 하지 않는다(docs/adr/0010-local-cascade-and-number-grounding.md).
+점을 천 단위 구분자로 쓴 원문 표기(``39.012``)도 근거로 인정한다(근거 있음 쪽으로만 넓힘). 그래서 원문 소수
+``3.141``과 답 ``3141``이 일치로 처리될 수 있다는 한계가 있다.
+주요 요소: ``ungrounded_numbers``, ``UngroundedNumber``, ``extract_numbers``, ``contains_number``,
+``without_dot_separators``.
 호출 관계: ``answering.service.ask_question``이 호출하고, 결과가 있으면 ``review_reasons``가 ``ungrounded_number``를 붙인다.
 I/O가 없어 tests/test_number_check.py로 단위 테스트한다.
 
@@ -15,6 +18,12 @@ Rules:
 * a number is grounded when the cited chunks' text (commas removed) contains the same digit string
   on a number boundary: ``12`` does not match inside ``123`` or ``1.12``; a ``.`` only counts as part
   of a number when a digit follows it, so a sentence-final ``1,200.`` still matches ``1200``
+* dot thousands separators in the source are accepted too: the chunk text is also searched with
+  ``\\d{1,3}(?:\\.\\d{3})+`` numbers (dots followed by exactly three digits, on a number boundary)
+  written without their dots, so a table cell ``39.012`` grounds an answer ``39,012`` and
+  ``1.234.567`` grounds ``1,234,567``; ``1.5`` still does not ground ``15``. This only ever widens
+  "grounded". Known limitation (한계): a real decimal with a three-digit fraction (원문 소수
+  ``3.141``) also grounds the answer ``3141``
 * provider-agnostic: works on Claude (``api_citation``) and local (``model_reference``) blocks alike
 """
 
@@ -26,6 +35,8 @@ from dataclasses import dataclass
 from typing import Any
 
 NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# A number using dots as thousands separators: 1-3 digits, then groups of exactly three digits.
+DOT_GROUPED_RE = re.compile(r"(?<!\d)(?<!\d\.)\d{1,3}(?:\.\d{3})+(?!\d)(?!\.\d)")
 FOOTNOTE_MARKER_RE = re.compile(r"\[\d+\]")
 MAX_REPORTED = 10  # numbers kept in logs and audit metadata
 
@@ -57,10 +68,20 @@ def extract_numbers(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def without_dot_separators(haystack: str) -> str:
+    """``haystack`` with every dot-thousands-separated number (``39.012``, ``1.234.567``) written
+    without its dots (``39012``, ``1234567``); other text unchanged."""
+    return DOT_GROUPED_RE.sub(lambda m: m.group(0).replace(".", ""), haystack)
+
+
 def contains_number(haystack: str, value: str) -> bool:
-    """``value`` (normalized) occurs in ``haystack`` (already normalized) on a number boundary."""
-    pattern = rf"(?<!\d)(?<!\d\.){re.escape(value)}(?!\d)(?!\.\d)"
-    return re.search(pattern, haystack) is not None
+    """``value`` (normalized) occurs in ``haystack`` (already normalized) on a number boundary,
+    either as written or with dot thousands separators removed (``without_dot_separators``)."""
+    pattern = re.compile(rf"(?<!\d)(?<!\d\.){re.escape(value)}(?!\d)(?!\.\d)")
+    if pattern.search(haystack) is not None:
+        return True
+    alternate = without_dot_separators(haystack)
+    return alternate != haystack and pattern.search(alternate) is not None
 
 
 def _cited_indices(
