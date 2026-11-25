@@ -2,7 +2,8 @@
 
 역할: 설정의 ``dart_mode``·``embedder_mode``·``llm_mode``를 보고 구현체를 만든다. real인데 키가 없으면
 ``MissingKeyError``. ``llm_mode == "local"``이면 키 없이 ``OllamaClient``(호스트 Ollama)를 만든다.
-주요 요소: ``make_dart_client``, ``make_embedder``, ``make_llm``.
+``LOCAL_LLM_FALLBACK_MODEL``이 있으면 로컬 상향 대상도 만든다(``make_fallback_llm``).
+주요 요소: ``make_dart_client``, ``make_embedder``, ``make_llm``, ``make_local_llm``, ``make_fallback_llm``.
 호출 관계: ``main.lifespan``, ``jobs.worker._main``, ``cli``, ``evals.run``이 호출한다.
 학습 문서: docs/study/09-testing-and-ops.md (실제/Fake 제공자 선택 구조)
 
@@ -13,10 +14,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from footnote_rag.config import Settings, get_settings
+from footnote_rag.config import Settings, ThinkSetting, get_settings
 
 if TYPE_CHECKING:
     from footnote_rag.answering.llm import LLMClient
+    from footnote_rag.answering.local_llm import OllamaClient
     from footnote_rag.dart.client import DartClient
     from footnote_rag.retrieval.embedder import Embedder
 
@@ -64,6 +66,42 @@ def make_embedder(settings: Settings | None = None) -> Embedder:
     )
 
 
+def make_local_llm(
+    settings: Settings | None = None,
+    *,
+    model: str | None = None,
+    think: ThinkSetting | None = None,
+) -> OllamaClient:
+    """An ``OllamaClient`` with the ``LOCAL_LLM_*`` settings (base_url, num_ctx, max_tokens,
+    timeout, temperature). ``model``/``think`` override ``LOCAL_LLM_MODEL``/``LOCAL_LLM_THINK``
+    (``None`` = the setting). Never builds a Claude client, whatever ``LLM_PROVIDER`` says."""
+    from footnote_rag.answering.local_llm import OllamaClient
+
+    s = settings or get_settings()
+    # Ollama on the host: no API key needed.
+    return OllamaClient(
+        base_url=s.local_llm_base_url,
+        model=model or s.local_llm_model,
+        num_ctx=s.local_llm_num_ctx,
+        max_tokens=s.local_llm_max_tokens,
+        timeout=s.local_llm_timeout_seconds,
+        think=s.local_llm_think if think is None else think,
+        temperature=s.local_llm_temperature,
+    )
+
+
+def make_fallback_llm(settings: Settings | None = None) -> LLMClient | None:
+    """The cascade target (``LOCAL_LLM_FALLBACK_MODEL``), or None when the cascade is off.
+
+    Only for ``llm_mode == "local"``; ``LOCAL_LLM_FALLBACK_THINK`` defaults to ``LOCAL_LLM_THINK``.
+    """
+    s = settings or get_settings()
+    model = s.local_llm_fallback_model.strip()
+    if s.llm_mode != "local" or not model:
+        return None
+    return make_local_llm(s, model=model, think=s.local_llm_fallback_think)
+
+
 def make_llm(settings: Settings | None = None) -> LLMClient:
     from footnote_rag.answering.llm import ClaudeClient, FakeLLM
 
@@ -71,18 +109,7 @@ def make_llm(settings: Settings | None = None) -> LLMClient:
     if s.llm_mode == "fake":
         return FakeLLM()
     if s.llm_mode == "local":
-        from footnote_rag.answering.local_llm import OllamaClient
-
-        # Ollama on the host: no API key needed.
-        return OllamaClient(
-            base_url=s.local_llm_base_url,
-            model=s.local_llm_model,
-            num_ctx=s.local_llm_num_ctx,
-            max_tokens=s.local_llm_max_tokens,
-            timeout=s.local_llm_timeout_seconds,
-            think=s.local_llm_think,
-            temperature=s.local_llm_temperature,
-        )
+        return make_local_llm(s)
     return ClaudeClient(
         api_key=_require(s.anthropic_api_key, "ANTHROPIC_API_KEY"),
         model=s.claude_model,

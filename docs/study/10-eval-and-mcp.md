@@ -8,6 +8,7 @@
 - `evals.validate`가 왜 필요한지(근거 인용문이 파서 출력에 실제로 있는지 확인)를 설명할 수 있다.
 - 로컬 모델 실측 결과(README "Eval 결과 (실측)")를 읽고, 인용 오류가 검색 문제인지 모델 문제인지 리포트로 구분할 수 있다.
 - MCP 서버가 DB 대신 HTTP API를 호출해 권한과 조직 격리를 유지하는 구조를 설명할 수 있다.
+- 로컬 모델 비교 Eval(`--local-models`, `--cascade`)이 가져오기·질문 임베딩을 한 번만 하는 이유와 상향 비율(escalation rate)을 읽는 법을 안다.
 
 ## 개념
 
@@ -65,10 +66,24 @@
 
 기본은 Fake 모드(비용 없음)이며 리포트에 "Fake mode … not answer quality"라는 경고가 붙는다. `--live`는 설정된 실제 제공자를 쓰고 비용이 발생한다. 테스트: `tests/test_evals_cli_mcp.py::test_eval_runner_fake_mode_writes_markdown_report`.
 
+한 문항에서 `LLMError`가 나면 실행을 멈추지 않고 그 문항을 `error`(거절, 각주 0)로 기록한다(`src/footnote_rag/evals/run.py::run_config`). 질문 임베딩은 `src/footnote_rag/evals/run.py::MemoizedQueryEmbedder`가 질문 텍스트 기준으로 메모해 문항당 한 번만 부른다(검색 진단용 `retrieve`와 `ask_question`이 같은 결과를 공유).
+
+### 로컬 모델 비교와 상향 지표
+
+`--live --local-models qwen3.5:9b,gpt-oss:20b@low --cascade "qwen3.5:9b>qwen3:14b"`처럼 주면 `src/footnote_rag/evals/run.py::run_eval_configs`가 공시 가져오기·질문 검색을 **한 번만** 하고(`src/footnote_rag/evals/run.py::prepare_eval`), 구성마다 같은 문항 순서로 답을 받는다. 먼저 `src/footnote_rag/evals/run.py::preflight_local_models`가 모든 모델의 연결·존재를 확인하고, 문제가 있으면 `ollama pull` 안내와 함께 종료 코드 2로 끝난다. 구성별 리포트는 위와 같은 형식이고, `src/footnote_rag/evals/run.py::render_compare_report`가 비교 리포트(`{stamp}-live-compare-local.md`)를 만든다. 비교 표의 숫자는 구성별 리포트와 **같은 지표 함수**(`recall_at_k`, `citation_accuracy` 등)로 계산한다.
+
+| 지표 | 코드 | 정의 |
+| --- | --- | --- |
+| escalation rate | `src/footnote_rag/evals/run.py::escalation_rate` | 상향 구성에서 fallback을 부른 문항 / 전체 문항. 상향 구성이 아니면 `n/a` |
+| ungrounded number answers | `src/footnote_rag/evals/run.py::ungrounded_answer_count` | 인용한 청크에 없는 숫자가 하나라도 든 답변 수(`src/footnote_rag/answering/number_check.py::ungrounded_numbers`) |
+| errors | `src/footnote_rag/evals/run.py::error_count` | `LLMError`로 `error` 처리된 문항 수 |
+
+상향 자체는 `src/footnote_rag/answering/service.py::ask_question`의 `fallback_llm` 인자다. `refusal`·`truncated`·`no_citations`·`ungrounded_number`나 primary의 502일 때만 fallback을 한 번 부르고, 검색 사유(`low_retrieval_score` 등)와 503/504는 상향하지 않는다([ADR 0009 로컬 상향·숫자 검증](../adr/0009-local-cascade-and-number-grounding.md)). 비교 리포트의 문항별 행렬에서 상향된 문항은 `↑`로 표시된다. 상향 구성의 정확도가 큰 모델 단독과 비슷하면서 p50 지연이 작은 모델에 가깝다면 상향이 제값을 하는 것이다. 테스트: `tests/test_eval_compare.py::test_configs_share_one_import_and_one_query_embedding_per_question`, `tests/test_cascade.py::test_no_citations_escalates_and_fallback_publishes`.
+
 지표의 해석 주의:
 - 판정이 **목차 접두어 일치**라서, 다른 목차에도 같은 내용이 있으면 정답인데도 오답으로 셀 수 있다. 연결↔별도 대응 주석은 보조 지표가 따로 세지만, 그 밖의 중복(예: `XI. 그 밖에 … > 우발부채 등에 관한 사항`)은 여전히 오답으로 센다.
 - 거절 판정이 넓다(`pending_review`면 거절로 셈). 답할 수 없는 질문에 모델이 답했어도 검토 대기로 갔다면 거절로 계산된다.
-- 답변 문장의 사실 정확성(숫자가 맞는지 등)은 재지 않는다. LLM 채점기도 없다.
+- 답변 문장의 사실 정확성은 재지 않는다. LLM 채점기도 없다. 숫자는 "인용한 청크에 같은 숫자가 있는가"만 코드로 확인한다(ungrounded number answers). 숫자가 청크에 있지만 다른 항목의 값인 경우는 잡지 못한다.
 
 ### MCP 서버
 

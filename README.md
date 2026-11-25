@@ -145,9 +145,25 @@ Anthropic API 크레딧 없이 실제 답변을 만들어 보려면 호스트에
 - **속도**: GPU와 모델 크기에 따라 질문 하나에 수십 초가 걸릴 수 있습니다. `LOCAL_LLM_TIMEOUT_SECONDS`(기본 180초)를 넘으면 504입니다. 첫 질문은 모델을 VRAM에 올리느라 더 느립니다.
 - 출력이 `LOCAL_LLM_MAX_TOKENS`에 걸리면 완성된 문장만 남기고 `pending_review`(`truncated`)로 보냅니다. JSON이 깨지면 한 번 다시 요청하고, 또 실패하면 502입니다.
 - Ollama가 꺼져 있으면 503("로컬 LLM 서버(Ollama)에 연결할 수 없습니다"), 모델이 없으면 503("모델 … 이 없습니다: ollama pull …")입니다.
-- 비용은 `ollama:<모델>` 이름으로 0원 기록됩니다. Claude와 품질을 비교하려면 `python -m footnote_rag.evals.run --live`를 제공자별로 돌려 리포트를 비교합니다([Eval](#eval)).
+- 비용은 `ollama:<모델>` 이름으로 0원 기록됩니다. Claude와 품질을 비교하려면 `python -m footnote_rag.evals.run --live`를 제공자별로 돌려 리포트를 비교합니다([Eval](#eval)). 로컬 모델끼리는 한 번에 비교할 수 있습니다([로컬 모델 비교](#로컬-모델-비교)).
+- **임베딩 비용**: 답변은 로컬이어도 질문 임베딩은 여전히 Voyage를 씁니다. 다만 문서 청크 임베딩은 캐시되므로(`embedding_cache`) 같은 공시를 다시 가져와도 청크는 다시 임베딩하지 않고, Voyage 호출은 질문 수만큼만 일어납니다.
 
-설계 이유와 대안은 [ADR 0008](docs/adr/0008-local-llm-ollama.md)을 보세요.
+**think 수준**: `LOCAL_LLM_THINK`는 `false`/`true` 외에 `low`/`medium`/`high`도 받아 Ollama `think` 필드에 그대로 넣습니다. gpt-oss 계열은 bool이 아니라 수준 문자열을 받습니다(예: `LOCAL_LLM_THINK=low`).
+
+**로컬 상향(cascade)**: `LOCAL_LLM_FALLBACK_MODEL`을 설정하면 "단순한 질문은 작은 모델, 애매한 답만 큰 모델"로 동작합니다. primary(`LOCAL_LLM_MODEL`) 답이 `refusal`·`truncated`·`no_citations`·`ungrounded_number`에 걸리거나 JSON이 두 번 깨지면(502) 같은 근거로 fallback 모델에 **한 번** 더 묻고 그 답을 씁니다. 검색 사유(`low_retrieval_score`, `no_retrieval_results`), `REVIEW_MODE=always`, 503(연결 실패·모델 없음)·504(시간 초과)는 모델을 바꿔도 나아지지 않으므로 상향하지 않습니다. 두 호출 모두 `llm_calls`에 같은 답변 id로 남고, `question.asked` 감사 로그에 `escalated`·`escalation_reasons`가 기록됩니다. 질문 API 응답 모양은 그대로입니다. 관리 탭 "LLM 상태" 카드와 `GET /llm/status`의 `fallback` 필드가 fallback 모델의 연결·존재 여부를 보여 줍니다.
+
+```bash
+LLM_PROVIDER=local
+LOCAL_LLM_MODEL=qwen3.5:9b
+LOCAL_LLM_FALLBACK_MODEL=qwen3:14b     # 비우면 상향 끔(기본)
+# LOCAL_LLM_FALLBACK_THINK=low         # 비우면 LOCAL_LLM_THINK와 같음
+```
+
+VRAM 16GB에서는 두 모델을 동시에 올리기 어려워 상향할 때 모델 교체 시간이 더 듭니다. 메모리가 충분하면 Ollama를 `OLLAMA_MAX_LOADED_MODELS=2`로 띄워 둘 다 올려 둘 수 있습니다.
+
+**숫자 근거 검증**: `NUMBER_GROUNDING_CHECK=review`(기본)이면 답변 문장의 숫자(금액·비율)가 그 문장이 인용한 청크 원문에 없을 때 `pending_review`(`ungrounded_number`)로 보냅니다. 쉼표는 무시하고, 1~2자리 정수(번호·개수)와 질문에 나온 숫자는 검사하지 않습니다. 단위 환산은 하지 않으므로 모델이 `1,234,567백만원`을 `약 1.2조 원`으로 바꿔 쓰면 일부러 걸립니다(계산은 모델이 아니라 코드가 해야 한다는 원칙). Claude와 로컬 답변 모두에 적용되고, `off`로 끌 수 있습니다.
+
+설계 이유와 대안은 [ADR 0008](docs/adr/0008-local-llm-ollama.md)과 [ADR 0009(로컬 상향·숫자 검증)](docs/adr/0009-local-cascade-and-number-grounding.md)을 보세요.
 
 ## 웹 화면으로 테스트하기
 
@@ -210,8 +226,11 @@ FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`�
 | `LOCAL_LLM_NUM_CTX` | `16384` | 컨텍스트 길이(`options.num_ctx`). 작으면 프롬프트 앞부분이 조용히 잘림 |
 | `LOCAL_LLM_MAX_TOKENS` | `2048` | 출력 토큰 상한(`options.num_predict`). 도달하면 `pending_review`(`truncated`) |
 | `LOCAL_LLM_TIMEOUT_SECONDS` | `180` | 요청 응답 대기 시간(초). 넘으면 504 |
-| `LOCAL_LLM_THINK` | `false` | Ollama `think`(추론 모델의 생각 단계). 켜면 느려짐 |
+| `LOCAL_LLM_THINK` | `false` | Ollama `think`(추론 모델의 생각 단계). `false`/`true` 또는 수준 `low`/`medium`/`high`(gpt-oss 계열). 값을 그대로 보냄. 켜면 느려짐 |
 | `LOCAL_LLM_TEMPERATURE` | `0` | `options.temperature` |
+| `LOCAL_LLM_FALLBACK_MODEL` | 빈 값(상향 끔) | 로컬 상향 대상 모델. `LLM_PROVIDER=local`일 때만 사용. 상향 사유에 걸린 답만 이 모델로 한 번 더 물음([ADR 0009](docs/adr/0009-local-cascade-and-number-grounding.md)) |
+| `LOCAL_LLM_FALLBACK_THINK` | 없음(`LOCAL_LLM_THINK`와 같음) | fallback 모델의 `think`. 값 형식은 `LOCAL_LLM_THINK`와 같음 |
+| `NUMBER_GROUNDING_CHECK` | `review` | `review`면 인용 청크에 없는 숫자가 든 답변을 검토 대기(`ungrounded_number`)로. `off`면 검사 안 함 |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `voyage-4` / `1024` | 차원은 마이그레이션 시점에 `vector(n)`으로 고정 |
 | `EMBED_BATCH_MAX_TOKENS` | `100000` | 요청 하나의 추정 토큰(문자 수) 상한. `EMBED_TPM_LIMIT`가 있으면 `min(이 값, EMBED_TPM_LIMIT)` |
 | `EMBED_RPM_LIMIT` | 없음(제한 없음) | 클라이언트 측 분당 요청 수 제한(60초 슬라이딩 윈도우, **워커 프로세스별**) |
@@ -359,9 +378,43 @@ docker compose run --rm --no-deps -v "${PWD}/evals:/app/evals" api python -m foo
 - **Metrics**: 검색 recall@k, 인용 정확도, 답하지 말아야 할 질문의 거절 비율, 평균 비용·지연시간, 그리고 answerable answered rate(답할 수 있는 질문 중 거절하지 않고 각주가 1개 이상인 비율), false abstentions(답할 수 있는데 거절한 문항 수와 id), 검색 성공 문항만으로 계산한 인용 정확도, 지연 p50/p95(nearest-rank). 보조 지표 citation accuracy (consolidated/separate counterpart accepted)는 기대 목차의 연결↔별도 대응 주석(예: `5. 재무제표 주석 > 12. 차입금` ↔ `3. 연결재무제표 주석 > 12. 차입금 (연결)`)을 인용한 각주도 맞음으로 셉니다(전체·검색 성공 문항). 엄격한 인용 정확도는 그대로입니다.
 - **Metrics by question type**: 같은 지표를 문항 유형(id 접두어 `samsung`/`naver`/`hyundai`/`compare`/`unans`, 데이터셋에 `category` 필드가 있으면 그 값)별로 나눈 표. 끝의 두 열이 대응 주석 인정 정확도입니다.
 - **False abstention diagnostics**: 답할 수 있는데 거절한 문항마다 답변 상태, `review_reason`(`no_citations` = 모델이 쓸 만한 근거를 내지 않음, `low_retrieval_score` = 신뢰도 규칙 등), 검색 상위 k개의 `section_path`·유사도.
-- **Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`와 `counterpart` 열(대응 주석이면 ✓). "정답이 검색됐는데 다른 근거를 골랐다", "같은 주석의 별도재무제표 판을 인용했다"(separate-statement counterpart cited), "정답이 검색되지 않았다"를 구분합니다. 본문 텍스트는 넣지 않습니다.
+- **Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`와 `counterpart` 열(대응 주석이면 ✓), `ungrounded numbers` 열(그 각주를 인용한 문장의 숫자 중 청크에 없는 것). "정답이 검색됐는데 다른 근거를 골랐다", "같은 주석의 별도재무제표 판을 인용했다"(separate-statement counterpart cited), "정답이 검색되지 않았다"를 구분합니다. 본문 텍스트는 넣지 않습니다.
+- **ungrounded number answers**(Metrics)와 **Ungrounded number diagnostics**: 인용 청크에 없는 숫자가 하나라도 든 답변 수와 그 숫자 목록([숫자 근거 검증](#로컬-llmollama로-실행하기)).
+- 한 문항에서 LLM 호출이 실패(`LLMError`)하면 실행을 멈추지 않고 그 문항을 `error` 상태(거절, 각주 0)로 기록합니다. 오류가 있으면 Metrics에 errors 행과 **Errors** 절이 붙습니다.
+- Eval 안에서는 질문 임베딩을 질문 텍스트 기준으로 메모해 문항당 Voyage 질문 임베딩 호출이 한 번입니다.
 
 CI에서는 돌리지 않습니다. 데이터셋 구성과 측정 결과는 위 [Eval 결과 (실측)](#eval-결과-실측)을 보세요.
+
+### 로컬 모델 비교
+
+API 비용 없이 같은 데이터셋(`evals/dataset.jsonl`, 25문항)을 여러 로컬 모델과 로컬 상향 구성에 돌려 정확도·지연을 한 리포트에서 비교합니다. `--live`가 필요하고, `LLM_PROVIDER` 값과 상관없이 Ollama 클라이언트만 만듭니다(Claude는 호출하지 않음). base_url·num_ctx·max_tokens·timeout·temperature는 `LOCAL_LLM_*` 설정을 씁니다.
+
+```bash
+# 필요한 모델을 먼저 받습니다(호스트)
+ollama pull qwen3.5:9b
+ollama pull gpt-oss:20b
+ollama pull qwen3:14b
+
+python -m footnote_rag.evals.run --live \
+  --local-models "qwen3.5:9b,gpt-oss:20b@low,qwen3:14b" \
+  --cascade "qwen3.5:9b>qwen3:14b"
+```
+
+- SPEC은 `모델이름[@think]`입니다. think는 `true`, `false`, `low`, `medium`, `high` 중 하나이고, 생략하면 `LOCAL_LLM_THINK`를 씁니다. `--cascade PRIMARY>FALLBACK`은 여러 번 줄 수 있고 양쪽에 `@think`를 붙일 수 있습니다.
+- **사전 점검**: 모든 모델의 연결·존재 여부를 먼저 확인합니다. 하나라도 없거나 Ollama에 연결되지 않으면 공시를 가져오기 전에 `ollama pull <모델>` 안내를 출력하고 종료 코드 2로 끝납니다.
+- 공시 가져오기와 질문 임베딩은 **한 번만** 하고 모든 구성이 같은 검색 결과·같은 문항 순서를 씁니다. 질문 임베딩은 Voyage, 답변은 로컬입니다.
+- 단일 모델 구성은 측정 전에 모델을 한 번 예열합니다(`/api/generate`). 상향 구성은 primary만 예열하고, 상향 때 모델을 교체하는 시간은 지연에 포함합니다.
+- 출력: 구성별 리포트(위와 같은 형식. 예: `…-live-local-gpt-oss-20b-think-low.md`, 상향 구성은 `…-live-local-qwen3.5-9b_to_qwen3-14b.md`)와 비교 리포트 `evals/reports/{timestamp}-live-compare-local.md`. 비교 리포트에는 구성 비교 표, 문항별 행렬(`cited ok/total` + `pub`/`rev`/`err`, 상향된 문항은 `↑`), 문항 유형별 인용 정확도 표가 있습니다.
+- 두 옵션을 주지 않으면 지금처럼 제공자 하나로 리포트 하나를 씁니다.
+
+구성 비교 표(직접 실행한 뒤 채웁니다):
+
+| config | recall@8 | citation acc. | citation acc. (hit) | answered (answerable) | false abst. | unans. abstained | ungrounded number answers | escalation rate | errors | p50 ms | p95 ms | cost USD |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5:9b | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 |
+| gpt-oss:20b@low | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 |
+| qwen3:14b | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 |
+| qwen3.5:9b > qwen3:14b | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 |
 
 ## MCP 서버 (Claude Code 연결)
 
