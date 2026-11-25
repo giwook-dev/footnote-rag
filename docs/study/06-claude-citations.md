@@ -44,7 +44,7 @@ RAG에서 검색한 조각을 `search_result` 블록으로 보내고 `citations:
         {
             "type": "search_result",
             "source": source_id(c.document_id, c.chunk_id),
-            "title": f"{c.document_title} · {c.section_path}",
+            "title": source_title(c),
             "content": [{"type": "text", "text": c.text}],
             "citations": {"enabled": True},
         }
@@ -55,7 +55,7 @@ RAG에서 검색한 조각을 `search_result` 블록으로 보내고 `citations:
 ```
 
 - `source`는 `doc:{document_id}#chunk:{chunk_id}` 형식이다(`src/footnote_rag/answering/prompt.py::source_id`). 응답 인용의 `source`로 어느 청크인지 다시 찾는 열쇠다.
-- `title`에 목차 경로를 넣어 모델이 어느 부분인지 알 수 있게 한다.
+- `title`에 목차 경로를 넣어 모델이 어느 부분인지 알 수 있게 한다. `src/footnote_rag/answering/prompt.py::source_title`은 `{문서 제목} · [연결] {section_path}`처럼 연결/별도 주석 표시를 붙인다. 시스템 프롬프트의 "질문이 별도를 지정하지 않으면 연결재무제표 주석을 인용" 규칙과 짝을 이룬다([ADR 0009](../adr/0009-prefer-consolidated-notes.md)). 로컬 모델 프롬프트의 근거 머리줄도 같은 제목을 쓴다.
 - 모든 블록에 citations를 같게 켠다. ADR에 따르면 한 요청의 `search_result` 블록은 citations 설정이 같아야 한다.
 
 출처: `src/footnote_rag/answering/llm.py::ClaudeClient.request_params`

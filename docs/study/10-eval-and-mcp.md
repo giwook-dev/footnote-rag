@@ -55,15 +55,18 @@
 | false abstentions | `src/footnote_rag/evals/run.py::EvalSummary.false_abstentions` | 답할 수 있는데 답하지 않은(거절했거나 각주 없음) 문항의 id 목록과 개수 |
 | 인용 정확도(검색 성공 문항) | `src/footnote_rag/evals/run.py::EvalSummary.citation_accuracy_retrieval_hit` | recall hit인 문항의 각주만으로 계산한 인용 정확도. 전체 인용 정확도와 차이가 크면 검색 실패가 원인, 둘 다 낮으면 모델의 근거 선택이 원인 |
 | 지연 p50/p95 | `src/footnote_rag/evals/run.py::EvalSummary.latency_p50_ms`, `src/footnote_rag/evals/run.py::percentile` | nearest-rank 백분위수(값의 p% 이상이 그 값 이하가 되는 가장 작은 값) |
+| 인용 정확도(대응 주석 인정) | `src/footnote_rag/evals/run.py::EvalSummary.citation_accuracy_counterpart`, `src/footnote_rag/evals/run.py::score_citations` | 기대 접두어와 일치하거나, 기대 목차의 연결↔별도 대응 주석(`src/footnote_rag/dart/sections.py::is_counterpart`)인 각주의 비율. 보조 지표이며 엄격한 인용 정확도는 그대로 둔다. 검색 성공 문항·유형별로도 낸다 |
 
 같은 지표를 문항 유형별(`src/footnote_rag/evals/run.py::item_category`: 데이터셋 `category` 필드, 없으면 id 접두어 `samsung`/`naver`/`hyundai`/`compare`/`unans`)로 나눈 표도 리포트에 들어간다. 기존 지표의 정의와 값은 바뀌지 않았다.
 
-**Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`를 보여 준다(`src/footnote_rag/evals/run.py::_render_diagnostics`). 기대 목차가 상위 k에 있었으면 "검색됐는데 다른 근거를 골랐다", 없으면 "검색 실패"로 구분된다. 본문 텍스트는 넣지 않는다.
+**Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`를 보여 준다(`src/footnote_rag/evals/run.py::_render_diagnostics`). 기대 목차가 상위 k에 있었으면 "검색됐는데 다른 근거를 골랐다", 없으면 "검색 실패"로 구분된다. 각주 표의 `counterpart` 열은 같은 주석의 별도재무제표 판을 인용한 경우를 표시하고, 진단 문구도 "separate-statement counterpart cited"로 따로 적는다. 본문 텍스트는 넣지 않는다.
+
+**False abstention diagnostics**: 답할 수 있는데 거절한 문항마다 답변 상태, `review_reason`(예: `no_citations`는 모델이 쓸 만한 근거 번호를 내지 않음, `low_retrieval_score`는 신뢰도 규칙), 검색 상위 k 표를 보여 준다(`src/footnote_rag/evals/run.py::_render_abstention_diagnostics`). 머리말에는 `prefer_consolidated`·`retrieval_candidates`가 적혀 설정별 리포트를 비교할 수 있다. 테스트: `tests/test_eval_report.py::test_counterpart_metric_accepts_the_nine_separate_note_citations`, `tests/test_eval_report.py::test_false_abstentions_get_review_reason_and_top_k`.
 
 기본은 Fake 모드(비용 없음)이며 리포트에 "Fake mode … not answer quality"라는 경고가 붙는다. `--live`는 설정된 실제 제공자를 쓰고 비용이 발생한다. 테스트: `tests/test_evals_cli_mcp.py::test_eval_runner_fake_mode_writes_markdown_report`.
 
 지표의 해석 주의:
-- 판정이 **목차 접두어 일치**라서, 다른 목차에도 같은 내용이 있으면 정답인데도 오답으로 셀 수 있다.
+- 판정이 **목차 접두어 일치**라서, 다른 목차에도 같은 내용이 있으면 정답인데도 오답으로 셀 수 있다. 연결↔별도 대응 주석은 보조 지표가 따로 세지만, 그 밖의 중복(예: `XI. 그 밖에 … > 우발부채 등에 관한 사항`)은 여전히 오답으로 센다.
 - 거절 판정이 넓다(`pending_review`면 거절로 셈). 답할 수 없는 질문에 모델이 답했어도 검토 대기로 갔다면 거절로 계산된다.
 - 답변 문장의 사실 정확성(숫자가 맞는지 등)은 재지 않는다. LLM 채점기도 없다.
 
