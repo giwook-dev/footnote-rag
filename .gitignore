@@ -19,3 +19,4 @@ build/
 
 # Eval scratch
 evals/reports/*.tmp
+evals/reports/*.log
