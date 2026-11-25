@@ -166,6 +166,16 @@ class Settings(BaseSettings):
     # (``ungrounded_number``); off = not checked (answering/number_check.py).
     number_grounding_check: Literal["off", "review"] = "review"
 
+    # --- note change analysis (docs/adr/0012-note-change-analysis.md) ---
+    # large_change: |delta| / |prior| >= this (also a sign flip or 0 -> non-zero).
+    note_diff_change_threshold: Decimal = Decimal("0.3")
+    # Non-equal lines kept per note (the rest is cut and the note is marked truncated).
+    note_diff_max_lines: int = 400
+    # Comma separated words; a note whose key contains one is a watchlist note.
+    note_diff_watchlist: str = (
+        "우발부채,약정,소송,특수관계자,담보,지급보증,보고기간후사건,계속기업,회계정책의변경"
+    )
+
     # --- chunking ---
     chunk_size: int = 1500
     chunk_overlap: int = 200
@@ -208,6 +218,10 @@ class Settings(BaseSettings):
         if self.embed_tpm_limit:
             return min(self.embed_batch_max_tokens, self.embed_tpm_limit)
         return self.embed_batch_max_tokens
+
+    @property
+    def note_diff_watchlist_words(self) -> tuple[str, ...]:
+        return tuple(w.strip() for w in self.note_diff_watchlist.split(",") if w.strip())
 
     @property
     def dart_dir(self) -> Path:

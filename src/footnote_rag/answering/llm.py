@@ -2,8 +2,10 @@
 
 역할: Claude Messages API 요청을 만들고, 오류를 502/503으로 바꾸고, 응답을 ``LLMResponse``(dict 블록)로 정규화한다.
 로컬 모델(Ollama) 구현은 ``answering/local_llm.py``의 ``OllamaClient``다.
-주요 요소: ``LLMClient``(Protocol), ``ClaudeClient``(``request_params``, ``answer``), ``FakeLLM``, ``LLMError``.
-호출 관계: ``providers.make_llm``이 만들고 ``answering.service.ask_question``이 ``answer``를 호출한다.
+주요 요소: ``LLMClient``(Protocol), ``ClaudeClient``(``request_params``, ``answer``), ``FakeLLM``
+(``answer``, ``chat_json``), ``LLMError``, ``JsonResult``.
+호출 관계: ``providers.make_llm``이 만들고 ``answering.service.ask_question``이 ``answer``를,
+``comparison.service.summarize_note``가 ``chat_json``(로컬·Fake만)을 호출한다.
 학습 문서: docs/study/06-claude-citations.md
 
 LLM clients behind a Protocol.
@@ -23,6 +25,7 @@ the Messages API wire shape, so footnote conversion is provider-agnostic and tes
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -74,8 +77,22 @@ class LLMResponse:
     abstained: bool = False
 
 
+@dataclass
+class JsonResult:
+    """A schema-constrained JSON reply (``chat_json``; local and fake clients only)."""
+
+    data: dict[str, Any]
+    usage: LLMUsage = field(default_factory=LLMUsage)
+    latency_ms: int = 0
+    done_reason: str | None = None
+    model_id: str = "unknown"
+
+
 class LLMClient(Protocol):
     async def answer(self, *, system: str, messages: list[dict[str, Any]]) -> LLMResponse: ...
+
+
+_PROMPT_REF_RE = re.compile(r"^\[([PC]\d+)\]\s*(.*)$", re.MULTILINE)
 
 
 class ClaudeClient:
@@ -224,3 +241,31 @@ class FakeLLM:
             )
             content.append({"type": "text", "text": " " if index == 0 else ""})
         return LLMResponse(self.model, self.stop_reason, content, usage, 5)
+
+    async def chat_json(
+        self,
+        *,
+        system: str,
+        user: str,
+        schema: dict[str, Any],
+        validate: Any = None,
+    ) -> JsonResult:
+        """Deterministic stand-in for ``OllamaClient.chat_json``.
+
+        For a ``{"bullets": [...]}`` schema it quotes up to three ``[P12] …``/``[C15] …`` lines of
+        the prompt as bullets (so every number comes from the prompt and every ref is valid);
+        any other schema gets ``{}``.
+        """
+        del validate
+        self.calls.append({"system": system, "user": user, "schema": schema})
+        usage = LLMUsage(input_tokens=max(1, (len(system) + len(user)) // 2), output_tokens=60)
+        data: dict[str, Any] = {}
+        if "bullets" in (schema.get("properties") or {}):
+            bullets = [
+                {"text": f"{text[:120].rstrip()} (변동 줄)", "refs": [ref]}
+                for ref, text in _PROMPT_REF_RE.findall(user)[:3]
+            ]
+            data = {"bullets": bullets}
+        return JsonResult(
+            data=data, usage=usage, latency_ms=5, done_reason="stop", model_id=self.model
+        )

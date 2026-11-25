@@ -223,6 +223,55 @@ button.fn.on { background: var(--accent-bg); }
 .hist button.on { border-color: var(--accent); }
 .hist .q { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 
+/* ---- note change analysis (변동 분석) ---- */
+.diff-controls { align-items: flex-end; }
+.diff-controls .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.diff-controls select { max-width: 360px; }
+.seg { display: flex; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; }
+.seg label { display: flex; gap: 4px; align-items: center; padding: 6px 10px; color: var(--fg); cursor: pointer; }
+.seg label:has(input:checked) { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
+.diff-recent { margin-top: 10px; }
+.recent-list { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; }
+.diff-stats { margin: 0 0 var(--gap-lg); }
+.diff-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 12px; align-items: start; }
+@media (max-width: 900px) { .diff-split { grid-template-columns: minmax(0, 1fr); } }
+.diff-filter { display: flex; gap: 6px; align-items: center; margin: 0 0 6px; }
+.note-list { list-style: none; margin: 0; padding: 0; }
+.note-list li { margin-bottom: 6px; }
+.note-item {
+  width: 100%; text-align: left; display: flex; flex-direction: column; gap: 4px;
+  background: var(--surface); padding: 9px 10px;
+}
+.note-item .t { font-weight: 600; overflow-wrap: anywhere; }
+.note-item.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.note-item .row { gap: 4px; }
+.diff-detail { margin: 0; }
+.diff-detail h3.diff-title { color: var(--fg); font-size: 15px; margin-bottom: 4px; }
+.diff-detail h4 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); }
+.diff-detail .path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.diff-detail .path a { font-size: 12px; }
+.num-table th.n, .num-table td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.num-table tr.mis td { background: var(--wait-bg); }
+.difflines {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden;
+}
+.difflines > div, .difflines details > div { padding: 3px 8px; white-space: pre-wrap; overflow-wrap: anywhere; scroll-margin: 80px; }
+.difflines .del { background: var(--fail-bg); }
+.difflines .add { background: var(--ok-bg); }
+.difflines .hl { outline: 2px solid var(--accent); outline-offset: -2px; }
+.difflines .fold, .difflines summary { color: var(--muted); background: var(--bg); padding: 3px 8px; }
+.difflines summary { cursor: pointer; }
+.difflines .ln { color: var(--muted); display: inline-block; min-width: 44px; }
+.sum { border: 1px dashed var(--line); border-radius: var(--radius-sm); padding: 10px; }
+.sum ul { margin: 8px 0 6px 18px; padding: 0; }
+.sum li { margin-bottom: 4px; }
+.sum .notice { margin-top: 8px; }
+button.ref {
+  border: 0; background: none; padding: 0 2px; color: var(--accent); font-size: 12px; font-weight: 600;
+}
+.sum-notice { margin-top: 8px; }
+
 /* ---- reviews ---- */
 .review-actions { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
 

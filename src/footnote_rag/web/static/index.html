@@ -37,6 +37,7 @@
   <nav class="tabs" role="tablist" aria-label="화면 탭">
     <button type="button" role="tab" id="tab-documents" data-tab="documents" aria-controls="panel-documents" aria-selected="true">문서</button>
     <button type="button" role="tab" id="tab-questions" data-tab="questions" aria-controls="panel-questions" aria-selected="false">질문</button>
+    <button type="button" role="tab" id="tab-diff" data-tab="diff" aria-controls="panel-diff" aria-selected="false">변동 분석</button>
     <button type="button" role="tab" id="tab-reviews" data-tab="reviews" aria-controls="panel-reviews" aria-selected="false" hidden>검토 <span id="review-count" class="badge b-wait" hidden></span></button>
     <button type="button" role="tab" id="tab-admin" data-tab="admin" aria-controls="panel-admin" aria-selected="false" hidden>관리</button>
   </nav>
@@ -154,7 +155,54 @@
       </aside>
     </section>
 
-    <!-- 탭 3. 검토 -->
+    <!-- 탭 3. 변동 분석 (전기 대비 주석 변동) -->
+    <section id="panel-diff" class="panel" role="tabpanel" aria-labelledby="tab-diff" hidden>
+      <div class="card">
+        <div class="card-head">
+          <h2>전기 대비 주석 변동 분석</h2>
+          <span class="note">같은 회사의 전년·당년 사업보고서 주석을 코드가 짝짓고 비교합니다(모델 호출 없음)</span>
+        </div>
+        <form id="diff-form" class="row diff-controls">
+          <div class="field">
+            <label for="diff-current">당년 보고서</label>
+            <select id="diff-current" required></select>
+          </div>
+          <div class="field">
+            <label for="diff-prior">전년 보고서 (같은 회사, 자동 선택)</label>
+            <select id="diff-prior" required></select>
+          </div>
+          <fieldset class="seg">
+            <legend class="sr-only">범위</legend>
+            <label><input type="radio" name="diff-scope" value="consolidated" checked> 연결</label>
+            <label><input type="radio" name="diff-scope" value="separate"> 별도</label>
+          </fieldset>
+          <button id="diff-btn" type="submit" class="primary">비교</button>
+          <span id="diff-spinner" class="spinner" hidden aria-label="비교 중"></span>
+        </form>
+        <p id="diff-prior-empty" class="notice" hidden>전년 보고서를 먼저 가져오세요. 문서 탭에서 같은 회사의 전년 사업보고서를 검색해 가져오면 여기에서 고를 수 있습니다.</p>
+        <p id="diff-docs-empty" class="note" hidden>준비된(ready) DART 사업보고서가 없습니다. 문서 탭에서 사업보고서를 가져오세요.</p>
+        <div class="row diff-recent">
+          <span class="note">최근 비교</span>
+          <ul id="diff-recent" class="recent-list"></ul>
+          <span id="diff-recent-empty" class="note">아직 없습니다.</span>
+        </div>
+      </div>
+
+      <div id="diff-result" hidden>
+        <dl id="diff-stats" class="stats diff-stats" aria-label="변동 요약"></dl>
+        <p id="diff-warnings" class="notice" hidden></p>
+        <div class="diff-split">
+          <div class="diff-list-col">
+            <label class="note diff-filter"><input id="diff-changed-only" type="checkbox" checked> 변경된 주석만 · 관심도 순</label>
+            <ul id="diff-notes" class="note-list" aria-label="주석 목록"></ul>
+            <p id="diff-notes-empty" class="note" hidden>표시할 주석이 없습니다.</p>
+          </div>
+          <article id="diff-detail" class="card diff-detail" aria-label="주석 변동 상세"></article>
+        </div>
+      </div>
+    </section>
+
+    <!-- 탭 4. 검토 -->
     <section id="panel-reviews" class="panel" role="tabpanel" aria-labelledby="tab-reviews" hidden>
       <div class="card-head">
         <h2>검토 대기 답변</h2>
@@ -164,7 +212,7 @@
       <p id="reviews-empty" class="note" hidden>검토 대기 중인 답변이 없습니다.</p>
     </section>
 
-    <!-- 탭 4. 관리 -->
+    <!-- 탭 5. 관리 -->
     <section id="panel-admin" class="panel" role="tabpanel" aria-labelledby="tab-admin" hidden>
       <div class="card">
         <div class="card-head">
@@ -208,6 +256,8 @@
             <option value="question.asked"></option>
             <option value="answer.created"></option>
             <option value="review.decided"></option>
+            <option value="comparison.created"></option>
+            <option value="comparison.summarized"></option>
           </datalist>
           <button type="submit" class="small">조회</button>
         </form>

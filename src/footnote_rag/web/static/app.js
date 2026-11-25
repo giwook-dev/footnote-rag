@@ -25,6 +25,9 @@
     active: null,
     fnSeq: 0,
     dartReports: [],
+    comparison: null,
+    diffNote: null,
+    diffSummaries: {},
   };
 
   const $ = (id) => document.getElementById(id);
@@ -237,9 +240,17 @@
     state.history = [];
     state.active = null;
     state.dartReports = [];
-    for (const id of ["answer-area", "history", "reviews-list", "usage-stats", "question-docs", "llm-status"]) {
+    state.comparison = null;
+    state.diffNote = null;
+    state.diffSummaries = {};
+    for (const id of [
+      "answer-area", "history", "reviews-list", "usage-stats", "question-docs", "llm-status",
+      "diff-current", "diff-prior", "diff-recent", "diff-stats", "diff-notes", "diff-detail",
+    ]) {
       $(id).replaceChildren();
     }
+    $("diff-result").hidden = true;
+    $("diff-prior-empty").hidden = true;
     $("llm-status-detail").hidden = true;
     for (const id of ["dart-results", "docs-table", "audit-table"]) {
       $(id).querySelector("tbody").replaceChildren();
@@ -323,6 +334,7 @@
   const LOADERS = {
     documents: () => loadDocuments(),
     questions: () => loadQuestionDocs(),
+    diff: () => loadDiffTab(),
     reviews: () => loadReviews(),
     admin: () => loadAdmin(),
   };
@@ -817,6 +829,459 @@
     }
   }
 
+  // ---------- note change analysis tab (변동 분석) ----------
+  // 비교(주석 짝짓기·줄 비교·숫자 변동)는 서버 코드가 하고, 요약은 버튼을 눌렀을 때만 로컬 모델이 한다.
+
+  const NOTE_STATUS_LABELS = { changed: "변경", added: "신규", removed: "삭제", unchanged: "변동 없음" };
+  const NOTE_STATUS_CLASS = { changed: "b-acc", added: "b-ok", removed: "b-fail", unchanged: "b-muted" };
+  const CHANGE_KIND_LABELS = { row_added: "행 추가", row_removed: "행 삭제" };
+  const MAX_NUMBER_ROWS_SHOWN = 200;
+  const SUMMARY_NOTICE = "모델 요약 — 변동 판단은 담당자가 확정";
+  const SUMMARY_ERROR_STATUSES = [501, 502, 503, 504];
+
+  const isComparable = (d) => d.status === "ready" && d.source === "dart" && d.meta;
+
+  function reportLabel(d) {
+    const meta = d.meta || {};
+    const parts = [meta.corp_name, meta.report_nm || d.title, meta.rcept_no || d.source_ref];
+    return parts.filter(Boolean).join(" · ");
+  }
+
+  // 같은 corp_code이고 접수일(rcept_dt)이 더 이른 문서만, 가장 최근 것부터.
+  function priorCandidates(current, docs) {
+    const meta = (current && current.meta) || {};
+    if (!meta.corp_code || !meta.rcept_dt) return [];
+    return docs
+      .filter(
+        (d) =>
+          d.id !== current.id &&
+          d.meta.corp_code === meta.corp_code &&
+          String(d.meta.rcept_dt || "") < String(meta.rcept_dt),
+      )
+      .sort((a, b) => String(b.meta.rcept_dt || "").localeCompare(String(a.meta.rcept_dt || "")));
+  }
+
+  function fillSelect(select, docs, selectedId) {
+    select.replaceChildren(
+      ...docs.map((d) => {
+        const option = el("option", { text: reportLabel(d), attrs: { value: d.id } });
+        if (d.id === selectedId) option.selected = true;
+        return option;
+      }),
+    );
+  }
+
+  function updatePriorOptions() {
+    const docs = state.docs.filter(isComparable);
+    const current = docs.find((d) => d.id === $("diff-current").value);
+    const candidates = priorCandidates(current, docs);
+    // 가장 최근 전년 보고서를 자동으로 고른다.
+    fillSelect($("diff-prior"), candidates, candidates.length > 0 ? candidates[0].id : null);
+    $("diff-prior-empty").hidden = !current || candidates.length > 0;
+    $("diff-btn").disabled = candidates.length === 0;
+  }
+
+  async function loadDiffTab() {
+    await fetchDocuments();
+    const docs = state.docs
+      .filter(isComparable)
+      .sort((a, b) => String(b.meta.rcept_dt || "").localeCompare(String(a.meta.rcept_dt || "")));
+    const previous = $("diff-current").value;
+    // 당년 보고서 후보: 전년 보고서가 있는 문서를 먼저 고른다.
+    const withPrior = docs.find((d) => priorCandidates(d, docs).length > 0);
+    const keep = docs.some((d) => d.id === previous) ? previous : null;
+    fillSelect($("diff-current"), docs, keep || (withPrior ? withPrior.id : docs[0] && docs[0].id));
+    $("diff-docs-empty").hidden = docs.length > 0;
+    updatePriorOptions();
+    await loadRecentComparisons();
+  }
+
+  async function loadRecentComparisons() {
+    const { data } = await api("/comparisons");
+    const items = Array.isArray(data) ? data : [];
+    $("diff-recent").replaceChildren(
+      ...items.slice(0, 8).map((c) => {
+        const scope = c.scope === "separate" ? "별도" : "연결";
+        const button = el("button", {
+          className: "small",
+          text: `${c.corp_name || "회사"} ${c.prior_rcept_no}→${c.current_rcept_no} (${scope})`,
+          attrs: { type: "button", title: fmtDateTime(c.created_at) },
+        });
+        button.addEventListener("click", guard(() => openComparison(c.id)));
+        return el("li", {}, [button]);
+      }),
+    );
+    $("diff-recent-empty").hidden = items.length > 0;
+  }
+
+  function selectedScope() {
+    const checked = document.querySelector('input[name="diff-scope"]:checked');
+    return checked ? checked.value : "consolidated";
+  }
+
+  async function runComparison(ev) {
+    ev.preventDefault();
+    const prior = $("diff-prior").value;
+    const current = $("diff-current").value;
+    if (!prior || !current) {
+      showAlert("전년 보고서를 먼저 가져오세요.");
+      return;
+    }
+    setBusy($("diff-btn"), $("diff-spinner"), true);
+    try {
+      const { data } = await api("/comparisons", {
+        method: "POST",
+        json: { prior_document_id: prior, current_document_id: current, scope: selectedScope() },
+      });
+      showComparison(data);
+      await loadRecentComparisons();
+    } finally {
+      setBusy($("diff-btn"), $("diff-spinner"), false);
+    }
+  }
+
+  async function openComparison(id) {
+    const { data } = await api(`/comparisons/${encodeURIComponent(id)}`);
+    showComparison(data);
+  }
+
+  function showComparison(data) {
+    state.comparison = data;
+    state.diffSummaries = data.summaries || {};
+    const notes = data.result.notes || [];
+    const first = visibleNotes()[0] || notes[0];
+    state.diffNote = first ? first.index : null;
+    renderDiffStats();
+    renderNoteList();
+    renderNoteDetail();
+    $("diff-result").hidden = false;
+  }
+
+  function visibleNotes() {
+    const notes = (state.comparison && state.comparison.result.notes) || [];
+    return $("diff-changed-only").checked ? notes.filter((n) => n.status !== "unchanged") : notes;
+  }
+
+  function renderDiffStats() {
+    const r = state.comparison.result;
+    const s = r.summary;
+    const counts = s.status_counts || {};
+    const threshold = Math.round(Number(r.settings && r.settings.change_threshold) * 100);
+    const stats = [
+      ["당년 주석", s.current_notes],
+      ["변경", counts.changed],
+      ["신규", counts.added],
+      ["삭제", counts.removed],
+      ["전기 수치 불일치", s.prior_mismatch],
+      [`큰 변동(±${Number.isFinite(threshold) ? threshold : 30}%↑)`, s.large_change],
+      ["비교 보류 행(중복)", s.ambiguous_rows],
+    ];
+    $("diff-stats").replaceChildren(
+      ...stats.map(([label, value]) =>
+        el("div", {}, [el("dt", { text: label }), el("dd", { text: fmtInt(value) })]),
+      ),
+    );
+    const warnings = $("diff-warnings");
+    warnings.textContent = (r.warnings || []).join(" ");
+    warnings.hidden = !r.warnings || r.warnings.length === 0;
+  }
+
+  function noteBadges(n) {
+    const badges = [
+      el("span", { className: `badge ${NOTE_STATUS_CLASS[n.status] || "b-muted"}`, text: NOTE_STATUS_LABELS[n.status] || n.status }),
+    ];
+    if (n.watchlist) badges.push(el("span", { className: "badge b-wait", text: "관심 주석" }));
+    if (n.counts.large_change > 0) {
+      badges.push(el("span", { className: "badge b-fail", text: `큰 변동 ${n.counts.large_change}` }));
+    }
+    if (n.counts.prior_mismatch > 0) {
+      badges.push(el("span", { className: "badge b-wait", text: `전기 불일치 ${n.counts.prior_mismatch}` }));
+    }
+    return badges;
+  }
+
+  function noteListNote(n) {
+    const ls = n.line_stats;
+    if (n.status === "added") return "전년 보고서에 없는 주석";
+    if (n.status === "removed") return "당년 보고서에 없는 주석";
+    const parts = [];
+    if (ls.text_added || ls.text_removed) parts.push(`문장 +${ls.text_added} / −${ls.text_removed}`);
+    if (ls.numbers_only) parts.push(`숫자만 변경 ${ls.numbers_only}줄`);
+    return parts.join(" · ") || "변동 없음";
+  }
+
+  function renderNoteList() {
+    const notes = visibleNotes();
+    $("diff-notes").replaceChildren(
+      ...notes.map((n) => {
+        const on = n.index === state.diffNote;
+        const button = el(
+          "button",
+          { className: `note-item${on ? " sel" : ""}`, attrs: { type: "button" } },
+          [
+            el("span", { className: "t", text: n.title }),
+            el("span", { className: "row" }, noteBadges(n)),
+            el("span", { className: "note", text: noteListNote(n) }),
+          ],
+        );
+        if (on) button.setAttribute("aria-current", "true");
+        button.addEventListener("click", () => {
+          state.diffNote = n.index;
+          renderNoteList();
+          renderNoteDetail();
+        });
+        return el("li", {}, [button]);
+      }),
+    );
+    $("diff-notes-empty").hidden = notes.length > 0;
+  }
+
+  function currentNote() {
+    const notes = (state.comparison && state.comparison.result.notes) || [];
+    return notes.find((n) => n.index === state.diffNote) || null;
+  }
+
+  function sideInfo(label, info, path) {
+    return el("div", { className: "path" }, [
+      `${label}: ${path || "(해당 주석 없음)"} · `,
+      dartLink(info && info.dart_url),
+    ]);
+  }
+
+  function flagBadge(flag) {
+    if (flag === "large_change") return el("span", { className: "badge b-fail", text: "큰 변동" });
+    if (flag === "prior_mismatch") return el("span", { className: "badge b-wait", text: "전기 수치 불일치" });
+    return el("span", { className: "badge b-muted", text: flag });
+  }
+
+  function numberRows(changes) {
+    const rows = [];
+    for (const c of changes) {
+      const many = c.current_values.length > 1 || c.prior_values.length > 1;
+      if (c.cells.length > 0) {
+        for (const cell of c.cells) {
+          rows.push({
+            table: c.table,
+            label: many ? `${c.label || "—"} (${cell.position}열)` : c.label || "—",
+            prior: cell.prior,
+            current: cell.current,
+            delta: cell.delta,
+            pct: cell.change_pct === null ? "—" : `${cell.change_pct}%`,
+            flags: cell.flags.map(flagBadge),
+          });
+        }
+      } else {
+        const kind = CHANGE_KIND_LABELS[c.kind];
+        rows.push({
+          table: c.table,
+          label: c.label || "—",
+          prior: c.prior_values.join(", ") || "—",
+          current: c.current_values.join(", ") || "—",
+          delta: c.kind === "row_added" ? "신규" : "—",
+          pct: "—",
+          flags: kind
+            ? [el("span", { className: `badge ${c.kind === "row_added" ? "b-ok" : "b-fail"}`, text: kind })]
+            : [el("span", { className: "badge b-muted", text: "값 개수 다름" })],
+        });
+      }
+    }
+    return rows;
+  }
+
+  function numberTable(rows, headers, className) {
+    const shown = rows.slice(0, MAX_NUMBER_ROWS_SHOWN);
+    const table = el("table", { className: `num-table ${className || ""}` }, [
+      el("thead", {}, [el("tr", {}, headers.map((h, i) => el("th", { className: i >= 2 && i <= 5 ? "n" : "", text: h, attrs: { scope: "col" } })))]),
+      el(
+        "tbody",
+        {},
+        shown.map((r) =>
+          el("tr", { className: className === "mismatch" ? "mis" : "" }, [
+            el("td", { text: r.table || "—" }),
+            el("td", { text: r.label }),
+            el("td", { className: "n", text: r.prior }),
+            el("td", { className: "n", text: r.current }),
+            el("td", { className: "n", text: r.delta }),
+            el("td", { className: "n", text: r.pct }),
+            el("td", {}, r.flags),
+          ]),
+        ),
+      ),
+    ]);
+    const wrap = el("div", { className: "table-wrap" }, [table]);
+    if (rows.length > shown.length) {
+      wrap.append(el("p", { className: "note", text: `외 ${fmtInt(rows.length - shown.length)}행은 생략했습니다.` }));
+    }
+    return wrap;
+  }
+
+  function lineNode(e) {
+    const sign = e.op === "delete" ? "−" : "+";
+    return el("div", { className: e.op === "delete" ? "del" : "add", attrs: { id: `diff-line-${e.ref}`, tabindex: "-1" } }, [
+      el("span", { className: "ln", text: e.ref }),
+      `${sign} ${e.text}`,
+    ]);
+  }
+
+  function lineDiffNode(n) {
+    const text = n.lines.filter((e) => !e.numbers_only);
+    const numbersOnly = n.lines.filter((e) => e.numbers_only);
+    const box = el("div", { className: "difflines", attrs: { "aria-label": "줄 비교" } });
+    if (n.line_stats.equal > 0) {
+      box.append(el("div", { className: "fold", text: `… 동일한 ${fmtInt(n.line_stats.equal)}줄 생략 …` }));
+    }
+    for (const e of text) box.append(lineNode(e));
+    if (numbersOnly.length > 0) {
+      const details = el("details", { className: "fold-numbers" }, [
+        el("summary", { text: `▸ 숫자만 바뀐 줄 ${fmtInt(n.line_stats.numbers_only)}쌍 (펼치기)` }),
+        ...numbersOnly.map(lineNode),
+      ]);
+      box.append(details);
+    }
+    if (n.lines.length === 0) box.append(el("div", { className: "fold", text: "바뀐 줄이 없습니다." }));
+    if (n.truncated) {
+      box.append(el("div", { className: "fold", text: "줄이 많아 앞부분만 저장했습니다(NOTE_DIFF_MAX_LINES)." }));
+    }
+    return box;
+  }
+
+  function scrollToLine(ref) {
+    const node = $(`diff-line-${ref}`);
+    if (!node) {
+      showAlert(`근거 줄 ${ref}은 화면에 표시된 줄 목록에 없습니다.`, "info");
+      return;
+    }
+    const details = node.closest("details");
+    if (details) details.open = true;
+    for (const other of document.querySelectorAll(".difflines .hl")) other.classList.remove("hl");
+    node.classList.add("hl");
+    const smooth = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    node.scrollIntoView({ block: "center", behavior: smooth ? "smooth" : "auto" });
+    node.focus({ preventScroll: true });
+  }
+
+  function summaryNode(n) {
+    const box = el("div", { className: "sum", attrs: { "aria-live": "polite" } });
+    const summary = state.diffSummaries[String(n.index)];
+    const button = el("button", {
+      className: "small primary",
+      text: summary ? "요약 다시 생성 (로컬 LLM)" : "요약 생성 (로컬 LLM)",
+      attrs: { type: "button" },
+    });
+    const spinner = el("span", { className: "spinner", attrs: { "aria-label": "요약 생성 중" } });
+    spinner.hidden = true;
+    const head = el("div", { className: "row" }, [button, spinner]);
+    box.append(head);
+    if (n.status === "unchanged") {
+      button.disabled = true;
+      box.append(el("p", { className: "note", text: "변동이 없는 주석은 요약하지 않습니다." }));
+    }
+    const errorBox = el("p", { className: "notice", attrs: { role: "status" } });
+    errorBox.hidden = true;
+    box.append(errorBox);
+    if (summary) {
+      const meta = [summary.model];
+      if (summary.latency_ms !== null && summary.latency_ms !== undefined) {
+        meta.push(`${(summary.latency_ms / 1000).toFixed(1)}초`);
+      }
+      if (summary.cost_usd !== null && summary.cost_usd !== undefined) meta.push(`비용 $${summary.cost_usd}`);
+      head.append(el("span", { className: "note", text: meta.join(" · ") }));
+      if (summary.status === "ok") {
+        head.append(el("span", { className: "badge b-ok", text: "● 숫자 원문 확인됨" }));
+      } else {
+        const numbers = summary.ungrounded_numbers.length > 0 ? summary.ungrounded_numbers.join(", ") : "없음";
+        head.append(
+          el("span", {
+            className: "badge b-wait",
+            text: `확인 필요: 원문에 없는 숫자 ${numbers}`,
+          }),
+        );
+      }
+      const list = el("ul", {}, summary.bullets.map((b) => {
+        const refs = b.refs.map((ref) => {
+          const link = el("button", { className: "ref", text: `[${ref}]`, attrs: { type: "button", "aria-label": `근거 줄 ${ref}로 이동` } });
+          link.addEventListener("click", () => scrollToLine(ref));
+          return link;
+        });
+        const warn = [];
+        if (!b.grounded) {
+          const why = b.ungrounded_numbers.length > 0 ? `원문에 없는 숫자 ${b.ungrounded_numbers.join(", ")}` : "유효한 근거 줄 없음";
+          warn.push(el("span", { className: "badge b-wait", text: `확인 필요: ${why}` }));
+        }
+        return el("li", {}, [`${b.text} `, ...refs, ...warn]);
+      }));
+      box.append(list);
+      if (summary.bullets.length === 0) box.append(el("p", { className: "note", text: "모델이 요약 항목을 만들지 않았습니다." }));
+    }
+    box.append(el("p", { className: "note sum-notice", text: SUMMARY_NOTICE }));
+    button.addEventListener("click", guard(() => requestSummary(n, button, spinner, errorBox)));
+    return box;
+  }
+
+  async function requestSummary(n, button, spinner, errorBox) {
+    const id = state.comparison.id;
+    setBusy(button, spinner, true);
+    errorBox.hidden = true;
+    try {
+      const { status, data } = await api(
+        `/comparisons/${encodeURIComponent(id)}/notes/${n.index}/summary`,
+        { method: "POST", allow: SUMMARY_ERROR_STATUSES },
+      );
+      if (SUMMARY_ERROR_STATUSES.includes(status)) {
+        // 501(Claude 미지원)·503(Ollama 연결 실패)·504(시간 초과) 메시지를 그대로 보여 준다.
+        errorBox.textContent = `요약 실패 (${status}): ${formatDetail(data, status)}`;
+        errorBox.hidden = false;
+        return;
+      }
+      state.diffSummaries[String(n.index)] = data;
+      if (state.comparison.id === id && state.diffNote === n.index) renderNoteDetail();
+    } finally {
+      setBusy(button, spinner, false);
+    }
+  }
+
+  function renderNoteDetail() {
+    const box = $("diff-detail");
+    const n = currentNote();
+    if (!n) {
+      box.replaceChildren(el("p", { className: "note", text: "왼쪽에서 주석을 고르세요." }));
+      return;
+    }
+    const r = state.comparison.result;
+    const matched = n.matched_by === "key" ? "짝짓기: key 일치" : n.matched_by === "similar_title" ? "짝짓기: 유사 제목" : "짝 없음";
+    const head = el("h3", { className: "diff-title" }, [n.title, ...(n.watchlist ? [" ", el("span", { className: "badge b-wait", text: "관심 주석" })] : [])]);
+    const mismatches = n.number_changes.filter((c) => c.kind === "prior_mismatch");
+    const others = n.number_changes.filter((c) => c.kind !== "prior_mismatch");
+    const children = [
+      head,
+      sideInfo("당년", r.current, n.current_section_path),
+      sideInfo("전년", r.prior, n.prior_section_path),
+      el("p", { className: "note", text: `${matched} · 상태: ${NOTE_STATUS_LABELS[n.status] || n.status}${n.ambiguous_rows ? ` · 비교 보류 행 ${n.ambiguous_rows}` : ""}` }),
+      el("h4", { text: "숫자 변동 (코드 계산)" }),
+    ];
+    if (others.length > 0) {
+      children.push(numberTable(numberRows(others), ["표", "행", "전년", "당년", "증감", "증감률", "플래그"]));
+    } else {
+      children.push(el("p", { className: "note", text: "전년 대비 숫자 변동이 없습니다." }));
+    }
+    if (mismatches.length > 0) {
+      children.push(
+        el("h4", { text: "전기 수치 불일치 — 당년 보고서의 전기 값 vs 전년 보고서의 당기 값" }),
+        numberTable(
+          numberRows(mismatches),
+          ["표", "행", "전년 보고서 당기", "당년 보고서 전기", "차이", "차이율", "플래그"],
+          "mismatch",
+        ),
+        el("p", {
+          className: "note",
+          text: "전기 수치 불일치 = 당년 보고서의 ‘전기’ 값이 전년 보고서의 ‘당기’ 값과 다름. 재작성·재분류 후보이며 판단은 담당자가 합니다.",
+        }),
+      );
+    }
+    children.push(el("h4", { text: "줄 비교" }), lineDiffNode(n), el("h4", { text: "요약" }), summaryNode(n));
+    box.replaceChildren(...children);
+  }
+
   // ---------- reviews tab ----------
 
   function setReviewCount(count) {
@@ -1055,6 +1520,13 @@
         $("question-text").focus();
       });
     }
+
+    $("diff-form").addEventListener("submit", guard(runComparison));
+    $("diff-current").addEventListener("change", updatePriorOptions);
+    $("diff-changed-only").addEventListener("change", () => {
+      if (!state.comparison) return;
+      renderNoteList();
+    });
 
     $("reviews-refresh").addEventListener("click", guard(loadReviews));
 

@@ -607,7 +607,7 @@ async def test_upgrade_from_0002_adds_dropped_source_refs_with_default_zero(
     assert (await _ask(client, org)).status_code == 200  # an existing llm_calls row
     await asyncio.to_thread(_alembic, "downgrade", "0002_embedding_cache")
     await asyncio.to_thread(_alembic, "upgrade", "head")
-    assert "0003_llm_calls_dropped_refs (head)" in await asyncio.to_thread(_alembic, "current")
+    assert "(head)" in await asyncio.to_thread(_alembic, "current")  # 0003 and later applied
     async with sessionmaker() as s:
         values = (
             await s.scalars(
