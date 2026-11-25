@@ -2,12 +2,13 @@
 
 역할: 질문 하나를 끝까지 처리하고 questions·answers·llm_calls·감사 로그 두 건을 한 트랜잭션으로 커밋한다.
 ``fallback_llm``이 있으면 모델을 바꾸면 나아질 수 있는 사유에 걸린 답만 fallback으로 한 번 더 묻는다(로컬 상향).
-주요 요소: ``ask_question``, ``retrieve``/``retrieve_ranked``(연결 주석 우선 재정렬 포함), ``review_reasons``(신뢰도 규칙),
-``to_source_refs``, ``ESCALATION_REASONS``.
+주요 요소: ``ask_question``, ``retrieve``/``retrieve_ranked``(연결 주석 우선 재정렬, 여러 문서 균형 검색 포함),
+``interleave_by_rank``, ``review_reasons``(신뢰도 규칙), ``to_source_refs``, ``ESCALATION_REASONS``,
+``escalation_triggers``.
 호출 관계: ``answering.router``와 ``evals.run``이 호출하고, ``retrieval.search``, ``answering.llm``,
 ``answering.footnotes``, ``answering.number_check``, ``usage.pricing``, ``audit.service``를 호출한다.
 학습 문서: docs/study/02-request-walkthrough.md, docs/study/06-claude-citations.md,
-docs/adr/0009-local-cascade-and-number-grounding.md
+docs/adr/0010-local-cascade-and-number-grounding.md, docs/adr/0011-balanced-multi-document-retrieval.md
 
 Question answering: retrieve -> Claude with search_result citations -> footnotes -> review gate.
 
@@ -15,7 +16,8 @@ Review gate (``REVIEW_MODE=on_low_confidence``): an answer goes to ``pending_rev
   * the model refused (``refusal``),
   * retrieval returned nothing (``no_retrieval_results``; Claude is NOT called),
   * the best similarity is below ``MIN_RETRIEVAL_SCORE`` (``low_retrieval_score``; measured over
-    the candidates before the consolidated-first reordering, docs/adr/0009), or
+    the candidates before the consolidated-first reordering, docs/adr/0009-prefer-consolidated-notes.md;
+    with balanced multi-document retrieval, over every document's candidates), or
   * the answer carries no footnotes (``no_citations``), or
   * the client flagged it (``LLMResponse.review_flags``, e.g. ``truncated`` for a local model), or
   * a cited sentence has a number its cited chunks do not contain (``ungrounded_number``,
@@ -25,7 +27,13 @@ Otherwise it is ``published``. ``REVIEW_MODE=always`` sends every answer to revi
 Cascade (``fallback_llm``): when the primary answer has a reason in ``ESCALATION_REASONS`` or the
 primary raised ``LLMError(502)`` (unusable output), the same messages go once to ``fallback_llm``
 and its answer is checked again and kept. Retrieval reasons, ``review_mode_always``, 503 and 504
-never escalate. Every successful call gets its own ``llm_calls`` row on the same answer.
+never escalate. ``no_citations`` of an answer the model explicitly abstained on
+(``LLMResponse.abstained``, local ``insufficient: true``) does not escalate either; it still goes
+to review. Every successful call gets its own ``llm_calls`` row on the same answer.
+
+Balanced multi-document retrieval (``BALANCE_MULTI_DOCUMENT_RETRIEVAL``, 2+ ``document_ids``): each
+document is searched (and consolidated-first reordered) on its own, then ``interleave_by_rank``
+fills ``top_k`` rank by rank across the documents, and the result is sorted by score.
 """
 
 from __future__ import annotations
@@ -62,6 +70,21 @@ ESCALATION_REASONS = frozenset({"refusal", "truncated", "no_citations", "ungroun
 # LLMError codes that escalate: 502 = the output was unusable (e.g. invalid JSON). 503 (server
 # unreachable, model missing) and 504 (timeout) would not get better with another model.
 ESCALATION_STATUS_CODES = frozenset({502})
+
+
+def escalation_triggers(response: LLMResponse, reasons: Sequence[str]) -> list[str]:
+    """Reasons of ``reasons`` that escalate ``response`` to the fallback model.
+
+    An explicit abstention (``response.abstained``: the model said there is no evidence) is the
+    right answer to an unanswerable question; another model would only add latency. So its
+    ``no_citations`` alone does not escalate. Other reasons (``truncated``, ``ungrounded_number``,
+    ``refusal``) still do, and so does ``no_citations`` when the model gave source numbers that
+    were all dropped (``abstained`` stays False).
+    """
+    triggers = [r for r in reasons if r in ESCALATION_REASONS]
+    if response.abstained:
+        triggers = [r for r in triggers if r != "no_citations"]
+    return triggers
 
 
 class DocumentScopeError(Exception):
@@ -157,6 +180,24 @@ async def _check_document_scope(
         raise DocumentScopeError("document not found")
 
 
+def interleave_by_rank(
+    ranked_lists: Sequence[Sequence[RetrievedChunk]], top_k: int
+) -> list[RetrievedChunk]:
+    """Round robin by rank: every list's 1st, then every list's 2nd, ... (list order kept) until
+    ``top_k`` chunks. A list that runs out leaves its slots to the others' next ranks. The
+    result is sorted by score, highest first (ties keep the round-robin order)."""
+    picked: list[RetrievedChunk] = []
+    rank = 0
+    while len(picked) < top_k and any(rank < len(lst) for lst in ranked_lists):
+        for lst in ranked_lists:
+            if len(picked) >= top_k:
+                break
+            if rank < len(lst):
+                picked.append(lst[rank])
+        rank += 1
+    return sorted(picked, key=lambda c: c.score, reverse=True)
+
+
 async def retrieve_ranked(
     session: AsyncSession,
     *,
@@ -171,6 +212,12 @@ async def retrieve_ranked(
 
     ``PREFER_CONSOLIDATED=true``: fetch ``max(top_k, RETRIEVAL_CANDIDATES)`` candidates and pick
     ``top_k`` with ``prefer_statement_scope``. ``false``: exactly the plain top-k search.
+
+    ``BALANCE_MULTI_DOCUMENT_RETRIEVAL=true`` and 2+ distinct ``document_ids``: the above runs per
+    document (``search_chunks`` with that one document), then ``interleave_by_rank`` picks
+    ``top_k`` evenly across the documents (top_k=8, 3 documents -> 3/3/2), sorted by score, so
+    one document with higher similarities cannot crowd the others out of a comparison question.
+    ``top_score`` stays the best candidate similarity over every document.
     """
     settings = settings or get_settings()
     if document_ids:
@@ -180,11 +227,31 @@ async def retrieve_ranked(
     except EmbeddingError as exc:
         raise RetrievalUnavailableError(str(exc)) from None
     prefer = settings.prefer_consolidated
+    fetch = max(top_k, settings.retrieval_candidates) if prefer else top_k
+    distinct = list(dict.fromkeys(document_ids or []))
+    if settings.balance_multi_document_retrieval and len(distinct) > 1:
+        per_document: list[list[RetrievedChunk]] = []
+        scores: list[float] = []
+        for document_id in distinct:
+            found = await search_chunks(
+                session,
+                org_id=user.org_id,
+                query_vector=q.vectors[0],
+                top_k=fetch,
+                document_ids=[document_id],
+            )
+            scores.extend(c.score for c in found)
+            per_document.append(
+                prefer_statement_scope(found, query=query, top_k=top_k) if prefer else found
+            )
+        return Retrieval(
+            chunks=interleave_by_rank(per_document, top_k), top_score=max(scores, default=None)
+        )
     candidates = await search_chunks(
         session,
         org_id=user.org_id,
         query_vector=q.vectors[0],
-        top_k=max(top_k, settings.retrieval_candidates) if prefer else top_k,
+        top_k=fetch,
         document_ids=document_ids or None,
     )
     top_score = max((c.score for c in candidates), default=None)
@@ -330,7 +397,7 @@ async def ask_question(
             responses.append(primary)
             models.append(primary.model)
             final = _evaluate(question, retrieval, primary, settings)
-            if fallback_llm is not None and ESCALATION_REASONS.intersection(final.reasons):
+            if fallback_llm is not None and escalation_triggers(primary, final.reasons):
                 escalation_reasons = list(final.reasons)
         if fallback_llm is not None and escalation_reasons:
             log.info(

@@ -69,6 +69,9 @@ class LLMResponse:
     dropped_source_refs: int = 0
     # Extra review-gate reasons decided by the client (e.g. "truncated" for local models).
     review_flags: list[str] = field(default_factory=list)
+    # The model explicitly answered "no evidence" (local: ``insufficient: true``). Such an
+    # answer still goes to review (``no_citations``) but is not escalated for that reason.
+    abstained: bool = False
 
 
 class LLMClient(Protocol):

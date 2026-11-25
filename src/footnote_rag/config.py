@@ -128,7 +128,7 @@ class Settings(BaseSettings):
     # false/true, or a level ("low"/"medium"/"high", gpt-oss); sent as-is in Ollama's ``think``.
     local_llm_think: bool | ThinkLevel = False
     local_llm_temperature: float = 0.0
-    # Local cascade (docs/adr/0009-local-cascade-and-number-grounding.md): answers that hit an
+    # Local cascade (docs/adr/0010-local-cascade-and-number-grounding.md): answers that hit an
     # escalation reason are asked once more with this model. Empty = no cascade.
     local_llm_fallback_model: str = ""
     # None = same as LOCAL_LLM_THINK.
@@ -157,6 +157,9 @@ class Settings(BaseSettings):
     # the same document (the reverse when the question says "별도"/"개별"). false = plain top_k.
     prefer_consolidated: bool = True
     retrieval_candidates: int = 16
+    # Questions over 2+ documents (docs/adr/0011): search each document on its own and fill
+    # top_k rank by rank across them (round robin), then sort by score. false = one search.
+    balance_multi_document_retrieval: bool = True
     min_retrieval_score: float = 0.35
     review_mode: Literal["on_low_confidence", "always"] = "on_low_confidence"
     # review = a cited sentence with a number its cited chunks do not contain goes to review

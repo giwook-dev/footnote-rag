@@ -95,6 +95,15 @@
 - 프롬프트도 함께 바꿨다. 근거 제목에 `[연결]`/`[별도]`가 붙고, 시스템 프롬프트에 연결 우선 규칙이 있다([06](06-claude-citations.md)).
 - 테스트: `tests/test_consolidated_preference.py::test_consolidated_counterpart_moves_ahead_and_other_order_is_kept`, `tests/test_consolidated_preference.py::test_retrieve_reorders_scopes_and_keeps_org_isolation`.
 
+### 3-2. 여러 문서 질문의 문서별 균형 검색
+
+여러 회사를 비교하는 질문을 한 번에 검색하면, 유사도가 전반적으로 높은 한 회사의 청크가 상위 k를 거의 다 차지할 수 있다. 2026-11-25 실측의 `compare-04`(세 회사의 외부감사인)는 기대 섹션이 한 회사 것만 들어와 모든 모델이 거절했다([ADR 0011](../adr/0011-balanced-multi-document-retrieval.md)).
+
+- `BALANCE_MULTI_DOCUMENT_RETRIEVAL=true`(기본)이고 문서가 2개 이상이면 `src/footnote_rag/answering/service.py::retrieve_ranked`가 문서마다 따로 검색하고(연결 주석 우선 재정렬도 문서 단위), `src/footnote_rag/answering/service.py::interleave_by_rank`가 각 문서의 1위, 2위, … 순서로 `TOP_K`개를 채운다(8개, 문서 3개 → 3/3/2). 최종 목록은 유사도 순으로 정렬한다.
+- 후보가 모자란 문서의 자리는 다른 문서의 다음 순위가 채운다. 신뢰도 게이트의 최고 유사도는 모든 문서 후보 중 최댓값이다.
+- 문서가 1개이거나 문서 지정이 없으면(조직 전체 검색) 기존과 같다. 검색 SQL은 그대로이고 문서별로 여러 번 부를 뿐이다.
+- 테스트: `tests/test_balanced_retrieval.py::test_three_documents_get_3_3_2_in_score_order`, `tests/test_balanced_retrieval.py::test_off_single_document_and_org_wide_are_unchanged`.
+
 ### 4. `MIN_RETRIEVAL_SCORE`: 검색 신뢰도 게이트
 
 `src/footnote_rag/answering/service.py::review_reasons`는 최고 점수(재정렬 전 후보의 최고 유사도, `Retrieval.top_score`)가 `MIN_RETRIEVAL_SCORE`(기본 0.35)보다 낮으면 `low_retrieval_score`를 붙여 답변을 `pending_review`로 보낸다. 답변 자체는 만들어지지만 member에게 바로 공개되지 않는다.

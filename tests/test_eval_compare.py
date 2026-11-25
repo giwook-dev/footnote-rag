@@ -283,7 +283,14 @@ async def test_configs_share_one_import_and_one_query_embedding_per_question(
     assert "## Configs" in md and "## Items" in md
     assert "## By question type (citation accuracy)" in md
     header = next(line for line in md.splitlines() if line.startswith("| config |"))
-    for column in ("ungrounded number answers", "escalation rate", "errors", "cost USD"):
+    for column in (
+        "| recall@8 | recall@8 (every document) |",
+        "ungrounded number answers",
+        "escalation rate",
+        "errors",
+        "| GPU share |",
+        "cost USD",
+    ):
         assert column in header
     rows = {line.split(" | ")[0][2:]: line for line in md.splitlines() if line.startswith("| ")}
     assert "| n/a | 0 |" in rows["o:3b@low"]  # escalation n/a, no errors
@@ -297,6 +304,114 @@ async def test_configs_share_one_import_and_one_query_embedding_per_question(
     assert "- fallback model (cascade): `ollama:big:9b`" in cascade_md
     assert "| escalation rate (fallback called) | 100.0% (3/3) |" in cascade_md
     assert "| ungrounded number answers | 0 |" in cascade_md
+
+
+class FakeOllamaServer:
+    """What one Ollama server holds in memory; ``share`` = size_vram / size per model."""
+
+    SIZE = 1000
+
+    def __init__(self, share: dict[str, float], loaded: tuple[str, ...] = ()) -> None:
+        self.share = share
+        self.loaded: list[str] = list(loaded)
+        self.unloads: list[tuple[str, str]] = []  # (client model, unloaded model)
+        self.log: list[str] = []  # warm-up / unload / answer events in order
+
+    def load(self, model: str) -> None:
+        if model not in self.loaded:
+            self.loaded.append(model)
+
+
+class OllamaLikeFake(LocalFake):
+    """``LocalFake`` with ``loaded_models``/``unload`` against a shared ``FakeOllamaServer``."""
+
+    def __init__(self, model: str, server: FakeOllamaServer, **kwargs) -> None:
+        super().__init__(model, **kwargs)
+        self.server = server
+
+    async def warm_up(self) -> bool:
+        self.server.log.append(f"warm {self.model}")
+        self.server.load(self.model)
+        return await super().warm_up()
+
+    async def answer(self, *, system: str, messages: list[dict[str, Any]]) -> LLMResponse:
+        self.server.load(self.model)
+        return await super().answer(system=system, messages=messages)
+
+    async def loaded_models(self) -> list[dict[str, Any]]:
+        size = FakeOllamaServer.SIZE
+        return [
+            {"name": m, "size": size, "size_vram": int(self.server.share.get(m, 1.0) * size)}
+            for m in self.server.loaded
+        ]
+
+    async def unload(self, model: str) -> bool:
+        self.server.log.append(f"unload {model}")
+        self.server.unloads.append((self.model, model))
+        self.server.loaded.remove(model)
+        return True
+
+
+async def test_compare_run_unloads_unused_models_and_reports_gpu_share(
+    tmp_path, settings, fake_dart
+):
+    server = FakeOllamaServer({"a:1b": 1.0, "b:9b": 0.5, "c:14b": 0.78}, loaded=("old:20b",))
+    a, b = OllamaLikeFake("a:1b", server), OllamaLikeFake("b:9b", server)
+    small = OllamaLikeFake("a:1b", server, abstain=True)  # escalates every question
+    big = OllamaLikeFake("c:14b", server)
+    configs = [
+        EvalConfig(llm=a),
+        EvalConfig(llm=b),
+        EvalConfig(llm=small, fallback_llm=big),
+    ]
+    summaries = await run_eval_configs(
+        load_dataset(_dataset(tmp_path)),
+        settings=settings,
+        embedder=FakeEmbedder(settings.embedding_dim),
+        configs=configs,
+        dart_client=fake_dart,
+        mode="live",
+        dataset_name="synthetic",
+        warm_up=True,
+    )
+    # before each config's warm-up: every loaded model the config does not use is unloaded
+    assert server.unloads == [("a:1b", "old:20b"), ("b:9b", "a:1b"), ("a:1b", "b:9b")]
+    assert server.log[:4] == ["unload old:20b", "warm a:1b", "unload a:1b", "warm b:9b"]
+    assert server.log[4:6] == ["unload b:9b", "warm a:1b"]
+    assert big.warmed == 0  # the cascade fallback is not warmed up
+    # the fallback was not loaded after the warm-up: measured again after the run
+    assert [s.gpu_share for s in summaries] == [
+        [("a:1b", 1.0)],
+        [("b:9b", 0.5)],
+        [("a:1b", 1.0), ("c:14b", 0.78)],
+    ]
+    paths, compare = write_compare_reports(summaries, tmp_path / "out", dataset="ds", k=8)
+    single_md = paths[0].read_text(encoding="utf-8")
+    assert "- GPU share (Ollama size_vram / size, after warm-up): 100%" in single_md
+    cascade_md = paths[2].read_text(encoding="utf-8")
+    assert "- GPU share (Ollama size_vram / size, after warm-up): a:1b 100% / c:14b 78%" in (
+        cascade_md
+    )
+    md = compare.read_text(encoding="utf-8")
+    rows = {line.split(" | ")[0][2:]: line for line in md.splitlines() if line.startswith("| ")}
+    assert rows["a:1b"].endswith("| 100% | 0.0000 |")
+    assert rows["b:9b"].endswith("| 50% | 0.0000 |")
+    assert rows["a:1b > c:14b"].endswith("| a:1b 100% / c:14b 78% | 0.0000 |")
+
+
+async def test_runs_without_warm_up_never_unload(tmp_path, settings, fake_dart):
+    server = FakeOllamaServer({}, loaded=("old:20b",))
+    summary = await run_eval(
+        load_dataset(_dataset(tmp_path)),
+        settings=settings,
+        embedder=FakeEmbedder(settings.embedding_dim),
+        llm=OllamaLikeFake("a:1b", server),
+        dart_client=fake_dart,
+        mode="live",
+        dataset_name="synthetic",
+    )
+    assert server.unloads == [] and summary.gpu_share is None
+    assert "GPU share" not in render_report(summary)
 
 
 async def test_comparison_metrics_reuse_the_per_config_functions():
@@ -330,9 +445,10 @@ async def test_comparison_metrics_reuse_the_per_config_functions():
     )
     md = render_compare_report([s], ["r.md"], dataset="d", k=8)
     row = next(line for line in md.splitlines() if line.startswith("| a > b |"))
+    # recall@8, recall@8 (every document; not scored here -> n/a), ..., GPU share (not measured)
     assert row == (
-        f"| a > b | {eval_run._pct(s.recall_at_k)} | 50.0% | 50.0% | 50.0% (1/2) | 1 | n/a "
-        "| 1 | 50.0% (1/2) | 1 | 10 | 10 | 0.0000 |"
+        f"| a > b | {eval_run._pct(s.recall_at_k)} | n/a | 50.0% | 50.0% | 50.0% (1/2) | 1 | n/a "
+        "| 1 | 50.0% (1/2) | 1 | 10 | 10 | n/a | 0.0000 |"
     )
     assert "| x-01 | 1/2 pub ↑ |" in md and "| x-02 | 0/0 err |" in md
     per_config = render_report(s)
@@ -382,7 +498,11 @@ async def test_single_config_run_embeds_each_question_once(tmp_path, settings, f
 # ---- the CLI path end to end (OllamaClient with its HTTP calls replaced) ----
 
 
-def _patch_ollama(monkeypatch, available: set[str] | None, created: list[str]):
+def _patch_ollama(
+    monkeypatch, available: set[str] | None, created: list[str], unloaded: list[str] | None = None
+):
+    """Replace every ``OllamaClient`` HTTP call. The server holds ``stale:7b`` (never used, so
+    unloaded before each config) and ``a:1b`` (80% on the GPU)."""
     from footnote_rag.answering import llm as llm_module
 
     def no_claude(*a, **k):
@@ -411,9 +531,20 @@ def _patch_ollama(monkeypatch, available: set[str] | None, created: list[str]):
     async def answer(self, *, system, messages):
         return await FakeLLM(model=self.model_id).answer(system=system, messages=messages)
 
+    async def loaded_models(self):
+        return [{"name": "stale:7b", "size": 100, "size_vram": 100}, *loaded]
+
+    async def unload(self, model):
+        unloaded.append(model)
+        return True
+
+    loaded = [{"name": "a:1b", "size": 100, "size_vram": 80}]
+    unloaded = [] if unloaded is None else unloaded
     monkeypatch.setattr(OllamaClient, "status", status)
     monkeypatch.setattr(OllamaClient, "warm_up", warm_up)
     monkeypatch.setattr(OllamaClient, "answer", answer)
+    monkeypatch.setattr(OllamaClient, "loaded_models", loaded_models)
+    monkeypatch.setattr(OllamaClient, "unload", unload)
     return warmed
 
 
@@ -421,7 +552,8 @@ async def test_cli_local_models_runs_every_config_with_ollama_clients(
     tmp_path, monkeypatch, capsys, import_calls, keep_engine
 ):
     created: list[str] = []
-    warmed = _patch_ollama(monkeypatch, {"a:1b", "b:2b"}, created)
+    unloaded: list[str] = []
+    warmed = _patch_ollama(monkeypatch, {"a:1b", "b:2b"}, created, unloaded)
     out = tmp_path / "reports"
     args = parse_args(
         [
@@ -437,12 +569,19 @@ async def test_cli_local_models_runs_every_config_with_ollama_clients(
     assert await eval_run._amain(args) == 0
     assert created == ["a:1b", "b:2b"]  # preflight on each model
     assert warmed == ["a:1b", "b:2b"]
+    # config a:1b unloads stale:7b; config b:2b unloads stale:7b and a:1b (the stub never forgets)
+    assert unloaded == ["stale:7b", "stale:7b", "a:1b"]
     assert sorted(import_calls) == [FIRST, SECOND]
     names = sorted(p.name for p in out.iterdir())
     assert len(names) == 3
     assert any(re.fullmatch(STAMP_RE + r"-live-local-a-1b\.md", n) for n in names)
     assert any(re.fullmatch(STAMP_RE + r"-live-local-b-2b-think-low\.md", n) for n in names)
     assert any(re.fullmatch(STAMP_RE + r"-live-compare-local\.md", n) for n in names)
+    compare = next(n for n in names if n.endswith("-live-compare-local.md"))
+    md = (out / compare).read_text(encoding="utf-8")
+    rows = {line.split(" | ")[0][2:]: line for line in md.splitlines() if line.startswith("| ")}
+    assert rows["a:1b"].endswith("| 80% | 0.0000 |")
+    assert rows["b:2b@low"].endswith("| n/a | 0.0000 |")  # the stub never loads b:2b
     printed = capsys.readouterr().out
     assert "comparison written:" in printed
 

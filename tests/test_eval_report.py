@@ -171,10 +171,11 @@ def _item(item_id: str, *, answerable: bool = True, corp: tuple[str, ...] = ("�
     )
 
 
-def _result(item, hit, ok, total, abstained, latency, *, retrieved=(), cited=()):
+def _result(item, hit, ok, total, abstained, latency, *, retrieved=(), cited=(), every=None):
     return ItemResult(
         item=item,
         retrieval_hit=hit,
+        retrieval_hit_every_document=hit if every is None else every,
         footnotes_total=total,
         footnotes_matching=ok,
         abstained=abstained,
@@ -211,7 +212,10 @@ def _fixed_summary() -> EvalSummary:
             retrieved=[RetrievedRef(other, 0.44, False)],
             cited=[other],
         ),
-        _result(_item("compare-01", corp=("가람전자", "NAVER")), True, 0, 0, True, 400),
+        # one of its two documents had the expected section: hit, but not on every document
+        _result(
+            _item("compare-01", corp=("가람전자", "NAVER")), True, 0, 0, True, 400, every=False
+        ),
         # an unanswerable item that cited something: not a "wrong citation" (no expected section)
         _result(_item("unans-01", answerable=False), None, 0, 1, True, 1000, cited=[other]),
     ]
@@ -285,9 +289,14 @@ def test_report_renders_new_sections_without_document_text():
     assert "| latency p50 (ms) | 300 |" in md and "| latency p95 (ms) | 1000 |" in md
     # per-type table
     assert "## Metrics by question type" in md
-    assert "| samsung | 2 | 100.0% | 75.0% | 75.0% | 100.0% (2/2) | 0 | n/a | 100 | 200 |" in md
-    assert "| compare | 1 | 100.0% | n/a | n/a | 0.0% (0/1) | 1 | n/a | 400 | 400 |" in md
-    assert "| unans | 1 | n/a | n/a | n/a | n/a | - | 100.0% | 1000 | 1000 |" in md
+    assert (
+        "| samsung | 2 | 100.0% | 100.0% | 75.0% | 75.0% | 100.0% (2/2) | 0 | n/a | 100 | 200 |"
+        in md
+    )
+    assert "| compare | 1 | 100.0% | 0.0% | n/a | n/a | 0.0% (0/1) | 1 | n/a | 400 | 400 |" in md
+    assert "| unans | 1 | n/a | n/a | n/a | n/a | n/a | - | 100.0% | 1000 | 1000 |" in md
+    assert "| retrieval recall@8 | 75.0% |" in md
+    assert "| retrieval recall@8 (every document) | 50.0% |" in md
     # citation diagnostics: only items with a wrong footnote
     diag = md[md.index("## Citation diagnostics") :]
     assert "### samsung-01" in diag and "### naver-01" in diag
@@ -296,7 +305,7 @@ def test_report_renders_new_sections_without_document_text():
     assert f"- expected section prefixes: `{LEASE}`" in diag
     assert "expected section retrieved (rank 1); the model cited other evidence" in diag
     assert "expected section not in top-k; retrieval miss" in diag
-    assert f"| 1 | 0.810 | ✓ | {LEASE} > 1 |" in diag
+    assert f"| 1 | 0.810 | ✓ | {LEASE} > 1 | - |" in diag  # no document recorded
     assert "| [2] |  | (첨부)재무제표 > 주석 > 3. 현금 |" in diag
     # paths and scores only: answer text never reaches the report
     assert "SECRET-ANSWER-BODY" not in md
@@ -347,6 +356,7 @@ def _scored(
     return ItemResult(
         item=item,
         retrieval_hit=hit if prefixes else None,
+        retrieval_hit_every_document=hit if prefixes else None,  # one document per item
         footnotes_total=len(cited),
         footnotes_matching=matching,
         abstained=abstained,
@@ -499,14 +509,15 @@ def test_counterpart_metric_renders_overall_retrieval_hit_and_per_type():
         "| citation acc. (counterpart accepted) | citation acc. (retrieval hit, counterpart accepted) |"
     )
     rows = {line.split(" | ")[0][2:]: line for line in md.splitlines() if line.startswith("| ")}
-    # strict per-type values as reported, then the counterpart-accepted columns
-    assert rows["samsung"].startswith("| samsung | 6 | 100.0% | 62.5% | 62.5% |")
+    # strict per-type values as reported (recall@8 then recall@8 every document), then the
+    # counterpart-accepted columns
+    assert rows["samsung"].startswith("| samsung | 6 | 100.0% | 100.0% | 62.5% | 62.5% |")
     assert rows["samsung"].endswith("| 100.0% | 100.0% |")
-    assert rows["naver"].startswith("| naver | 6 | 83.3% | 62.5% | 71.4% |")
+    assert rows["naver"].startswith("| naver | 6 | 83.3% | 83.3% | 62.5% | 71.4% |")
     assert rows["naver"].endswith("| 75.0% | 85.7% |")
-    assert rows["hyundai"].startswith("| hyundai | 5 | 100.0% | 71.4% | 71.4% |")
+    assert rows["hyundai"].startswith("| hyundai | 5 | 100.0% | 100.0% | 71.4% | 71.4% |")
     assert rows["hyundai"].endswith("| 85.7% | 85.7% |")
-    assert rows["compare"].startswith("| compare | 4 | 100.0% | 50.0% | 50.0% |")
+    assert rows["compare"].startswith("| compare | 4 | 100.0% | 100.0% | 50.0% | 50.0% |")
     assert rows["compare"].endswith("| 100.0% | 100.0% |")
     assert rows["unans"].endswith("| n/a | n/a |")
 
@@ -608,3 +619,87 @@ async def test_fake_run_report_has_import_table_and_diagnostics_section(
     assert summary.prefer_consolidated is settings.prefer_consolidated
     # review_reason is copied from the answer: set exactly when the answer went to review
     assert all(bool(r.review_reason) == (r.status == "pending_review") for r in summary.results)
+    # every retrieved row names its document (rcept_no of the import)
+    first = summary.results[0]
+    assert first.retrieved and {ref.document for ref in first.retrieved} == {FIRST}
+    # single-document item: "every document" recall is the plain recall
+    assert first.retrieval_hit_every_document == first.retrieval_hit
+    assert summary.results[1].retrieval_hit_every_document is None  # unanswerable
+    assert "| retrieval recall@8 (every document) |" in md
+    assert "GPU share" not in md  # only local comparison runs measure it
+
+
+# ---- recall@k (every document) and the document column ----
+
+SAM, NAV, HYU = "20260310002820", "20260311001100", "20260312000500"
+AUDITOR = "V. 회계감사인의 감사의견 등 > 1. 외부감사에 관한 사항"
+
+
+def _compare_item() -> EvalItem:
+    return EvalItem(
+        id="compare-04",
+        rcept_nos=[SAM, NAV, HYU],
+        corp_names=["삼성전자", "NAVER", "현대자동차"],
+        question="세 회사의 외부감사인은?",
+        expected_section_prefixes=[AUDITOR],
+        answerable=True,
+        evidence_quotes=[],
+    )
+
+
+def _ref(path: str, score: float, rcept_no: str, corp: str) -> RetrievedRef:
+    return RetrievedRef(path, score, path.startswith(AUDITOR), document=rcept_no, corp_name=corp)
+
+
+def test_every_document_recall_fails_when_one_document_misses_the_section():
+    item = _compare_item()
+    other = "II. 사업의 내용 > 1. 사업의 개요"
+    # the 2026-11-25 compare-04 shape: the expected section of one company only
+    one = [_ref(AUDITOR, 0.62, SAM, "삼성전자"), _ref(other, 0.55, NAV, "NAVER")]
+    every = [
+        *one,
+        _ref(AUDITOR, 0.5, NAV, "NAVER"),
+        _ref(AUDITOR + " > 가", 0.4, HYU, "현대자동차"),
+    ]
+    assert eval_run.every_document_hit(item, one) is False
+    assert eval_run.every_document_hit(item, every) is True
+    # unscored and single-document items
+    unanswerable = EvalItem("u", [SAM, NAV], [], "q", [], False, [])
+    assert eval_run.every_document_hit(unanswerable, every) is None
+    single = EvalItem("s", [SAM], [], "q", [AUDITOR], True, [])
+    assert eval_run.every_document_hit(single, [_ref(AUDITOR, 0.6, "?", "x")]) is True
+
+    def scored(refs) -> ItemResult:
+        return ItemResult(
+            item=item,
+            retrieval_hit=any(r.expected for r in refs),
+            footnotes_total=0,
+            footnotes_matching=0,
+            abstained=True,
+            status="pending_review",
+            cost_usd=None,
+            latency_ms=1,
+            answer_preview="",
+            retrieved=refs,
+            retrieval_hit_every_document=eval_run.every_document_hit(item, refs),
+        )
+
+    rows = [scored(one), scored(every)]
+    assert eval_run.recall_at_k(rows) == 1.0  # "any expected section" counts compare-04
+    assert eval_run.recall_at_k_every_document(rows) == 0.5
+    s = EvalSummary(mode="live", dataset="d", k=8, results=rows)
+    md = render_report(s)
+    assert "| retrieval recall@8 | 100.0% |" in md
+    assert "| retrieval recall@8 (every document) | 50.0% |" in md
+    # false abstention diagnostics: retrieved rows name the company
+    assert "| top-8 rank | score | expected | retrieved section_path | document |" in md
+    assert f"| 1 | 0.620 | ✓ | {AUDITOR} | 삼성전자 |" in md
+    assert f"| 2 | 0.550 |  | {other} | NAVER |" in md
+
+
+def test_document_column_falls_back_to_rcept_no():
+    assert RetrievedRef("p", 0.1, False, document=SAM).document_label == SAM
+    assert RetrievedRef("p", 0.1, False, document=SAM, corp_name="삼성전자").document_label == (
+        "삼성전자"
+    )
+    assert RetrievedRef("p", 0.1, False).document_label == "-"

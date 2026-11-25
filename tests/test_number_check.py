@@ -70,6 +70,44 @@ def test_decimals_and_percent_match():
     assert values([cited("할인율은 연 4.3%입니다.", 0)]) == ["4.3"]
 
 
+# hyundai-05 on 2026-11-25: the audit-hours table cell is written "39.012" (dot as the thousands
+# separator) and the model answered "39,012"; every config sent it to review (ungrounded_number).
+AUDIT_TABLE = "감사보수 | 감사시간\n4,250 | 39.012\n합계 1.234.567"
+
+
+@pytest.mark.parametrize(
+    ("source", "answer"),
+    [("39.012", "39,012"), ("1.234.567", "1,234,567"), ("시간 39.012.", "39012")],
+)
+def test_dot_thousands_separator_in_the_source_is_grounded(source, answer):
+    assert values([cited(f"감사시간은 {answer}시간입니다.", 0)], texts=(source,)) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "answer"),
+    [("1.5", "15"), ("39.01", "3,901"), ("1.2345", "12,345"), ("1234.567", "1,234,567")],
+    ids=["one-digit-fraction", "two-digit-group", "four-digit-group", "four-digit-lead"],
+)
+def test_other_dotted_numbers_stay_ungrounded(source, answer):
+    assert not contains_number(source, answer.replace(",", ""))
+
+
+def test_dot_thousands_on_a_real_table():
+    blocks = [cited("감사시간은 39,012시간, 합계는 1,234,567입니다.", 0)]
+    assert values(blocks, texts=(AUDIT_TABLE,)) == []
+    # the dotted text itself still matches as written
+    assert values([cited("감사시간은 39.012시간입니다.", 0)], texts=(AUDIT_TABLE,)) == []
+    # a number the table does not have is still reported
+    assert values([cited("감사시간은 39,013시간입니다.", 0)], texts=(AUDIT_TABLE,)) == ["39013"]
+
+
+def test_dot_thousands_known_limitation():
+    """Widening only: a decimal with a three-digit fraction also grounds the digits without the
+    dot (documented in the module docstring)."""
+    assert contains_number("원주율 3.141", "3141")
+    assert contains_number("원주율 3.141", "3.141")
+
+
 def test_converted_amount_is_ungrounded():
     # 1,234,567백만원 rewritten as 약 1.2조 원: no unit conversion on purpose.
     blocks = [cited("리스부채는 약 1.2조 원입니다.", 0)]
