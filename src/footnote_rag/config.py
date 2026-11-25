@@ -27,6 +27,10 @@ ProviderChoice = Literal["auto", "fake", "real"]
 # The LLM additionally accepts "local" (Ollama on the host). Never chosen by "auto".
 LLMProviderChoice = Literal["auto", "fake", "real", "local"]
 LLMMode = Literal["fake", "real", "local"]
+# Ollama ``think``: a bool for most models, a level string for gpt-oss ("low"/"medium"/"high").
+ThinkLevel = Literal["low", "medium", "high"]
+ThinkSetting = bool | ThinkLevel
+THINK_LEVELS: tuple[str, ...] = ("low", "medium", "high")
 
 # llm_calls.model prefix for local (Ollama) models. Local inference costs nothing per token,
 # so usage.pricing prices every model with this prefix at 0 (see compute_cost).
@@ -121,8 +125,14 @@ class Settings(BaseSettings):
     local_llm_num_ctx: int = 16384
     local_llm_max_tokens: int = 2048
     local_llm_timeout_seconds: float = 180.0
-    local_llm_think: bool = False
+    # false/true, or a level ("low"/"medium"/"high", gpt-oss); sent as-is in Ollama's ``think``.
+    local_llm_think: bool | ThinkLevel = False
     local_llm_temperature: float = 0.0
+    # Local cascade (docs/adr/0009-local-cascade-and-number-grounding.md): answers that hit an
+    # escalation reason are asked once more with this model. Empty = no cascade.
+    local_llm_fallback_model: str = ""
+    # None = same as LOCAL_LLM_THINK.
+    local_llm_fallback_think: bool | ThinkLevel | None = None
 
     # --- embeddings ---
     embedding_model: str = "voyage-4"
@@ -149,6 +159,9 @@ class Settings(BaseSettings):
     retrieval_candidates: int = 16
     min_retrieval_score: float = 0.35
     review_mode: Literal["on_low_confidence", "always"] = "on_low_confidence"
+    # review = a cited sentence with a number its cited chunks do not contain goes to review
+    # (``ungrounded_number``); off = not checked (answering/number_check.py).
+    number_grounding_check: Literal["off", "review"] = "review"
 
     # --- chunking ---
     chunk_size: int = 1500

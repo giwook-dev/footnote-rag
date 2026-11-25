@@ -2,16 +2,35 @@
 
 역할: 임시 조직을 만들어 데이터셋의 공시를 정상 서비스·워커로 가져오고, 등록한 문서가 모두 ``ready``/``failed``가
 될 때까지 기다린 뒤(``wait_for_imports``) 질문마다 검색·답변 결과를 채점해 Markdown 리포트를 쓴다.
-기본은 Fake 모드(비용 없음), ``--live``는 실제 제공자.
-주요 요소: ``run_eval``, ``wait_for_imports``, ``EvalSummary``(지표 속성), ``ItemResult``, ``DocumentImport``,
-``score_citations``, ``item_category``, ``percentile``, ``render_report``, ``write_report``, ``main``.
+기본은 Fake 모드(비용 없음), ``--live``는 실제 제공자. ``--live --local-models``/``--cascade``는 같은 데이터셋을 여러 로컬
+(Ollama) 구성에 돌려 구성별 리포트와 비교 리포트(``{stamp}-live-compare-local.md``)를 쓴다(가져오기·질문 임베딩은 한 번).
+주요 요소: ``run_eval``, ``run_eval_configs``, ``EvalConfig``, ``MemoizedQueryEmbedder``, ``wait_for_imports``,
+``EvalSummary``(지표 속성), ``ItemResult``, ``DocumentImport``, ``score_citations``, ``item_category``, ``percentile``,
+``render_report``, ``render_compare_report``, ``write_report``, ``write_compare_reports``, ``parse_model_spec``,
+``preflight_local_models``, ``main``.
 호출 관계: ``documents.service``, ``jobs.worker.Worker``, ``answering.service``를 그대로 호출한다.
-학습 문서: docs/study/10-eval-and-mcp.md
+학습 문서: docs/study/10-eval-and-mcp.md, docs/adr/0009-local-cascade-and-number-grounding.md
 
 Eval runner.
 
     python -m footnote_rag.evals.run [--dataset evals/dataset.jsonl] [--live] [--out evals/reports]
                                      [--import-timeout 1800]
+                                     [--local-models SPEC[,SPEC...]] [--cascade PRIMARY>FALLBACK ...]
+
+Local model comparison (``--live`` only; ``LLM_PROVIDER`` is ignored, only ``OllamaClient`` is
+built, with the ``LOCAL_LLM_*`` base_url / num_ctx / max_tokens / timeout / temperature). A SPEC is
+``model[@think]`` (think: true, false, low, medium, high; default ``LOCAL_LLM_THINK``)::
+
+    --local-models qwen3.5:9b,gpt-oss:20b@low,qwen3:14b --cascade "qwen3.5:9b>qwen3:14b"
+
+Every model is checked first (``OllamaClient.status``); an unreachable server or a missing model
+prints ``ollama pull`` hints and exits with 2 before anything is imported. The filings are imported
+once, each question is embedded once (``MemoizedQueryEmbedder``) and every config answers the same
+questions in the same order. Single-model configs are warmed up (``OllamaClient.warm_up``) before
+timing; a cascade warms only its primary (swapping models on escalation is a real cost).
+
+An ``LLMError`` on one question is recorded as status ``error`` (abstained, no footnotes) and the
+run goes on (single-config runs too).
 
 Default is fake mode (FakeEmbedder / FakeLLM / FakeDartClient): no network, no cost; it
 exercises the pipeline mechanics. ``--live`` uses the configured providers, including the LLM
@@ -62,9 +81,16 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from footnote_rag.answering.llm import CITATION_API, NO_EVIDENCE_TEXT, LLMClient
-from footnote_rag.answering.service import ask_question, retrieve
-from footnote_rag.config import LOCAL_MODEL_PREFIX, Settings, get_settings
+from footnote_rag.answering.llm import CITATION_API, NO_EVIDENCE_TEXT, LLMClient, LLMError
+from footnote_rag.answering.prompt import source_id
+from footnote_rag.answering.service import AskResult, ask_question, retrieve
+from footnote_rag.config import (
+    LOCAL_MODEL_PREFIX,
+    THINK_LEVELS,
+    Settings,
+    ThinkSetting,
+    get_settings,
+)
 from footnote_rag.dart.client import DartClient
 from footnote_rag.dart.sections import SEPARATE, is_counterpart, statement_scope
 from footnote_rag.db.models import Document, User
@@ -72,10 +98,15 @@ from footnote_rag.documents.service import latest_jobs_for_documents, request_da
 from footnote_rag.evals.dataset import DEFAULT_DATASET, EvalItem, load_dataset
 from footnote_rag.jobs.handlers import JobContext
 from footnote_rag.jobs.worker import Worker
+from footnote_rag.observability import get_logger
 from footnote_rag.orgs.service import seed_org
-from footnote_rag.retrieval.embedder import Embedder
+from footnote_rag.retrieval.embedder import BatchCallback, Embedder, EmbeddingResult
+from footnote_rag.retrieval.search import RetrievedChunk
+
+log = get_logger(__name__)
 
 DEFAULT_IMPORT_TIMEOUT_SECONDS = 1800.0
+PREFLIGHT_EXIT_CODE = 2
 IMPORT_POLL_SECONDS = 2.0
 TERMINAL_DOCUMENT_STATUSES = frozenset({"ready", "failed"})
 
@@ -105,6 +136,14 @@ class ItemResult:
     # Footnotes outside the expected prefixes that cite an expected section's counterpart note.
     footnotes_counterpart: int = 0
     review_reason: str | None = None
+    # Cascade: the fallback model was called for this question.
+    escalated: bool = False
+    # Numbers of the answer missing from their cited chunks (answering.number_check), as written.
+    ungrounded_numbers: list[str] = field(default_factory=list)
+    # Per footnote (aligned with ``cited_paths``): ungrounded numbers of sentences citing it.
+    footnote_ungrounded: list[list[str]] = field(default_factory=list)
+    # ``LLMError.public_message`` when ``status == "error"``.
+    error: str | None = None
 
     @property
     def footnotes_accepted(self) -> int:
@@ -227,6 +266,36 @@ def latency_percentile(rows: Sequence[ItemResult], pct: float) -> float | None:
     return percentile([r.latency_ms for r in rows], pct)
 
 
+def ungrounded_answer_count(rows: Sequence[ItemResult]) -> int:
+    """Answers with at least one number missing from their cited chunks."""
+    return sum(1 for r in rows if r.ungrounded_numbers)
+
+
+def escalated_count(rows: Sequence[ItemResult]) -> int:
+    return sum(1 for r in rows if r.escalated)
+
+
+def escalation_rate(rows: Sequence[ItemResult]) -> float | None:
+    """Escalated questions / all questions (cascade configs)."""
+    return escalated_count(rows) / len(rows) if rows else None
+
+
+def error_count(rows: Sequence[ItemResult]) -> int:
+    return sum(1 for r in rows if r.status == "error")
+
+
+def _think_text(think: ThinkSetting) -> str:
+    return str(think).lower() if isinstance(think, bool) else str(think)
+
+
+def model_label(model: str, think: ThinkSetting | None = None) -> str:
+    """``qwen3.5:9b`` / ``gpt-oss:20b@low`` (``ollama:`` prefix dropped, think shown unless off)."""
+    label = model.removeprefix(LOCAL_MODEL_PREFIX)
+    if think is not None and think is not False:
+        label += f"@{_think_text(think)}"
+    return label
+
+
 @dataclass
 class EvalSummary:
     mode: str
@@ -243,6 +312,37 @@ class EvalSummary:
     # Retrieval settings of the run (docs/adr/0009), so reports of different settings compare.
     prefer_consolidated: bool | None = None
     retrieval_candidates: int | None = None
+    # Local comparison runs only: Ollama ``think`` of the model(s) and the cascade fallback.
+    # None = not recorded (the default single-provider run keeps its header and file name).
+    think: ThinkSetting | None = None
+    fallback_model: str | None = None
+    fallback_think: ThinkSetting | None = None
+
+    @property
+    def is_cascade(self) -> bool:
+        return self.fallback_model is not None
+
+    @property
+    def label(self) -> str:
+        """Config name in the comparison report: ``qwen3:14b``, ``gpt-oss:20b@low``,
+        ``qwen3.5:9b > qwen3:14b``."""
+        primary = model_label(self.model, self.think)
+        if self.fallback_model is None:
+            return primary
+        return f"{primary} > {model_label(self.fallback_model, self.fallback_think)}"
+
+    @property
+    def ungrounded_answers(self) -> int:
+        return ungrounded_answer_count(self.results)
+
+    @property
+    def escalation_rate(self) -> float | None:
+        """None unless this is a cascade config."""
+        return escalation_rate(self.results) if self.is_cascade else None
+
+    @property
+    def error_count(self) -> int:
+        return error_count(self.results)
 
     @property
     def recall_at_k(self) -> float | None:
@@ -331,15 +431,31 @@ def describe_llm(llm: LLMClient) -> tuple[str, str, str]:
     return provider, model, method
 
 
+def _model_slug(model: str, think: ThinkSetting | None) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._]+", "-", model.removeprefix(LOCAL_MODEL_PREFIX)).strip("-")
+    slug = slug or "unknown"
+    if think is not None and think is not False:
+        slug += f"-think-{_think_text(think)}"
+    return slug
+
+
 def report_filename(summary: EvalSummary, stamp: str) -> str:
-    """``{stamp}-{mode}-{provider}-{model}.md`` (provider omitted when it equals the mode)."""
-    model = summary.model.removeprefix(LOCAL_MODEL_PREFIX)
-    slug = re.sub(r"[^A-Za-z0-9._]+", "-", model).strip("-") or "unknown"
+    """``{stamp}-{mode}-{provider}-{model}.md`` (provider omitted when it equals the mode).
+
+    Local comparison configs: ``-think-low`` after a model whose think is set (not off), and
+    ``{primary}_to_{fallback}`` for a cascade (``qwen3.5-9b_to_qwen3-14b``)."""
+    slug = _model_slug(summary.model, summary.think)
+    if summary.fallback_model is not None:
+        slug += "_to_" + _model_slug(summary.fallback_model, summary.fallback_think)
     parts = [stamp, summary.mode]
     if summary.provider != summary.mode:
         parts.append(summary.provider)
     parts.append(slug)
     return "-".join(parts) + ".md"
+
+
+def compare_report_filename(stamp: str) -> str:
+    return f"{stamp}-live-compare-local.md"
 
 
 # ---- rendering ----
@@ -484,7 +600,9 @@ def _render_diagnostics(summary: EvalSummary) -> list[str]:
         "Answerable items with at least one footnote outside the expected sections. Paths and similarity "
         "scores only (no document text). `✓` = path starts with an expected prefix. `counterpart` ✓ = "
         "not an expected prefix, but the consolidated/separate counterpart note of one (same note in "
-        "`연결재무제표 주석` and `재무제표 주석`); the counterpart-accepted metric counts it as correct.",
+        "`연결재무제표 주석` and `재무제표 주석`); the counterpart-accepted metric counts it as correct. "
+        "`ungrounded numbers` = numbers of the sentences citing the footnote that its chunk does not "
+        "contain (no unit conversion).",
         "",
     ]
     if not wrong:
@@ -501,16 +619,51 @@ def _render_diagnostics(summary: EvalSummary) -> list[str]:
             "",
             *_render_retrieved_table(summary, r),
             "",
-            "| footnote | expected | cited section_path | counterpart |",
-            "| --- | --- | --- | --- |",
+            "| footnote | expected | cited section_path | counterpart | ungrounded numbers |",
+            "| --- | --- | --- | --- | --- |",
         ]
         lines += [
             f"| [{i}] | {'✓' if _matches(path, prefixes_list) else ''} | {_cell(path)} "
-            f"| {'✓' if is_expected_counterpart(path, prefixes_list) else ''} |"
+            f"| {'✓' if is_expected_counterpart(path, prefixes_list) else ''} "
+            f"| {_numbers(_footnote_numbers(r, i - 1))} |"
             for i, path in enumerate(r.cited_paths, start=1)
         ]
         lines.append("")
     return lines
+
+
+def _numbers(values: Sequence[str]) -> str:
+    return ", ".join(f"`{_cell(v)}`" for v in values)
+
+
+def _footnote_numbers(r: ItemResult, index: int) -> list[str]:
+    return r.footnote_ungrounded[index] if index < len(r.footnote_ungrounded) else []
+
+
+def _render_ungrounded(summary: EvalSummary) -> list[str]:
+    rows = [r for r in summary.results if r.ungrounded_numbers]
+    lines = [
+        "## Ungrounded number diagnostics",
+        "",
+        "Answers with a number (amount, ratio) that none of the sentence's cited chunks contains "
+        "(`answering.number_check`: commas ignored, 1-2 digit integers and numbers from the question "
+        "skipped, no unit conversion). Numbers only (no document text).",
+        "",
+    ]
+    if not rows:
+        return [*lines, "No ungrounded numbers.", ""]
+    lines += ["| id | status | ungrounded numbers |", "| --- | --- | --- |"]
+    lines += [f"| {r.item.id} | {r.status} | {_numbers(r.ungrounded_numbers)} |" for r in rows]
+    return [*lines, ""]
+
+
+def _render_errors(summary: EvalSummary) -> list[str]:
+    errors = [r for r in summary.results if r.status == "error"]
+    if not errors:
+        return []
+    lines = ["## Errors", "", "Questions whose LLM call failed (`LLMError`); the run went on.", ""]
+    lines += [f"- {r.item.id}: {_cell(r.error or 'error')}" for r in errors]
+    return [*lines, ""]
 
 
 # review_reason codes (answering.service.review_reasons) -> what they mean for an abstention.
@@ -521,6 +674,7 @@ REVIEW_REASON_HINTS = {
     "no_retrieval_results": "retrieval returned nothing; the model was not called",
     "refusal": "the model refused",
     "truncated": "the output hit the token limit",
+    "ungrounded_number": "a cited sentence has a number its cited chunks do not contain",
     "review_mode_always": "REVIEW_MODE=always",
 }
 
@@ -554,6 +708,7 @@ def _render_abstention_diagnostics(summary: EvalSummary) -> list[str]:
             "",
             f"- expected section prefixes: {_expected_prefixes(r)}",
             f"- status: {r.status}",
+            *([f"- error: {_cell(r.error)}"] if r.error else []),
             f"- review_reason: {_review_reason(r)}",
             f"- footnotes: {r.footnotes_total}",
             f"- retrieval: {retrieval}",
@@ -568,14 +723,42 @@ def _flag(value: bool | None) -> str:
     return "-" if value is None else str(value).lower()
 
 
+def _local_config_header(summary: EvalSummary) -> list[str]:
+    """Header lines of a local comparison config (absent from the default run's report)."""
+    lines = []
+    if summary.think is not None:
+        lines.append(f"- think: {_think_text(summary.think)}")
+    if summary.fallback_model is not None:
+        lines.append(f"- fallback model (cascade): `{summary.fallback_model}`")
+        if summary.fallback_think is not None:
+            lines.append(f"- fallback think: {_think_text(summary.fallback_think)}")
+    return lines
+
+
+def _optional_metric_rows(summary: EvalSummary) -> list[str]:
+    rows = []
+    if summary.is_cascade:
+        rows.append(
+            f"| escalation rate (fallback called) | {_pct(summary.escalation_rate)} "
+            f"({escalated_count(summary.results)}/{len(summary.results)}) |"
+        )
+    if summary.error_count:
+        rows.append(f"| errors (LLMError, question skipped) | {summary.error_count} |")
+    return rows
+
+
 def render_report(summary: EvalSummary) -> str:
     false_ids = summary.false_abstentions
+    title_model = summary.model + (
+        f" > {summary.fallback_model}" if summary.fallback_model is not None else ""
+    )
     lines = [
-        f"# Eval report ({summary.mode}, {summary.provider}, {summary.model})",
+        f"# Eval report ({summary.mode}, {summary.provider}, {title_model})",
         "",
         f"- generated: {datetime.now(UTC).isoformat(timespec='seconds')}",
         f"- provider: {summary.provider}",
         f"- model: `{summary.model}`",
+        *_local_config_header(summary),
         f"- citation_method: {summary.citation_method}",
         f"- dataset: `{summary.dataset}`",
         f"- evaluated rows: {len(summary.results)} (skipped `_example` rows: {summary.skipped_examples})",
@@ -609,6 +792,8 @@ def render_report(summary: EvalSummary) -> str:
         f"| {_counterpart_ratio([r for r in summary.results if r.retrieval_hit is True])} |",
         f"| latency p50 (ms) | {_ms(summary.latency_p50_ms)} |",
         f"| latency p95 (ms) | {_ms(summary.latency_p95_ms)} |",
+        f"| ungrounded number answers | {summary.ungrounded_answers} |",
+        *_optional_metric_rows(summary),
         "",
     ]
     if summary.mode == "fake":
@@ -634,8 +819,10 @@ def render_report(summary: EvalSummary) -> str:
             f"{r.cost_usd if r.cost_usd is not None else 'n/a'} | {r.latency_ms} |"
         )
     lines.append("")
+    lines += _render_errors(summary)
     lines += _render_abstention_diagnostics(summary)
     lines += _render_diagnostics(summary)
+    lines += _render_ungrounded(summary)
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
@@ -726,37 +913,77 @@ async def _collect_imports(
     return out
 
 
-async def run_eval(
+class MemoizedQueryEmbedder:
+    """Eval-only wrapper: ``embed_query`` is cached per question text for the whole process, so
+    each question is embedded once however many configs answer it (and ``retrieve`` plus
+    ``ask_question`` share one call). Documents pass straight through."""
+
+    def __init__(self, inner: Embedder) -> None:
+        self.inner = inner
+        self.model = inner.model
+        self.dim = inner.dim
+        self._queries: dict[str, EmbeddingResult] = {}
+
+    async def embed_documents(
+        self, texts: list[str], on_batch: BatchCallback | None = None
+    ) -> EmbeddingResult:
+        return await self.inner.embed_documents(texts, on_batch=on_batch)
+
+    async def embed_query(self, text: str) -> EmbeddingResult:
+        cached = self._queries.get(text)
+        if cached is None:
+            cached = await self.inner.embed_query(text)
+            self._queries[text] = cached
+        return cached
+
+
+@dataclass
+class EvalConfig:
+    """One answering setup: an LLM, optionally with a cascade fallback (local comparison)."""
+
+    llm: LLMClient
+    fallback_llm: LLMClient | None = None
+    # Recorded in the report header and file name (local comparison only).
+    think: ThinkSetting | None = None
+    fallback_think: ThinkSetting | None = None
+
+
+@dataclass
+class PreparedEval:
+    """Imports and retrieval shared by every config of a run."""
+
+    runnable: list[EvalItem]
+    skipped_examples: int
+    admin_id: uuid.UUID | None = None
+    rcept_to_doc: dict[str, uuid.UUID] = field(default_factory=dict)
+    import_failures: list[str] = field(default_factory=list)
+    imports: list[DocumentImport] = field(default_factory=list)
+    hits: list[list[RetrievedChunk]] = field(default_factory=list)  # aligned with ``runnable``
+
+
+def _doc_ids(item: EvalItem, prepared: PreparedEval) -> list[uuid.UUID]:
+    return [prepared.rcept_to_doc[r] for r in item.rcept_nos if r in prepared.rcept_to_doc]
+
+
+async def prepare_eval(
     items: list[EvalItem],
     *,
     settings: Settings,
     embedder: Embedder,
-    llm: LLMClient,
+    query_embedder: Embedder,
     dart_client: DartClient,
-    mode: str,
-    dataset_name: str,
     max_worker_loops: int = 1000,
     import_timeout_seconds: float = DEFAULT_IMPORT_TIMEOUT_SECONDS,
     import_poll_seconds: float = IMPORT_POLL_SECONDS,
-) -> EvalSummary:
+) -> PreparedEval:
+    """Seed an org, import every filing once, wait for the imports, retrieve every question."""
     from footnote_rag.db.session import get_sessionmaker
 
     sm = get_sessionmaker()
-    provider, model, method = describe_llm(llm)
-    summary = EvalSummary(
-        mode=mode,
-        dataset=dataset_name,
-        k=settings.top_k,
-        provider=provider,
-        model=model,
-        citation_method=method,
-        prefer_consolidated=settings.prefer_consolidated,
-        retrieval_candidates=settings.retrieval_candidates,
-    )
     runnable = [i for i in items if not i.example]
-    summary.skipped_examples = len(items) - len(runnable)
+    prepared = PreparedEval(runnable=runnable, skipped_examples=len(items) - len(runnable))
     if not runnable:
-        return summary
+        return prepared
 
     run_id = uuid.uuid4().hex[:8]
     async with sm() as session:
@@ -780,7 +1007,8 @@ async def run_eval(
         context=JobContext(sm, settings, embedder, dart_client),
         worker_id=f"eval-{run_id}",
     )
-    summary.import_failures = await wait_for_imports(
+    prepared.admin_id, prepared.rcept_to_doc = admin.id, rcept_to_doc
+    prepared.import_failures = await wait_for_imports(
         sm,
         worker,
         rcept_to_doc,
@@ -788,78 +1016,482 @@ async def run_eval(
         poll_seconds=import_poll_seconds,
         max_worker_loops=max_worker_loops,
     )
-    summary.imports = await _collect_imports(sm, org_id, rcept_to_doc)
+    prepared.imports = await _collect_imports(sm, org_id, rcept_to_doc)
 
     for item in runnable:
-        doc_ids = [rcept_to_doc[r] for r in item.rcept_nos if r in rcept_to_doc]
+        doc_ids = _doc_ids(item, prepared)
         async with sm() as session:
             user = await session.get(User, admin.id)
             assert user is not None
-            hits = await retrieve(
-                session,
-                user=user,
-                query=item.question,
-                top_k=settings.top_k,
-                document_ids=doc_ids or None,
-                embedder=embedder,
-                settings=settings,
+            prepared.hits.append(
+                await retrieve(
+                    session,
+                    user=user,
+                    query=item.question,
+                    top_k=settings.top_k,
+                    document_ids=doc_ids or None,
+                    embedder=query_embedder,
+                    settings=settings,
+                )
             )
+    return prepared
+
+
+def _retrieval_fields(item: EvalItem, hits: list[RetrievedChunk]) -> dict:
+    prefixes = item.expected_section_prefixes
+    return {
+        "retrieval_hit": any(_matches(h.section_path, prefixes) for h in hits)
+        if item.answerable and prefixes
+        else None,
+        "retrieved": [
+            RetrievedRef(
+                h.section_path,
+                h.score,
+                bool(prefixes) and _matches(h.section_path, prefixes),
+            )
+            for h in hits
+        ],
+    }
+
+
+def _item_result(item: EvalItem, hits: list[RetrievedChunk], ask: AskResult) -> ItemResult:
+    prefixes = item.expected_section_prefixes
+    cited_paths = [str(f.get("section_path", "")) for f in ask.footnotes]
+    matching, counterpart = score_citations(cited_paths, prefixes)
+    abstained = (
+        not ask.footnotes
+        or ask.answer.status == "pending_review"
+        or NO_EVIDENCE_TEXT in ask.answer.text
+    )
+    cost = ask.usage.get("cost_usd")
+    footnote_sources = [source_id(f.get("document_id"), f.get("chunk_id")) for f in ask.footnotes]
+    return ItemResult(
+        item=item,
+        footnotes_total=len(ask.footnotes),
+        footnotes_matching=matching,
+        abstained=abstained,
+        status=ask.answer.status,
+        cost_usd=Decimal(cost) if cost is not None else None,
+        latency_ms=ask.latency_ms,
+        answer_preview=ask.answer.text[:80],
+        cited_paths=cited_paths,
+        footnotes_counterpart=counterpart if item.answerable else 0,
+        review_reason=ask.answer.review_reason,
+        escalated=ask.escalated,
+        ungrounded_numbers=list(dict.fromkeys(u.text for u in ask.ungrounded_numbers)),
+        footnote_ungrounded=[
+            list(dict.fromkeys(u.text for u in ask.ungrounded_numbers if src in u.sources))
+            for src in footnote_sources
+        ],
+        **_retrieval_fields(item, hits),
+    )
+
+
+def _error_result(
+    item: EvalItem, hits: list[RetrievedChunk], exc: LLMError, latency_ms: int
+) -> ItemResult:
+    return ItemResult(
+        item=item,
+        footnotes_total=0,
+        footnotes_matching=0,
+        abstained=True,
+        status="error",
+        cost_usd=None,
+        latency_ms=latency_ms,
+        answer_preview="",
+        error=exc.public_message,
+        **_retrieval_fields(item, hits),
+    )
+
+
+def _new_summary(
+    config: EvalConfig, *, settings: Settings, mode: str, dataset_name: str
+) -> EvalSummary:
+    provider, model, method = describe_llm(config.llm)
+    return EvalSummary(
+        mode=mode,
+        dataset=dataset_name,
+        k=settings.top_k,
+        provider=provider,
+        model=model,
+        citation_method=method,
+        prefer_consolidated=settings.prefer_consolidated,
+        retrieval_candidates=settings.retrieval_candidates,
+        think=config.think,
+        fallback_model=describe_llm(config.fallback_llm)[1] if config.fallback_llm else None,
+        fallback_think=config.fallback_think,
+    )
+
+
+async def run_config(
+    prepared: PreparedEval,
+    config: EvalConfig,
+    *,
+    settings: Settings,
+    query_embedder: Embedder,
+    mode: str,
+    dataset_name: str,
+    warm_up: bool = False,
+) -> EvalSummary:
+    """Ask every prepared question with one config. ``LLMError`` -> an ``error`` row, go on."""
+    from footnote_rag.db.session import get_sessionmaker
+
+    sm = get_sessionmaker()
+    summary = _new_summary(config, settings=settings, mode=mode, dataset_name=dataset_name)
+    summary.skipped_examples = prepared.skipped_examples
+    summary.import_failures = list(prepared.import_failures)
+    summary.imports = list(prepared.imports)
+    if not prepared.runnable:
+        return summary
+    warm = getattr(config.llm, "warm_up", None)
+    if warm_up and callable(warm):
+        await warm()  # primary only: a cascade's model swap on escalation is a real cost
+    for item, hits in zip(prepared.runnable, prepared.hits, strict=True):
+        doc_ids = _doc_ids(item, prepared)
+        started = time.perf_counter()
         async with sm() as session:
-            user = await session.get(User, admin.id)
+            user = await session.get(User, prepared.admin_id)
             assert user is not None
-            ask = await ask_question(
-                session,
-                user=user,
-                question=item.question,
-                document_ids=doc_ids or None,
-                embedder=embedder,
-                llm=llm,
-                settings=settings,
-            )
-        prefixes = item.expected_section_prefixes
-        cited_paths = [str(f.get("section_path", "")) for f in ask.footnotes]
-        matching, counterpart = score_citations(cited_paths, prefixes)
-        abstained = (
-            not ask.footnotes
-            or ask.answer.status == "pending_review"
-            or NO_EVIDENCE_TEXT in ask.answer.text
-        )
-        cost = ask.usage.get("cost_usd")
-        summary.results.append(
-            ItemResult(
-                item=item,
-                retrieval_hit=any(_matches(h.section_path, prefixes) for h in hits)
-                if item.answerable and prefixes
-                else None,
-                footnotes_total=len(ask.footnotes),
-                footnotes_matching=matching,
-                abstained=abstained,
-                status=ask.answer.status,
-                cost_usd=Decimal(cost) if cost is not None else None,
-                latency_ms=ask.latency_ms,
-                answer_preview=ask.answer.text[:80],
-                retrieved=[
-                    RetrievedRef(
-                        h.section_path,
-                        h.score,
-                        bool(prefixes) and _matches(h.section_path, prefixes),
-                    )
-                    for h in hits
-                ],
-                cited_paths=cited_paths,
-                footnotes_counterpart=counterpart if item.answerable else 0,
-                review_reason=ask.answer.review_reason,
-            )
-        )
+            try:
+                ask = await ask_question(
+                    session,
+                    user=user,
+                    question=item.question,
+                    document_ids=doc_ids or None,
+                    embedder=query_embedder,
+                    llm=config.llm,
+                    settings=settings,
+                    fallback_llm=config.fallback_llm,
+                )
+            except LLMError as exc:
+                latency_ms = int((time.perf_counter() - started) * 1000)
+                log.warning(
+                    "eval.item_error", item=item.id, model=summary.label, status=exc.status_code
+                )
+                summary.results.append(_error_result(item, hits, exc, latency_ms))
+                continue
+        summary.results.append(_item_result(item, hits, ask))
     return summary
 
 
-def write_report(summary: EvalSummary, out_dir: Path) -> Path:
+async def run_eval_configs(
+    items: list[EvalItem],
+    *,
+    settings: Settings,
+    embedder: Embedder,
+    configs: Sequence[EvalConfig],
+    dart_client: DartClient,
+    mode: str,
+    dataset_name: str,
+    warm_up: bool = False,
+    max_worker_loops: int = 1000,
+    import_timeout_seconds: float = DEFAULT_IMPORT_TIMEOUT_SECONDS,
+    import_poll_seconds: float = IMPORT_POLL_SECONDS,
+) -> list[EvalSummary]:
+    """Import once, embed each question once, then run every config on the same questions."""
+    query_embedder = (
+        embedder if isinstance(embedder, MemoizedQueryEmbedder) else MemoizedQueryEmbedder(embedder)
+    )
+    prepared = await prepare_eval(
+        items,
+        settings=settings,
+        embedder=embedder,
+        query_embedder=query_embedder,
+        dart_client=dart_client,
+        max_worker_loops=max_worker_loops,
+        import_timeout_seconds=import_timeout_seconds,
+        import_poll_seconds=import_poll_seconds,
+    )
+    return [
+        await run_config(
+            prepared,
+            config,
+            settings=settings,
+            query_embedder=query_embedder,
+            mode=mode,
+            dataset_name=dataset_name,
+            warm_up=warm_up,
+        )
+        for config in configs
+    ]
+
+
+async def run_eval(
+    items: list[EvalItem],
+    *,
+    settings: Settings,
+    embedder: Embedder,
+    llm: LLMClient,
+    dart_client: DartClient,
+    mode: str,
+    dataset_name: str,
+    max_worker_loops: int = 1000,
+    import_timeout_seconds: float = DEFAULT_IMPORT_TIMEOUT_SECONDS,
+    import_poll_seconds: float = IMPORT_POLL_SECONDS,
+) -> EvalSummary:
+    """Single-provider run (the default CLI path): one config, one summary."""
+    (summary,) = await run_eval_configs(
+        items,
+        settings=settings,
+        embedder=embedder,
+        configs=[EvalConfig(llm=llm)],
+        dart_client=dart_client,
+        mode=mode,
+        dataset_name=dataset_name,
+        max_worker_loops=max_worker_loops,
+        import_timeout_seconds=import_timeout_seconds,
+        import_poll_seconds=import_poll_seconds,
+    )
+    return summary
+
+
+def _stamp() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def write_report(summary: EvalSummary, out_dir: Path, stamp: str | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    path = out_dir / report_filename(summary, stamp)
+    path = out_dir / report_filename(summary, stamp or _stamp())
     path.write_text(render_report(summary), encoding="utf-8")
     return path
+
+
+# ---- local model comparison report ----
+
+STATUS_ABBREVIATIONS = {"published": "pub", "pending_review": "rev", "error": "err"}
+
+
+def _escalation_cell(summary: EvalSummary) -> str:
+    if not summary.is_cascade:
+        return "n/a"
+    return (
+        f"{_pct(summary.escalation_rate)} ({escalated_count(summary.results)}"
+        f"/{len(summary.results)})"
+    )
+
+
+def _matrix_cell(r: ItemResult | None) -> str:
+    if r is None:
+        return "-"
+    cell = (
+        f"{r.footnotes_matching}/{r.footnotes_total} {STATUS_ABBREVIATIONS.get(r.status, r.status)}"
+    )
+    return cell + (" ↑" if r.escalated else "")
+
+
+def render_compare_report(
+    summaries: Sequence[EvalSummary], report_names: Sequence[str], *, dataset: str, k: int
+) -> str:
+    """Side-by-side view of local configs; every number comes from the per-config metrics."""
+    labels = [_cell(s.label) for s in summaries]
+    rows = len(summaries[0].results) if summaries else 0
+    lines = [
+        "# Eval comparison (live, local models)",
+        "",
+        f"- generated: {datetime.now(UTC).isoformat(timespec='seconds')}",
+        f"- dataset: `{dataset}` ({rows} rows), k: {k}",
+        "- answers: local Ollama only · question embeddings: Voyage (document chunks cached, "
+        "one query embedding per question shared by every config)",
+        "- configs: " + ", ".join(f"`{label}`" for label in labels),
+        "- per-config reports:",
+        *(f"  - [{name}]({name})" for name in report_names),
+        "",
+        "## Configs",
+        "",
+        f"| config | recall@{k} | citation acc. | citation acc. (hit) | answered (answerable) "
+        "| false abst. | unans. abstained | ungrounded number answers | escalation rate | errors "
+        "| p50 ms | p95 ms | cost USD |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for label, s in zip(labels, summaries, strict=True):
+        lines.append(
+            f"| {label} | {_pct(s.recall_at_k)} | {_pct(s.citation_accuracy)} "
+            f"| {_pct(s.citation_accuracy_retrieval_hit)} | {_ratio(s.answered_rate, s.results)} "
+            f"| {len(s.false_abstentions)} | {_pct(s.abstention_rate)} | {s.ungrounded_answers} "
+            f"| {_escalation_cell(s)} | {s.error_count} | {_ms(s.latency_p50_ms)} "
+            f"| {_ms(s.latency_p95_ms)} | {s.total_cost_usd:.4f} |"
+        )
+    header = "| id | " + " | ".join(labels) + " |"
+    separator = "| --- |" + " --- |" * len(labels)
+    lines += [
+        "",
+        "## Items",
+        "",
+        "`cited ok/total` + status: `pub` = published, `rev` = pending_review, `err` = error, "
+        "`↑` = escalated to fallback",
+        "",
+        header,
+        separator,
+    ]
+    by_id = [{r.item.id: r for r in s.results} for s in summaries]
+    ids = list(dict.fromkeys(r.item.id for s in summaries for r in s.results))
+    for item_id in ids:
+        cells = [_matrix_cell(index.get(item_id)) for index in by_id]
+        lines.append(f"| {_cell(item_id)} | " + " | ".join(cells) + " |")
+    groups = [s.by_category() for s in summaries]
+    categories = list(dict.fromkeys(name for g in groups for name in g))
+    lines += [
+        "",
+        "## By question type (citation accuracy)",
+        "",
+        header.replace("| id |", "| type |"),
+    ]
+    lines.append(separator)
+    for name in categories:
+        cells = [_pct(citation_accuracy(g[name])) if name in g else "-" for g in groups]
+        lines.append(f"| {_cell(name)} | " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def write_compare_reports(
+    summaries: Sequence[EvalSummary], out_dir: Path, *, dataset: str, k: int
+) -> tuple[list[Path], Path]:
+    """Per-config reports and ``{stamp}-live-compare-local.md``, all with one timestamp."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = _stamp()
+    paths: list[Path] = []
+    for summary in summaries:
+        name = report_filename(summary, stamp)
+        n = 2
+        while any(p.name == name for p in paths):  # the same config given twice
+            name = report_filename(summary, stamp).removesuffix(".md") + f"-{n}.md"
+            n += 1
+        path = out_dir / name
+        path.write_text(render_report(summary), encoding="utf-8")
+        paths.append(path)
+    compare = out_dir / compare_report_filename(stamp)
+    compare.write_text(
+        render_compare_report(summaries, [p.name for p in paths], dataset=dataset, k=k),
+        encoding="utf-8",
+    )
+    return paths, compare
+
+
+# ---- local model specs (CLI) and preflight ----
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """``model[@think]``; ``think`` None = ``LOCAL_LLM_THINK``."""
+
+    model: str
+    think: ThinkSetting | None = None
+
+
+def parse_think(text: str) -> ThinkSetting:
+    value = text.strip().lower()
+    if value in ("true", "false"):
+        return value == "true"
+    if value in THINK_LEVELS:
+        return value  # type: ignore[return-value]
+    raise ValueError(f"think must be one of true, false, {', '.join(THINK_LEVELS)}: {text!r}")
+
+
+def parse_model_spec(text: str) -> ModelSpec:
+    name, sep, think = text.strip().partition("@")
+    name = name.strip()
+    if not name:
+        raise ValueError(f"empty model name in {text!r}")
+    return ModelSpec(name, parse_think(think) if sep else None)
+
+
+def parse_local_models(text: str) -> list[ModelSpec]:
+    specs = [parse_model_spec(part) for part in text.split(",") if part.strip()]
+    if not specs:
+        raise ValueError("no model given")
+    return specs
+
+
+def parse_cascade(text: str) -> tuple[ModelSpec, ModelSpec]:
+    primary, sep, fallback = text.partition(">")
+    if not sep or ">" in fallback:
+        raise ValueError(f"expected PRIMARY>FALLBACK: {text!r}")
+    return parse_model_spec(primary), parse_model_spec(fallback)
+
+
+def _arg_type(parse: Callable[[str], object]) -> Callable[[str], object]:
+    def wrapped(text: str) -> object:
+        try:
+            return parse(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
+
+    wrapped.__name__ = parse.__name__
+    return wrapped
+
+
+def build_local_configs(
+    settings: Settings,
+    local_models: Sequence[ModelSpec],
+    cascades: Sequence[tuple[ModelSpec, ModelSpec]],
+) -> list[EvalConfig]:
+    """``OllamaClient`` per config via ``providers.make_local_llm`` (never a Claude client)."""
+    from footnote_rag import providers
+
+    def resolve(spec: ModelSpec) -> ThinkSetting:
+        return settings.local_llm_think if spec.think is None else spec.think
+
+    configs = [
+        EvalConfig(
+            llm=providers.make_local_llm(settings, model=spec.model, think=resolve(spec)),
+            think=resolve(spec),
+        )
+        for spec in local_models
+    ]
+    for primary, fallback in cascades:
+        configs.append(
+            EvalConfig(
+                llm=providers.make_local_llm(settings, model=primary.model, think=resolve(primary)),
+                fallback_llm=providers.make_local_llm(
+                    settings, model=fallback.model, think=resolve(fallback)
+                ),
+                think=resolve(primary),
+                fallback_think=resolve(fallback),
+            )
+        )
+    return configs
+
+
+@dataclass
+class PreflightProblem:
+    model: str
+    base_url: str | None
+    connected: bool | None
+    detail: str | None
+
+
+async def preflight_local_models(configs: Sequence[EvalConfig]) -> list[PreflightProblem]:
+    """``status()`` of every distinct model; problems = unreachable server or missing model."""
+    clients: dict[tuple[str, str], LLMClient] = {}
+    for config in configs:
+        for llm in (config.llm, config.fallback_llm):
+            if llm is not None:
+                key = (str(getattr(llm, "base_url", "")), str(getattr(llm, "model", "")))
+                clients.setdefault(key, llm)
+    problems: list[PreflightProblem] = []
+    for (base_url, model), llm in clients.items():
+        status = getattr(llm, "status", None)
+        if not callable(status):
+            continue
+        data = await status()
+        if data.get("connected") is not True or data.get("model_available") is not True:
+            problems.append(
+                PreflightProblem(model, base_url or None, data.get("connected"), data.get("detail"))
+            )
+    return problems
+
+
+def render_preflight(problems: Sequence[PreflightProblem]) -> str:
+    lines = ["로컬 모델 사전 점검 실패: 공시를 가져오기 전에 중단합니다."]
+    for p in problems:
+        state = "Ollama 연결 실패" if p.connected is not True else "모델 없음"
+        where = f" ({p.base_url})" if p.base_url else ""
+        lines.append(f"- {p.model}: {state}{where}" + (f" - {p.detail}" if p.detail else ""))
+    if any(p.connected is not True for p in problems):
+        lines.append("Ollama 서버를 실행했는지, LOCAL_LLM_BASE_URL이 맞는지 확인하세요.")
+    lines.append("필요한 모델을 받은 뒤 다시 실행하세요:")
+    lines += [f"  ollama pull {m}" for m in dict.fromkeys(p.model for p in problems)]
+    return "\n".join(lines)
 
 
 async def _amain(args: argparse.Namespace) -> int:
@@ -870,6 +1502,8 @@ async def _amain(args: argparse.Namespace) -> int:
     from footnote_rag.retrieval.embedder import FakeEmbedder
 
     settings = get_settings()
+    if args.local_models or args.cascade:
+        return await _amain_compare(args, settings)
     if args.live:
         embedder, llm, dart = (
             make_embedder(settings),
@@ -899,10 +1533,42 @@ async def _amain(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+async def _amain_compare(args: argparse.Namespace, settings: Settings) -> int:
+    """``--live --local-models``/``--cascade``: preflight, one import, every config, reports."""
+    from footnote_rag.db.session import dispose_engine
+    from footnote_rag.providers import make_dart_client, make_embedder
+
+    configs = build_local_configs(settings, args.local_models or [], args.cascade or [])
+    problems = await preflight_local_models(configs)
+    if problems:
+        print(render_preflight(problems), file=sys.stderr)
+        return PREFLIGHT_EXIT_CODE
+    embedder, dart = make_embedder(settings), make_dart_client(settings)
+    items = load_dataset(args.dataset)
+    try:
+        summaries = await run_eval_configs(
+            items,
+            settings=settings,
+            embedder=embedder,
+            configs=configs,
+            dart_client=dart,
+            mode="live",
+            dataset_name=str(args.dataset),
+            warm_up=True,
+            import_timeout_seconds=args.import_timeout,
+        )
+    finally:
+        await dispose_engine()
+    paths, compare = write_compare_reports(
+        summaries, args.out, dataset=str(args.dataset), k=settings.top_k
+    )
+    for path in paths:
+        print(f"report written: {path}")
+    print(f"comparison written: {compare}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="footnote_rag.evals.run")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--live", action="store_true", help="use real providers (costs money)")
@@ -913,7 +1579,38 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_IMPORT_TIMEOUT_SECONDS,
         help="seconds to wait for every imported filing to become ready/failed (default 1800)",
     )
-    return asyncio.run(_amain(parser.parse_args(argv)))
+    parser.add_argument(
+        "--local-models",
+        type=_arg_type(parse_local_models),
+        default=None,
+        metavar="SPEC[,SPEC...]",
+        help="compare local Ollama models (needs --live); SPEC = model[@think], think = true, "
+        "false, low, medium or high (default LOCAL_LLM_THINK)",
+    )
+    parser.add_argument(
+        "--cascade",
+        type=_arg_type(parse_cascade),
+        action="append",
+        default=None,
+        metavar="PRIMARY>FALLBACK",
+        help="add a local cascade config (needs --live; repeatable), e.g. 'qwen3.5:9b>qwen3:14b'",
+    )
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if (args.local_models or args.cascade) and not args.live:
+        parser.error("--local-models and --cascade need --live")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+    return asyncio.run(_amain(parse_args(argv)))
 
 
 if __name__ == "__main__":

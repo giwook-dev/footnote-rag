@@ -1,11 +1,13 @@
-"""질문 답변 서비스: 검색 → Claude(search_result + citations) → 각주 → 검토 게이트 → 저장.
+"""질문 답변 서비스: 검색 → Claude(search_result + citations) → 각주·숫자 검증 → 검토 게이트(+ 로컬 상향) → 저장.
 
 역할: 질문 하나를 끝까지 처리하고 questions·answers·llm_calls·감사 로그 두 건을 한 트랜잭션으로 커밋한다.
+``fallback_llm``이 있으면 모델을 바꾸면 나아질 수 있는 사유에 걸린 답만 fallback으로 한 번 더 묻는다(로컬 상향).
 주요 요소: ``ask_question``, ``retrieve``/``retrieve_ranked``(연결 주석 우선 재정렬 포함), ``review_reasons``(신뢰도 규칙),
-``to_source_refs``.
+``to_source_refs``, ``ESCALATION_REASONS``.
 호출 관계: ``answering.router``와 ``evals.run``이 호출하고, ``retrieval.search``, ``answering.llm``,
-``answering.footnotes``, ``usage.pricing``, ``audit.service``를 호출한다.
-학습 문서: docs/study/02-request-walkthrough.md, docs/study/06-claude-citations.md
+``answering.footnotes``, ``answering.number_check``, ``usage.pricing``, ``audit.service``를 호출한다.
+학습 문서: docs/study/02-request-walkthrough.md, docs/study/06-claude-citations.md,
+docs/adr/0009-local-cascade-and-number-grounding.md
 
 Question answering: retrieve -> Claude with search_result citations -> footnotes -> review gate.
 
@@ -15,15 +17,23 @@ Review gate (``REVIEW_MODE=on_low_confidence``): an answer goes to ``pending_rev
   * the best similarity is below ``MIN_RETRIEVAL_SCORE`` (``low_retrieval_score``; measured over
     the candidates before the consolidated-first reordering, docs/adr/0009), or
   * the answer carries no footnotes (``no_citations``), or
-  * the client flagged it (``LLMResponse.review_flags``, e.g. ``truncated`` for a local model).
+  * the client flagged it (``LLMResponse.review_flags``, e.g. ``truncated`` for a local model), or
+  * a cited sentence has a number its cited chunks do not contain (``ungrounded_number``,
+    ``NUMBER_GROUNDING_CHECK=review``; ``answering.number_check``).
 Otherwise it is ``published``. ``REVIEW_MODE=always`` sends every answer to review.
+
+Cascade (``fallback_llm``): when the primary answer has a reason in ``ESCALATION_REASONS`` or the
+primary raised ``LLMError(502)`` (unusable output), the same messages go once to ``fallback_llm``
+and its answer is checked again and kept. Retrieval reasons, ``review_mode_always``, 503 and 504
+never escalate. Every successful call gets its own ``llm_calls`` row on the same answer.
 """
 
 from __future__ import annotations
 
 import time
 import uuid
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
@@ -32,15 +42,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from footnote_rag.answering.footnotes import SourceRef, build_footnotes
 from footnote_rag.answering.llm import NO_EVIDENCE_TEXT, LLMClient, LLMError, LLMResponse
+from footnote_rag.answering.number_check import MAX_REPORTED, UngroundedNumber, ungrounded_numbers
 from footnote_rag.answering.prompt import SYSTEM_PROMPT, build_messages, source_id
 from footnote_rag.audit.service import Actions, record
 from footnote_rag.config import Settings, get_settings
 from footnote_rag.db.models import Answer, Document, LlmCall, Question, User
+from footnote_rag.observability import get_logger
 from footnote_rag.retrieval.embedder import Embedder, EmbeddingError
 from footnote_rag.retrieval.search import RetrievedChunk, prefer_statement_scope, search_chunks
 from footnote_rag.usage.pricing import compute_cost
 
+log = get_logger(__name__)
+
 REFUSAL_TEXT = "모델이 이 요청에 대한 답변을 거절했습니다. 담당자 검토가 필요합니다."
+
+# Review reasons another model might fix. Retrieval reasons (no_retrieval_results,
+# low_retrieval_score) and review_mode_always do not depend on the model.
+ESCALATION_REASONS = frozenset({"refusal", "truncated", "no_citations", "ungrounded_number"})
+# LLMError codes that escalate: 502 = the output was unusable (e.g. invalid JSON). 503 (server
+# unreachable, model missing) and 504 (timeout) would not get better with another model.
+ESCALATION_STATUS_CODES = frozenset({502})
 
 
 class DocumentScopeError(Exception):
@@ -66,6 +87,12 @@ class AskResult:
     usage: dict[str, Any]
     latency_ms: int
     retrieved: int
+    # Cascade: the fallback model was called, and the model ids called, in order.
+    escalated: bool = False
+    models: list[str] = field(default_factory=list)
+    escalation_reasons: list[str] = field(default_factory=list)
+    # Numbers of the final answer missing from their cited chunks (number_check).
+    ungrounded_numbers: list[UngroundedNumber] = field(default_factory=list)
 
 
 def to_source_refs(chunks: list[RetrievedChunk]) -> list[SourceRef]:
@@ -90,9 +117,12 @@ def review_reasons(
     footnote_count: int,
     settings: Settings,
     top_score: float | None = None,
+    ungrounded_numbers: Sequence[object] = (),
 ) -> list[str]:
     """Review reasons; ``top_score`` (default: best score in ``retrieved``) is compared with
-    ``MIN_RETRIEVAL_SCORE``. ``ask_question`` passes the pre-reordering candidate maximum."""
+    ``MIN_RETRIEVAL_SCORE``. ``ask_question`` passes the pre-reordering candidate maximum.
+    ``ungrounded_numbers`` (``number_check.ungrounded_numbers``) adds ``ungrounded_number`` when
+    ``NUMBER_GROUNDING_CHECK=review``."""
     reasons: list[str] = []
     if llm_response is not None and llm_response.stop_reason == "refusal":
         reasons.append("refusal")
@@ -108,6 +138,8 @@ def review_reasons(
         reasons.append("low_retrieval_score")
     if footnote_count == 0 and "refusal" not in reasons:
         reasons.append("no_citations")
+    if ungrounded_numbers and settings.number_grounding_check == "review":
+        reasons.append("ungrounded_number")
     if not reasons and settings.review_mode == "always":
         reasons.append("review_mode_always")
     return reasons
@@ -186,6 +218,74 @@ async def retrieve(
     return result.chunks
 
 
+@dataclass
+class _Attempt:
+    """One LLM response (or none: nothing retrieved) turned into text, footnotes and reasons."""
+
+    response: LLMResponse | None
+    text: str
+    footnotes: list[dict[str, Any]]
+    ungrounded: list[UngroundedNumber]
+    reasons: list[str]
+
+
+def _evaluate(
+    question: str, retrieval: Retrieval, response: LLMResponse | None, settings: Settings
+) -> _Attempt:
+    retrieved = retrieval.chunks
+    ungrounded: list[UngroundedNumber] = []
+    if response is None:
+        text, footnotes = NO_EVIDENCE_TEXT, []
+    elif response.stop_reason == "refusal":
+        text, footnotes = REFUSAL_TEXT, []
+    else:
+        built = build_footnotes(response.content, to_source_refs(retrieved))
+        method = response.citation_method
+        text = built.text or NO_EVIDENCE_TEXT
+        footnotes = [{**f, "citation_method": method} for f in built.footnotes]
+        if settings.number_grounding_check != "off":
+            ungrounded = ungrounded_numbers(
+                response.content,
+                [c.text for c in retrieved],
+                question,
+                sources=[source_id(c.document_id, c.chunk_id) for c in retrieved],
+            )
+            if ungrounded:
+                log.warning(
+                    "answer.ungrounded_numbers",
+                    model=response.model,
+                    count=len(ungrounded),
+                    numbers=[u.text for u in ungrounded[:MAX_REPORTED]],
+                )
+    reasons = review_reasons(
+        retrieved=retrieved,
+        llm_response=response,
+        footnote_count=len(footnotes),
+        settings=settings,
+        top_score=retrieval.top_score,
+        ungrounded_numbers=ungrounded,
+    )
+    return _Attempt(response, text, footnotes, ungrounded, reasons)
+
+
+def _client_model(llm: LLMClient) -> str:
+    return str(getattr(llm, "model_id", None) or getattr(llm, "model", "unknown"))
+
+
+async def _record_failure(session: AsyncSession, user: User, exc: LLMError) -> None:
+    org_id, user_id = user.org_id, user.id  # read before rollback expires `user`
+    await session.rollback()
+    record(
+        session,
+        action=Actions.QUESTION_FAILED,
+        org_id=org_id,
+        actor_user_id=user_id,
+        target_type="question",
+        metadata={"status_code": exc.status_code, "reason": exc.public_message},
+    )
+    await session.commit()
+
+
 async def ask_question(
     session: AsyncSession,
     *,
@@ -195,6 +295,7 @@ async def ask_question(
     embedder: Embedder,
     llm: LLMClient,
     settings: Settings,
+    fallback_llm: LLMClient | None = None,
 ) -> AskResult:
     started = time.perf_counter()
     retrieval = await retrieve_ranked(
@@ -208,43 +309,57 @@ async def ask_question(
     )
     retrieved = retrieval.chunks
 
-    llm_response: LLMResponse | None = None
+    responses: list[LLMResponse] = []
+    models: list[str] = []
+    escalation_reasons: list[str] = []
+    escalation_error: int | None = None
     if not retrieved:
-        text, footnotes = NO_EVIDENCE_TEXT, []
+        final = _evaluate(question, retrieval, None, settings)
     else:
+        messages = build_messages(question, retrieved)
+        primary: LLMResponse | None = None
         try:
-            llm_response = await llm.answer(
-                system=SYSTEM_PROMPT, messages=build_messages(question, retrieved)
-            )
+            primary = await llm.answer(system=SYSTEM_PROMPT, messages=messages)
         except LLMError as exc:
-            org_id, user_id = user.org_id, user.id  # read before rollback expires `user`
-            await session.rollback()
-            record(
-                session,
-                action=Actions.QUESTION_FAILED,
-                org_id=org_id,
-                actor_user_id=user_id,
-                target_type="question",
-                metadata={"status_code": exc.status_code, "reason": exc.public_message},
+            if fallback_llm is None or exc.status_code not in ESCALATION_STATUS_CODES:
+                await _record_failure(session, user, exc)
+                raise
+            models.append(_client_model(llm))
+            escalation_reasons = [f"llm_error_{exc.status_code}"]
+        if primary is not None:
+            responses.append(primary)
+            models.append(primary.model)
+            final = _evaluate(question, retrieval, primary, settings)
+            if fallback_llm is not None and ESCALATION_REASONS.intersection(final.reasons):
+                escalation_reasons = list(final.reasons)
+        if fallback_llm is not None and escalation_reasons:
+            log.info(
+                "answer.escalating",
+                primary=models[0],
+                fallback=_client_model(fallback_llm),
+                reasons=escalation_reasons,
             )
-            await session.commit()
-            raise
-        if llm_response.stop_reason == "refusal":
-            text, footnotes = REFUSAL_TEXT, []
-        else:
-            built = build_footnotes(llm_response.content, to_source_refs(retrieved))
-            method = llm_response.citation_method
-            text = built.text or NO_EVIDENCE_TEXT
-            footnotes = [{**f, "citation_method": method} for f in built.footnotes]
-
-    reasons = review_reasons(
-        retrieved=retrieved,
-        llm_response=llm_response,
-        footnote_count=len(footnotes),
-        settings=settings,
-        top_score=retrieval.top_score,
-    )
-    status = "pending_review" if reasons else "published"
+            try:
+                second = await fallback_llm.answer(system=SYSTEM_PROMPT, messages=messages)
+            except LLMError as exc:
+                if primary is None:
+                    await _record_failure(session, user, exc)
+                    raise
+                # The primary answer is still usable (it goes to review): keep it.
+                models.append(_client_model(fallback_llm))
+                escalation_error = exc.status_code
+                log.warning(
+                    "answer.escalation_failed",
+                    fallback=_client_model(fallback_llm),
+                    status_code=exc.status_code,
+                )
+            else:
+                responses.append(second)
+                models.append(second.model)
+                final = _evaluate(question, retrieval, second, settings)
+    escalated = bool(escalation_reasons)
+    status = "pending_review" if final.reasons else "published"
+    reported_numbers = [u.text for u in final.ungrounded[:MAX_REPORTED]]
 
     q = Question(id=uuid.uuid4(), org_id=user.org_id, asked_by=user.id, text=question)
     session.add(q)
@@ -253,15 +368,14 @@ async def ask_question(
         id=uuid.uuid4(),
         question_id=q.id,
         org_id=user.org_id,
-        text=text,
-        footnotes=footnotes,
+        text=final.text,
+        footnotes=final.footnotes,
         status=status,
-        review_reason=",".join(reasons) or None,
+        review_reason=",".join(final.reasons) or None,
     )
     session.add(answer)
     await session.flush()
 
-    cost: Decimal | None = None
     usage_out: dict[str, Any] = {
         "model": None,
         "input_tokens": 0,
@@ -270,33 +384,57 @@ async def ask_question(
         "cache_creation_input_tokens": 0,
         "cost_usd": "0.0000",
     }
-    if llm_response is not None:
-        cost = compute_cost(llm_response.model, llm_response.usage, settings.llm_prices)
+    costs: list[Decimal | None] = []
+    for response in responses:
+        cost = compute_cost(response.model, response.usage, settings.llm_prices)
+        costs.append(cost)
         session.add(
             LlmCall(
                 id=uuid.uuid4(),
                 org_id=user.org_id,
                 answer_id=answer.id,
-                model=llm_response.model,
-                input_tokens=llm_response.usage.input_tokens,
-                output_tokens=llm_response.usage.output_tokens,
-                cache_read_input_tokens=llm_response.usage.cache_read_input_tokens,
-                cache_creation_input_tokens=llm_response.usage.cache_creation_input_tokens,
+                model=response.model,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                cache_read_input_tokens=response.usage.cache_read_input_tokens,
+                cache_creation_input_tokens=response.usage.cache_creation_input_tokens,
                 cost_usd=cost,
-                latency_ms=llm_response.latency_ms,
-                stop_reason=llm_response.stop_reason,
-                dropped_source_refs=llm_response.dropped_source_refs,
+                latency_ms=response.latency_ms,
+                stop_reason=response.stop_reason,
+                dropped_source_refs=response.dropped_source_refs,
             )
         )
+    if final.response is not None:
+        # Model of the answer that was kept; tokens and cost cover every call (cascade: both).
+        total_cost = (
+            sum((c for c in costs if c is not None), Decimal(0))
+            if all(c is not None for c in costs)
+            else None
+        )
         usage_out = {
-            "model": llm_response.model,
-            "input_tokens": llm_response.usage.input_tokens,
-            "output_tokens": llm_response.usage.output_tokens,
-            "cache_read_input_tokens": llm_response.usage.cache_read_input_tokens,
-            "cache_creation_input_tokens": llm_response.usage.cache_creation_input_tokens,
-            "cost_usd": f"{cost:.4f}" if cost is not None else None,
+            "model": final.response.model,
+            "input_tokens": sum(r.usage.input_tokens for r in responses),
+            "output_tokens": sum(r.usage.output_tokens for r in responses),
+            "cache_read_input_tokens": sum(r.usage.cache_read_input_tokens for r in responses),
+            "cache_creation_input_tokens": sum(
+                r.usage.cache_creation_input_tokens for r in responses
+            ),
+            "cost_usd": f"{total_cost:.4f}" if total_cost is not None else None,
         }
 
+    asked_metadata: dict[str, Any] = {
+        "question_chars": len(question),
+        "document_ids": [str(d) for d in document_ids or []],
+        "retrieved": len(retrieved),
+        "top_score": round(retrieval.top_score or 0.0, 4),
+        "escalated": escalated,
+        "escalation_reasons": escalation_reasons,
+        "ungrounded_numbers": reported_numbers,
+    }
+    if escalated:
+        asked_metadata["models"] = models
+    if escalation_error is not None:
+        asked_metadata["escalation_error"] = escalation_error
     record(
         session,
         action=Actions.QUESTION_ASKED,
@@ -304,12 +442,7 @@ async def ask_question(
         actor_user_id=user.id,
         target_type="question",
         target_id=q.id,
-        metadata={
-            "question_chars": len(question),
-            "document_ids": [str(d) for d in document_ids or []],
-            "retrieved": len(retrieved),
-            "top_score": round(retrieval.top_score or 0.0, 4),
-        },
+        metadata=asked_metadata,
     )
     record(
         session,
@@ -322,10 +455,10 @@ async def ask_question(
             "question_id": str(q.id),
             "status": status,
             "review_reason": answer.review_reason,
-            "footnote_count": len(footnotes),
-            "llm_called": llm_response is not None,
+            "footnote_count": len(final.footnotes),
+            "llm_called": bool(responses),
             "model": usage_out["model"],
-            "stop_reason": llm_response.stop_reason if llm_response else None,
+            "stop_reason": final.response.stop_reason if final.response else None,
             "cost_usd": usage_out["cost_usd"],
         },
     )
@@ -333,8 +466,12 @@ async def ask_question(
     await session.refresh(answer)
     return AskResult(
         answer=answer,
-        footnotes=footnotes,
+        footnotes=final.footnotes,
         usage=usage_out,
         latency_ms=int((time.perf_counter() - started) * 1000),
         retrieved=len(retrieved),
+        escalated=escalated,
+        models=models,
+        escalation_reasons=escalation_reasons,
+        ungrounded_numbers=final.ungrounded,
     )

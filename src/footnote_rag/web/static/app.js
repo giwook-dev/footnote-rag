@@ -919,6 +919,14 @@
       ["연결", yesNo(data.connected, "확인 안 함")],
       ["모델 있음", yesNo(data.model_available, "—")],
     ];
+    if (data.fallback) {
+      // Local cascade (LOCAL_LLM_FALLBACK_MODEL): one line for the fallback model.
+      const fb = data.fallback;
+      stats.push([
+        "상향 모델",
+        `${String(fb.model || "—")} · 연결 ${yesNo(fb.connected, "확인 안 함")} · 모델 ${yesNo(fb.model_available, "—")}`,
+      ]);
+    }
     $("llm-status").replaceChildren(
       ...stats.map(([label, value]) =>
         el("div", {}, [el("dt", { text: label }), el("dd", { text: value })]),

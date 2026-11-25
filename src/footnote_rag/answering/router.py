@@ -1,9 +1,10 @@
 """질문·답변·검색 엔드포인트(``POST /questions``, ``GET /answers/{id}``, ``POST /search``, ``GET /llm/status``).
 
 역할: 서비스 예외를 HTTP 상태(404/503/502/504)로 바꾸고, member에게는 검토 대기 답변 본문을 숨긴다.
-``GET /llm/status``(admin)는 현재 LLM 제공자·모델·연결 상태를 돌려준다(``/readyz``와 별개).
+``GET /llm/status``(admin)는 현재 LLM 제공자·모델·연결 상태를 돌려준다(``/readyz``와 별개). 로컬 상향이 켜져
+있으면(``LOCAL_LLM_FALLBACK_MODEL``) ``fallback`` 필드에 fallback 모델의 연결·존재 여부를 더한다.
 주요 요소: ``post_question``, ``get_answer``, ``search``, ``llm_status``, ``_visible_to``,
-``get_embedder``·``get_llm``(app.state).
+``get_embedder``·``get_llm``·``get_fallback_llm``(app.state).
 호출 관계: ``answering.service``의 ``ask_question``·``retrieve``를 호출한다. ``mcp_server``도 이 API를 쓴다.
 학습 문서: docs/study/02-request-walkthrough.md
 
@@ -48,6 +49,11 @@ def get_llm(request: Request) -> LLMClient:
     return request.app.state.llm
 
 
+def get_fallback_llm(request: Request) -> LLMClient | None:
+    """Local cascade target (``LOCAL_LLM_FALLBACK_MODEL``); None = no cascade."""
+    return getattr(request.app.state, "fallback_llm", None)
+
+
 class QuestionIn(BaseModel):
     question: str = Field(min_length=2, max_length=2000)
     document_ids: list[uuid.UUID] | None = None
@@ -82,6 +88,13 @@ class SearchHit(BaseModel):
     dart_url: str | None
 
 
+class FallbackStatusOut(BaseModel):
+    model: str
+    connected: bool | None
+    model_available: bool | None
+    detail: str | None = None
+
+
 class LLMStatusOut(BaseModel):
     provider: str
     model: str
@@ -90,6 +103,8 @@ class LLMStatusOut(BaseModel):
     connected: bool | None
     model_available: bool | None
     detail: str | None = None
+    # Only present when the local cascade is on (LOCAL_LLM_FALLBACK_MODEL).
+    fallback: FallbackStatusOut | None = None
 
 
 def _visible_to(user: User, status: str) -> bool:
@@ -103,6 +118,7 @@ async def post_question(
     session: AsyncSession = Depends(get_session),
     embedder: Embedder = Depends(get_embedder),
     llm: LLMClient = Depends(get_llm),
+    fallback_llm: LLMClient | None = Depends(get_fallback_llm),
 ) -> AnswerOut:
     try:
         result = await ask_question(
@@ -113,6 +129,7 @@ async def post_question(
             embedder=embedder,
             llm=llm,
             settings=get_settings(),
+            fallback_llm=fallback_llm,
         )
     except DocumentScopeError:
         raise HTTPException(status_code=404, detail="Document not found") from None
@@ -157,21 +174,46 @@ async def get_answer(
     )
 
 
-@router.get("/llm/status", response_model=LLMStatusOut, tags=["ops"])
+async def _fallback_status(fallback_llm: LLMClient) -> FallbackStatusOut:
+    status = getattr(fallback_llm, "status", None)
+    model = str(getattr(fallback_llm, "model", "unknown"))
+    if not callable(status):
+        return FallbackStatusOut(model=model, connected=None, model_available=None)
+    data = await status()
+    return FallbackStatusOut(
+        model=str(data.get("model") or model),
+        connected=data.get("connected"),
+        model_available=data.get("model_available"),
+        detail=data.get("detail"),
+    )
+
+
+# exclude_unset: ``fallback`` appears only when the cascade is on (the other fields are always set).
+@router.get(
+    "/llm/status", response_model=LLMStatusOut, response_model_exclude_unset=True, tags=["ops"]
+)
 async def llm_status(
     _user: User = Depends(require_role(*ADMINS)),
     llm: LLMClient = Depends(get_llm),
+    fallback_llm: LLMClient | None = Depends(get_fallback_llm),
 ) -> LLMStatusOut:
-    """Current LLM provider, model and reachability (local: ``GET {base}/api/tags``, 3 s)."""
+    """Current LLM provider, model and reachability (local: ``GET {base}/api/tags``, 3 s), plus
+    the cascade fallback model's reachability when ``LOCAL_LLM_FALLBACK_MODEL`` is set."""
     status = getattr(llm, "status", None)
     if callable(status):
-        return LLMStatusOut(**await status())
-    return LLMStatusOut(
-        provider=str(getattr(llm, "provider", "unknown")),
-        model=str(getattr(llm, "model", "unknown")),
-        connected=None,
-        model_available=None,
-    )
+        out = LLMStatusOut(**await status())
+    else:
+        out = LLMStatusOut(
+            provider=str(getattr(llm, "provider", "unknown")),
+            model=str(getattr(llm, "model", "unknown")),
+            base_url=None,
+            connected=None,
+            model_available=None,
+            detail=None,
+        )
+    if fallback_llm is not None:
+        out.fallback = await _fallback_status(fallback_llm)
+    return out
 
 
 @router.post("/search", response_model=list[SearchHit])

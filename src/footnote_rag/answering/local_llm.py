@@ -3,10 +3,10 @@
 역할: ``search_result`` 블록을 ``[n] 제목\\n본문`` 목록으로 바꿔 Ollama ``/api/chat``에 보내고, 문장별 근거 번호
 JSON을 검증해 Claude와 같은 모양의 text 블록 + ``search_result_location`` citations로 바꾼다. 그래서 각주 번호
 매기기(``footnotes.build_footnotes``)와 신뢰도·검토·감사·사용량 흐름을 그대로 탄다.
-주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``status``), ``parse_local_answer``,
+주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``status``, ``warm_up``), ``parse_local_answer``,
 ``salvage_local_answer``, ``to_content_blocks``.
-호출 관계: ``providers.make_llm``이 ``LLM_PROVIDER=local``일 때 만들고 ``answering.service.ask_question``이
-``answer``를 호출한다. ``GET /llm/status``가 ``status``를 호출한다.
+호출 관계: ``providers.make_local_llm``이 만들고(``make_llm``·``make_fallback_llm``·비교 Eval) ``answering.service.ask_question``이
+``answer``를 호출한다. ``GET /llm/status``가 ``status``를, 비교 Eval이 ``status``(사전 점검)와 ``warm_up``(예열)을 호출한다.
 학습 문서: docs/study/06-claude-citations.md (로컬 모델 경로), docs/adr/0008-local-llm-ollama.md
 
 Ollama-backed ``LLMClient``.
@@ -14,6 +14,8 @@ Ollama-backed ``LLMClient``.
 * native ``POST {base}/api/chat`` (not the OpenAI-compatible endpoint, which ignores
   ``num_ctx`` and can silently truncate long prompts), ``stream: false``,
   ``format: LOCAL_ANSWER_SCHEMA``, ``options: {num_ctx, num_predict, temperature}``, ``think``
+  (a bool, or a level string such as ``"low"`` for gpt-oss, sent as-is)
+* ``warm_up``: ``POST {base}/api/generate`` with an empty prompt loads the model; never raises
 * invalid JSON / schema -> one retry; a second failure -> ``LLMError(502)``.
   ``done_reason == "length"`` is not retried: complete sentences are salvaged and the answer is
   flagged ``truncated`` (pending review)
@@ -47,7 +49,7 @@ from footnote_rag.answering.prompt import (
     LOCAL_SYSTEM_PROMPT,
     build_local_user_prompt,
 )
-from footnote_rag.config import LOCAL_MODEL_PREFIX
+from footnote_rag.config import LOCAL_MODEL_PREFIX, ThinkSetting
 from footnote_rag.observability import get_logger
 
 log = get_logger(__name__)
@@ -232,7 +234,7 @@ class OllamaClient:
         num_ctx: int = 16384,
         max_tokens: int = 2048,
         timeout: float = 180.0,
-        think: bool = False,
+        think: ThinkSetting = False,
         temperature: float = 0.0,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -275,8 +277,34 @@ class OllamaClient:
     def _client(self, timeout: httpx.Timeout) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=self.base_url, timeout=timeout, transport=self._transport)
 
+    def _request_timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(self.timeout, connect=min(self.timeout, CONNECT_TIMEOUT_SECONDS))
+
+    async def warm_up(self) -> bool:
+        """Load the model into memory (``POST /api/generate`` with an empty prompt) before timing.
+
+        Never raises: a failure is logged as a warning and returns False.
+        """
+        body = {"model": self.model, "prompt": "", "stream": False}
+        started = time.perf_counter()
+        try:
+            async with self._client(self._request_timeout()) as client:
+                resp = await client.post("/api/generate", json=body)
+        except Exception as exc:  # noqa: BLE001 - warm-up is best effort
+            log.warning("llm.local_warm_up_failed", model=self.model, error=type(exc).__name__)
+            return False
+        if resp.status_code >= 400:
+            log.warning("llm.local_warm_up_failed", model=self.model, status=resp.status_code)
+            return False
+        log.info(
+            "llm.local_warm_up",
+            model=self.model,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return True
+
     async def _chat(self, body: dict[str, Any]) -> dict[str, Any]:
-        timeout = httpx.Timeout(self.timeout, connect=min(self.timeout, CONNECT_TIMEOUT_SECONDS))
+        timeout = self._request_timeout()
         try:
             async with self._client(timeout) as client:
                 resp = await client.post("/api/chat", json=body)

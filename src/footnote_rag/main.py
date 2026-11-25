@@ -2,7 +2,7 @@
 
 역할: 라우터를 묶고, 요청마다 ``X-Request-ID``를 붙이는 미들웨어와 ``/healthz``·``/readyz``를 둔다.
 빌드 없는 웹 화면(``web/static``)을 ``/ui``에 마운트하고 ``/ui`` 응답에만 CSP 등 보안 헤더를 붙인다(``/``는 ``/ui/``로 리다이렉트).
-주요 요소: ``create_app``(앱 조립), ``lifespan``(로깅 설정, 운영 JWT 검사, 임베더·LLM 생성).
+주요 요소: ``create_app``(앱 조립), ``lifespan``(로깅 설정, 운영 JWT 검사, 임베더·LLM·상향용 fallback LLM 생성).
 호출 관계: uvicorn이 ``app``을 띄우고, 앱은 각 ``*/router.py``와 ``providers``를 호출한다.
 학습 문서: docs/study/01-big-picture.md, docs/study/09-testing-and-ops.md
 
@@ -33,7 +33,7 @@ from footnote_rag.dart.router import router as dart_router
 from footnote_rag.db.session import dispose_engine, get_sessionmaker
 from footnote_rag.documents.router import router as documents_router
 from footnote_rag.observability import configure_logging, get_logger, request_id_var
-from footnote_rag.providers import make_embedder, make_llm
+from footnote_rag.providers import make_embedder, make_fallback_llm, make_llm
 from footnote_rag.reviews.router import router as reviews_router
 from footnote_rag.usage.router import router as usage_router
 
@@ -73,12 +73,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.embedder = make_embedder(settings)
     if not hasattr(app.state, "llm"):
         app.state.llm = make_llm(settings)
+    if not hasattr(app.state, "fallback_llm"):
+        # Local cascade target; None unless LLM_PROVIDER=local and LOCAL_LLM_FALLBACK_MODEL is set.
+        app.state.fallback_llm = make_fallback_llm(settings)
     log.info(
         "app.started",
         llm=settings.llm_mode,
         embedder=settings.embedder_mode,
         dart=settings.dart_mode,
         model=getattr(app.state.llm, "model", None),
+        fallback_model=getattr(app.state.fallback_llm, "model", None),
     )
     yield
     await dispose_engine()
