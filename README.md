@@ -42,7 +42,8 @@ Claude는 API 크레딧이 없어 아직 돌리지 않았습니다. 크레딧을
 - **약점은 모델이 근거 번호를 고르는 단계입니다.** `samsung-04`, `naver-01`, `naver-04`, `hyundai-03`은 기대 목차가 검색됐는데도 각주가 모두 다른 목차를 가리켰고, 비교 질문 `compare-03`은 각주 5개 중 1개만 맞았습니다. 로컬 모델은 Citations API 없이 근거 번호를 직접 고릅니다([ADR 0008](docs/adr/0008-local-llm-ollama.md)). 다음 실행부터는 리포트의 "Citation diagnostics" 표(기대 목차, 검색 상위 k의 경로·유사도, 모델이 인용한 경로)로 문항별 원인을 바로 확인할 수 있습니다.
 - 비교 질문 `compare-02`, `compare-04`는 검색은 성공했지만 검토 대기(`pending_review`)로 가서 답하지 않았습니다. 리포트의 새 지표 "answerable answered rate"·"false abstentions"가 이 경우를 따로 셉니다.
 - **파서 수정의 효과**: 원문 XML 오류 문자를 정리하기 전에는 NAVER 보고서가 11개, 현대차 보고서가 6개 섹션으로 무너져 한 섹션에 수십만 자가 들어갔고, 목차 경로가 근거 위치를 가리키지 못했습니다. 수정 후 삼성전자 110개, NAVER 117개, 현대자동차 125개 섹션으로 나뉩니다([docs/data-sources.md](docs/data-sources.md)).
-- 이 리포트의 "Import failures"(`20260318001394: processing None`)는 Eval과 compose의 `worker` 서비스가 같은 큐를 처리하면서 생긴 오판입니다. 현대차 문항은 정상 채점됐습니다. 지금은 Eval이 등록한 문서가 모두 `ready`/`failed`가 될 때까지 기다립니다([Eval](#eval)).
+- **재측정과 진단(2026-11-25)**: 같은 로컬 모델로 다시 측정했습니다([evals/reports/20261125T020155Z-live-local-qwen3-14b.md](evals/reports/20261125T020155Z-live-local-qwen3-14b.md)). recall@8 95.2%, 인용 정확도 61.3%(19/31, 검색 성공 문항만 63.3%), answered 90.5%(19/21, false abstention `compare-02`·`compare-04`), 답할 수 없는 질문 거절 100%, p50 12,132 ms / p95 25,120 ms입니다. Citation diagnostics를 보면 **틀린 각주 12개 중 9개는 기대한 연결재무제표 주석과 같은 주석을 별도재무제표 주석에서 인용한 경우**였습니다(예: 기대 `3. 연결재무제표 주석 > 12. 차입금 (연결)` / 인용 `5. 재무제표 주석 > 12. 차입금`). 대부분 기대 섹션도 검색 1~4위 안에 있었지만 별도 주석 청크가 더 높은 순위였습니다. 실제 오류는 3개(`naver-02` 검색 실패, `naver-04`·`hyundai-03` 다른 주석 인용)입니다. 그래서 질문이 별도를 지정하지 않으면 연결 주석을 우선하도록 했습니다. 검색은 후보를 넓게 가져와 대응하는 별도 청크를 뒤로 보내고(`PREFER_CONSOLIDATED`), 두 시스템 프롬프트에는 연결 주석 우선 규칙과 근거 제목의 `[연결]`/`[별도]` 표시를 넣었습니다. Eval에는 기존 엄격 지표를 그대로 두고, 대응 주석을 인정하는 보조 지표와 거절 문항 진단을 추가했습니다([ADR 0009](docs/adr/0009-prefer-consolidated-notes.md)). 위 표의 수치는 이 변경 전 측정값이며, 변경 후 수치는 다시 측정해 갱신합니다.
+- 2026-11-24 리포트의 "Import failures"(`20260318001394: processing None`)는 Eval과 compose의 `worker` 서비스가 같은 큐를 처리하면서 생긴 오판입니다. 현대차 문항은 정상 채점됐습니다. 지금은 Eval이 등록한 문서가 모두 `ready`/`failed`가 될 때까지 기다립니다([Eval](#eval)).
 
 ## 빠른 시작
 
@@ -218,7 +219,9 @@ FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`�
 | `EMBED_BATCH_MAX_RETRIES` | `6` | 429·일시 오류 시 **같은 배치만** 재시도하는 횟수. 다 쓰면 작업 단위 재시도로 넘김 |
 | `EMBED_RETRY_BASE_SECONDS` / `EMBED_RETRY_MAX_SECONDS` | `20` / `120` | 배치 재시도 대기 = `min(BASE × 2^n, MAX)` + 지터(최대 10%) |
 | `TOP_K` | `8` | 검색 청크 수 |
-| `MIN_RETRIEVAL_SCORE` | `0.35` | 최고 유사도가 이보다 낮으면 검토 대기 |
+| `PREFER_CONSOLIDATED` | `true` | 같은 문서에 연결 주석과 그 대응 별도 주석이 둘 다 검색되면 별도 청크를 뒤로 보냄. 질문에 "별도"·"개별"이 있으면 반대. `false`면 유사도 순 `TOP_K`개 그대로([ADR 0009](docs/adr/0009-prefer-consolidated-notes.md)) |
+| `RETRIEVAL_CANDIDATES` | `16` | `PREFER_CONSOLIDATED=true`일 때 재정렬 전에 가져오는 후보 수. 실제로는 `max(TOP_K, 이 값)` |
+| `MIN_RETRIEVAL_SCORE` | `0.35` | 최고 유사도가 이보다 낮으면 검토 대기. 재정렬 전 후보의 최고 유사도와 비교 |
 | `REVIEW_MODE` | `on_low_confidence` | `always`면 모든 답변을 검토 대기로 |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1500` / `200` | 문자 기준 |
 | `JOB_MAX_ATTEMPTS` | `5` | 작업 최대 시도 횟수 |
@@ -351,11 +354,12 @@ docker compose run --rm --no-deps -v "${PWD}/evals:/app/evals" api python -m foo
 
 실행기는 임시 조직을 만들어 데이터셋의 공시를 정상 서비스로 가져오기 등록하고, 자체 워커로 큐를 처리합니다. compose의 `worker` 서비스가 같은 DB에서 작업을 먼저 가져갈 수 있으므로, 큐가 비어도 **등록한 문서가 모두 `ready` 또는 `failed`가 될 때까지 2초 간격으로 DB를 확인하며 기다립니다**(그동안 자체 워커도 계속 큐를 처리하므로 서비스 워커가 없어도 됩니다). `--import-timeout`을 넘기면 그 문서는 "Import failures"에 `timeout(<상태>)`로 기록됩니다.
 
-리포트는 `evals/reports/{timestamp}-{mode}[-{provider}]-{model}.md`로 저장됩니다(예: `20261124T120000Z-live-local-qwen3-14b.md`, `…-live-real-claude-sonnet-5-5.md`, `…-fake-fake-llm.md`). 머리말에 제공자·모델·`citation_method`(`api_citation` / `model_reference`)와 문서별 가져오기 결과(섹션 수, 청크 수, 임베딩 토큰, 캐시 적중·미스. 값은 `jobs.result`)가 적혀 있어 Claude와 로컬 결과를 나란히 비교할 수 있습니다. 리포트 내용:
+리포트는 `evals/reports/{timestamp}-{mode}[-{provider}]-{model}.md`로 저장됩니다(예: `20261124T120000Z-live-local-qwen3-14b.md`, `…-live-real-claude-sonnet-5-5.md`, `…-fake-fake-llm.md`). 머리말에 제공자·모델·`citation_method`(`api_citation` / `model_reference`), 검색 설정(`prefer_consolidated`, `retrieval_candidates`)과 문서별 가져오기 결과(섹션 수, 청크 수, 임베딩 토큰, 캐시 적중·미스. 값은 `jobs.result`)가 적혀 있어 Claude와 로컬 결과를 나란히 비교할 수 있습니다. 리포트 내용:
 
-- **Metrics**: 검색 recall@k, 인용 정확도, 답하지 말아야 할 질문의 거절 비율, 평균 비용·지연시간, 그리고 answerable answered rate(답할 수 있는 질문 중 거절하지 않고 각주가 1개 이상인 비율), false abstentions(답할 수 있는데 거절한 문항 수와 id), 검색 성공 문항만으로 계산한 인용 정확도, 지연 p50/p95(nearest-rank).
-- **Metrics by question type**: 같은 지표를 문항 유형(id 접두어 `samsung`/`naver`/`hyundai`/`compare`/`unans`, 데이터셋에 `category` 필드가 있으면 그 값)별로 나눈 표.
-- **Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`. "정답이 검색됐는데 다른 근거를 골랐다"와 "정답이 검색되지 않았다"를 구분합니다. 본문 텍스트는 넣지 않습니다.
+- **Metrics**: 검색 recall@k, 인용 정확도, 답하지 말아야 할 질문의 거절 비율, 평균 비용·지연시간, 그리고 answerable answered rate(답할 수 있는 질문 중 거절하지 않고 각주가 1개 이상인 비율), false abstentions(답할 수 있는데 거절한 문항 수와 id), 검색 성공 문항만으로 계산한 인용 정확도, 지연 p50/p95(nearest-rank). 보조 지표 citation accuracy (consolidated/separate counterpart accepted)는 기대 목차의 연결↔별도 대응 주석(예: `5. 재무제표 주석 > 12. 차입금` ↔ `3. 연결재무제표 주석 > 12. 차입금 (연결)`)을 인용한 각주도 맞음으로 셉니다(전체·검색 성공 문항). 엄격한 인용 정확도는 그대로입니다.
+- **Metrics by question type**: 같은 지표를 문항 유형(id 접두어 `samsung`/`naver`/`hyundai`/`compare`/`unans`, 데이터셋에 `category` 필드가 있으면 그 값)별로 나눈 표. 끝의 두 열이 대응 주석 인정 정확도입니다.
+- **False abstention diagnostics**: 답할 수 있는데 거절한 문항마다 답변 상태, `review_reason`(`no_citations` = 모델이 쓸 만한 근거를 내지 않음, `low_retrieval_score` = 신뢰도 규칙 등), 검색 상위 k개의 `section_path`·유사도.
+- **Citation diagnostics**: 답할 수 있는 문항 중 각주가 하나라도 기대 목차 밖을 가리킨 문항마다 기대 목차 접두어, 검색 상위 k개의 `section_path`·유사도(기대 목차면 ✓), 모델이 인용한 `section_path`와 `counterpart` 열(대응 주석이면 ✓). "정답이 검색됐는데 다른 근거를 골랐다", "같은 주석의 별도재무제표 판을 인용했다"(separate-statement counterpart cited), "정답이 검색되지 않았다"를 구분합니다. 본문 텍스트는 넣지 않습니다.
 
 CI에서는 돌리지 않습니다. 데이터셋 구성과 측정 결과는 위 [Eval 결과 (실측)](#eval-결과-실측)을 보세요.
 

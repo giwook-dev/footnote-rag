@@ -85,9 +85,19 @@
 - 조직 조건을 `chunks.org_id`와 `documents.org_id` **양쪽**에 거는 것은 방어를 겹친 것이다([03](03-auth-rbac-isolation.md)). `status == "ready"` 조건 덕분에 처리 중이거나 실패한 문서의 청크는 검색되지 않는다.
 - 테스트: `tests/test_answering.py::test_search_is_scoped_to_org_ready_docs_and_document_ids`.
 
+### 3-1. 연결재무제표 주석 우선 재정렬
+
+사업보고서에는 같은 주석이 `3. 연결재무제표 주석`과 `5. 재무제표 주석`(별도)에 두 번 나온다. 문장이 거의 같아 유사도도 비슷하고, 별도 주석이 더 높게 나오기도 한다. 2026-11-25 실측에서 틀린 각주 12개 중 9개가 이 혼동이었다([ADR 0009](../adr/0009-prefer-consolidated-notes.md)).
+
+- `src/footnote_rag/dart/sections.py::statement_scope`는 경로의 `…재무제표 주석`을 보고 연결/별도를 가린다. `src/footnote_rag/dart/sections.py::note_key`는 앞 번호·`(연결)`·공백·"연결"을 지운 비교 키를 만든다. 그래서 `35. 특수관계자 등과의 거래 (연결)`과 `33. 특수관계자 등과의 거래`는 같은 키를 갖는다.
+- `src/footnote_rag/answering/service.py::retrieve_ranked`는 `PREFER_CONSOLIDATED=true`이면 후보를 `max(TOP_K, RETRIEVAL_CANDIDATES)`개(기본 16) 가져와 `src/footnote_rag/retrieval/search.py::prefer_statement_scope`로 최종 `TOP_K`를 고른다. 같은 문서에서 연결 주석과 대응하는 별도 청크를 맨 뒤로 보내고, 나머지는 유사도 순서를 지킨다. 질문에 "별도"·"개별"이 있으면 반대로 한다.
+- 별도 청크는 지우지 않는다. 자리가 남으면 뒤쪽에 들어간다. `false`면 기존과 같은 순수 top-k다.
+- 프롬프트도 함께 바꿨다. 근거 제목에 `[연결]`/`[별도]`가 붙고, 시스템 프롬프트에 연결 우선 규칙이 있다([06](06-claude-citations.md)).
+- 테스트: `tests/test_consolidated_preference.py::test_consolidated_counterpart_moves_ahead_and_other_order_is_kept`, `tests/test_consolidated_preference.py::test_retrieve_reorders_scopes_and_keeps_org_isolation`.
+
 ### 4. `MIN_RETRIEVAL_SCORE`: 검색 신뢰도 게이트
 
-`src/footnote_rag/answering/service.py::review_reasons`는 최고 점수가 `MIN_RETRIEVAL_SCORE`(기본 0.35)보다 낮으면 `low_retrieval_score`를 붙여 답변을 `pending_review`로 보낸다. 답변 자체는 만들어지지만 member에게 바로 공개되지 않는다.
+`src/footnote_rag/answering/service.py::review_reasons`는 최고 점수(재정렬 전 후보의 최고 유사도, `Retrieval.top_score`)가 `MIN_RETRIEVAL_SCORE`(기본 0.35)보다 낮으면 `low_retrieval_score`를 붙여 답변을 `pending_review`로 보낸다. 답변 자체는 만들어지지만 member에게 바로 공개되지 않는다.
 
 - 이 기본값을 **실제 Voyage 점수 분포로 보정한 기록은 저장소에 없다.** 실제 데이터와 Eval 데이터셋이 없기 때문이다.
 - 테스트 환경은 `MIN_RETRIEVAL_SCORE=0.05`를 쓴다(`tests/conftest.py`). Fake 임베더 점수는 실제 모델과 분포가 달라서다.
@@ -104,7 +114,7 @@
 **대안**
 - 로컬 임베딩 모델: 비용·외부 전송이 없지만 이미지 크기와 CPU 추론 지연이 늘고 한국어 회계 도메인 품질을 따로 검증해야 한다(ADR).
 - 키워드 검색(Postgres FTS, BM25): 숫자·고유명사 정확 일치에 강하지만 한국어 형태소 분석기가 필요하다(ADR).
-- 하이브리드 검색과 재랭킹(reranker): 이 저장소에는 **없다.** ADR은 Eval로 recall이 부족하다고 확인되면 검토하겠다고 적었다.
+- 하이브리드 검색과 재랭킹(reranker): 이 저장소에는 **없다.** ADR은 Eval로 recall이 부족하다고 확인되면 검토하겠다고 적었다. 연결/별도 재정렬(3-1)은 모델을 쓰지 않는 규칙 기반 재정렬로, 외부 reranker와는 다르다.
 - 토큰 기준 청킹: 모델 한도와 더 정확히 맞지만 토크나이저 의존성이 생긴다.
 
 **한계와 개선 방향**

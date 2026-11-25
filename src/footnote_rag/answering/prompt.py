@@ -2,7 +2,9 @@
 
 역할: 검색 청크마다 ``search_result`` 블록(source, title, content, citations on)을 만들고 끝에 질문을 붙인다.
 로컬(Ollama) 경로는 같은 블록을 ``[n] 제목\\n본문`` 형식의 번호 목록으로 바꿔 보낸다.
-주요 요소: ``SYSTEM_PROMPT``, ``build_messages``, ``source_id``(``doc:{document_id}#chunk:{chunk_id}``),
+근거 제목은 ``{문서 제목} · [연결] {section_path}``처럼 주석 종류 표시(``[연결]``/``[별도]``)를 붙이고, 두 시스템
+프롬프트는 질문이 별도를 지정하지 않으면 연결재무제표 주석을 근거로 쓰라고 지시한다(docs/adr/0009).
+주요 요소: ``SYSTEM_PROMPT``, ``build_messages``, ``source_title``, ``source_id``(``doc:{document_id}#chunk:{chunk_id}``),
 ``LOCAL_SYSTEM_PROMPT``, ``LOCAL_ANSWER_SCHEMA``, ``build_local_user_prompt``.
 호출 관계: ``answering.service``가 호출하고, ``source_id``는 각주 변환 때 청크를 다시 찾는 키가 된다.
 학습 문서: docs/study/06-claude-citations.md (프롬프트 설계)
@@ -14,7 +16,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from footnote_rag.dart.sections import labeled_section_path
 from footnote_rag.retrieval.search import RetrievedChunk
+
+# The system prompts stay fixed strings (no per-request values) so prompt caching keeps working.
 
 SYSTEM_PROMPT = """당신은 회계 감사보고서와 공시 문서를 근거로 질문에 답하는 분석 보조자입니다.
 
@@ -23,6 +28,7 @@ SYSTEM_PROMPT = """당신은 회계 감사보고서와 공시 문서를 근거�
 - 검색 결과에서 근거를 찾을 수 없으면 정확히 "제공된 문서에서 근거를 찾지 못했습니다."라고만 답합니다.
 - 숫자는 원문에 적힌 그대로 옮기고, 원문의 단위(예: 백만원, 천원, %)를 함께 표기합니다.
 - 여러 회사를 비교할 때는 회사별로 나누어 서술하고, 각 회사의 주장마다 그 회사 문서의 근거를 인용합니다.
+- 같은 내용이 연결재무제표 주석과 (별도)재무제표 주석에 모두 있으면, 질문이 별도재무제표를 지정하지 않는 한 연결재무제표 주석을 근거로 인용합니다. 검색 결과 제목의 [연결]·[별도] 표시로 구분합니다.
 - 답변은 한국어로, 간결한 문장으로 작성합니다."""
 
 
@@ -38,6 +44,7 @@ LOCAL_SYSTEM_PROMPT = """당신은 회계 감사보고서와 공시 문서를 �
 - 제공된 근거에서 답을 찾을 수 없으면 insufficient를 true로 하고 sentences는 빈 배열로 둡니다.
 - 숫자는 원문에 적힌 그대로 옮기고, 원문의 단위(예: 백만원, 천원, %)를 함께 표기합니다.
 - 여러 회사를 비교할 때는 회사별로 나누어 서술하고, 각 회사에 관한 문장에는 그 회사 문서의 근거 번호를 답니다.
+- 같은 내용이 연결재무제표 주석과 (별도)재무제표 주석에 모두 있으면, 질문이 별도재무제표를 지정하지 않는 한 연결재무제표 주석의 근거 번호를 씁니다. 근거 머리줄의 [연결]·[별도] 표시로 구분합니다.
 - 답변은 한국어로, 간결한 문장으로 작성합니다.
 - 출력은 {"insufficient": true|false, "sentences": [{"text": "문장", "sources": [근거 번호]}]} 형식의 JSON 하나뿐입니다."""
 
@@ -69,10 +76,10 @@ LOCAL_ANSWER_SCHEMA: dict[str, Any] = {
 
 
 def build_local_user_prompt(question: str, sources: list[tuple[str, str]]) -> str:
-    """``[n] {문서 제목} · {section_path}\\n{chunk text}`` per source, then the question.
+    """``[n] {문서 제목} · [연결] {section_path}\\n{chunk text}`` per source, then the question.
 
-    ``sources`` holds ``(title, text)`` pairs where title is already ``문서 제목 · section_path``
-    (the same title the ``search_result`` blocks carry).
+    ``sources`` holds ``(title, text)`` pairs where title is already ``source_title(chunk)``
+    (the same title the ``search_result`` blocks carry, scope label included).
     """
     parts = ["다음은 검색된 근거입니다. 각 근거 앞의 번호를 sources에 사용하세요.", ""]
     for n, (title, text) in enumerate(sources, start=1):
@@ -85,12 +92,18 @@ def source_id(document_id: Any, chunk_id: Any) -> str:
     return f"doc:{document_id}#chunk:{chunk_id}"
 
 
+def source_title(chunk: RetrievedChunk) -> str:
+    """``{문서 제목} · [연결] {section_path}``; the label is ``[별도]`` for separate notes and
+    absent outside the notes (``dart.sections.labeled_section_path``)."""
+    return f"{chunk.document_title} · {labeled_section_path(chunk.section_path)}"
+
+
 def build_messages(question: str, chunks: list[RetrievedChunk]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = [
         {
             "type": "search_result",
             "source": source_id(c.document_id, c.chunk_id),
-            "title": f"{c.document_title} · {c.section_path}",
+            "title": source_title(c),
             "content": [{"type": "text", "text": c.text}],
             "citations": {"enabled": True},
         }

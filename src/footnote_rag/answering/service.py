@@ -1,7 +1,8 @@
 """질문 답변 서비스: 검색 → Claude(search_result + citations) → 각주 → 검토 게이트 → 저장.
 
 역할: 질문 하나를 끝까지 처리하고 questions·answers·llm_calls·감사 로그 두 건을 한 트랜잭션으로 커밋한다.
-주요 요소: ``ask_question``, ``retrieve``, ``review_reasons``(신뢰도 규칙), ``to_source_refs``.
+주요 요소: ``ask_question``, ``retrieve``/``retrieve_ranked``(연결 주석 우선 재정렬 포함), ``review_reasons``(신뢰도 규칙),
+``to_source_refs``.
 호출 관계: ``answering.router``와 ``evals.run``이 호출하고, ``retrieval.search``, ``answering.llm``,
 ``answering.footnotes``, ``usage.pricing``, ``audit.service``를 호출한다.
 학습 문서: docs/study/02-request-walkthrough.md, docs/study/06-claude-citations.md
@@ -11,7 +12,8 @@ Question answering: retrieve -> Claude with search_result citations -> footnotes
 Review gate (``REVIEW_MODE=on_low_confidence``): an answer goes to ``pending_review`` when
   * the model refused (``refusal``),
   * retrieval returned nothing (``no_retrieval_results``; Claude is NOT called),
-  * the best similarity is below ``MIN_RETRIEVAL_SCORE`` (``low_retrieval_score``), or
+  * the best similarity is below ``MIN_RETRIEVAL_SCORE`` (``low_retrieval_score``; measured over
+    the candidates before the consolidated-first reordering, docs/adr/0009), or
   * the answer carries no footnotes (``no_citations``), or
   * the client flagged it (``LLMResponse.review_flags``, e.g. ``truncated`` for a local model).
 Otherwise it is ``published``. ``REVIEW_MODE=always`` sends every answer to review.
@@ -32,10 +34,10 @@ from footnote_rag.answering.footnotes import SourceRef, build_footnotes
 from footnote_rag.answering.llm import NO_EVIDENCE_TEXT, LLMClient, LLMError, LLMResponse
 from footnote_rag.answering.prompt import SYSTEM_PROMPT, build_messages, source_id
 from footnote_rag.audit.service import Actions, record
-from footnote_rag.config import Settings
+from footnote_rag.config import Settings, get_settings
 from footnote_rag.db.models import Answer, Document, LlmCall, Question, User
 from footnote_rag.retrieval.embedder import Embedder, EmbeddingError
-from footnote_rag.retrieval.search import RetrievedChunk, search_chunks
+from footnote_rag.retrieval.search import RetrievedChunk, prefer_statement_scope, search_chunks
 from footnote_rag.usage.pricing import compute_cost
 
 REFUSAL_TEXT = "모델이 이 요청에 대한 답변을 거절했습니다. 담당자 검토가 필요합니다."
@@ -47,6 +49,14 @@ class DocumentScopeError(Exception):
 
 class RetrievalUnavailableError(Exception):
     pass
+
+
+@dataclass
+class Retrieval:
+    """Final chunks plus the best similarity among the candidates before reordering."""
+
+    chunks: list[RetrievedChunk]
+    top_score: float | None
 
 
 @dataclass
@@ -79,7 +89,10 @@ def review_reasons(
     llm_response: LLMResponse | None,
     footnote_count: int,
     settings: Settings,
+    top_score: float | None = None,
 ) -> list[str]:
+    """Review reasons; ``top_score`` (default: best score in ``retrieved``) is compared with
+    ``MIN_RETRIEVAL_SCORE``. ``ask_question`` passes the pre-reordering candidate maximum."""
     reasons: list[str] = []
     if llm_response is not None and llm_response.stop_reason == "refusal":
         reasons.append("refusal")
@@ -89,7 +102,9 @@ def review_reasons(
         reasons.extend(f for f in flags if f not in reasons)
     if not retrieved:
         reasons.append("no_retrieval_results")
-    elif max(c.score for c in retrieved) < settings.min_retrieval_score:
+    elif (
+        top_score if top_score is not None else max(c.score for c in retrieved)
+    ) < settings.min_retrieval_score:
         reasons.append("low_retrieval_score")
     if footnote_count == 0 and "refusal" not in reasons:
         reasons.append("no_citations")
@@ -110,6 +125,44 @@ async def _check_document_scope(
         raise DocumentScopeError("document not found")
 
 
+async def retrieve_ranked(
+    session: AsyncSession,
+    *,
+    user: User,
+    query: str,
+    top_k: int,
+    document_ids: list[uuid.UUID] | None,
+    embedder: Embedder,
+    settings: Settings | None = None,
+) -> Retrieval:
+    """Vector search scoped to the caller's org, then the consolidated-first reordering.
+
+    ``PREFER_CONSOLIDATED=true``: fetch ``max(top_k, RETRIEVAL_CANDIDATES)`` candidates and pick
+    ``top_k`` with ``prefer_statement_scope``. ``false``: exactly the plain top-k search.
+    """
+    settings = settings or get_settings()
+    if document_ids:
+        await _check_document_scope(session, user.org_id, document_ids)
+    try:
+        q = await embedder.embed_query(query)
+    except EmbeddingError as exc:
+        raise RetrievalUnavailableError(str(exc)) from None
+    prefer = settings.prefer_consolidated
+    candidates = await search_chunks(
+        session,
+        org_id=user.org_id,
+        query_vector=q.vectors[0],
+        top_k=max(top_k, settings.retrieval_candidates) if prefer else top_k,
+        document_ids=document_ids or None,
+    )
+    top_score = max((c.score for c in candidates), default=None)
+    if prefer:
+        chunks = prefer_statement_scope(candidates, query=query, top_k=top_k)
+    else:
+        chunks = candidates
+    return Retrieval(chunks=chunks, top_score=top_score)
+
+
 async def retrieve(
     session: AsyncSession,
     *,
@@ -118,20 +171,19 @@ async def retrieve(
     top_k: int,
     document_ids: list[uuid.UUID] | None,
     embedder: Embedder,
+    settings: Settings | None = None,
 ) -> list[RetrievedChunk]:
-    if document_ids:
-        await _check_document_scope(session, user.org_id, document_ids)
-    try:
-        q = await embedder.embed_query(query)
-    except EmbeddingError as exc:
-        raise RetrievalUnavailableError(str(exc)) from None
-    return await search_chunks(
+    """Final (reordered) chunks of ``retrieve_ranked``; ``POST /search`` and the Eval use this."""
+    result = await retrieve_ranked(
         session,
-        org_id=user.org_id,
-        query_vector=q.vectors[0],
+        user=user,
+        query=query,
         top_k=top_k,
-        document_ids=document_ids or None,
+        document_ids=document_ids,
+        embedder=embedder,
+        settings=settings,
     )
+    return result.chunks
 
 
 async def ask_question(
@@ -145,14 +197,16 @@ async def ask_question(
     settings: Settings,
 ) -> AskResult:
     started = time.perf_counter()
-    retrieved = await retrieve(
+    retrieval = await retrieve_ranked(
         session,
         user=user,
         query=question,
         top_k=settings.top_k,
         document_ids=document_ids,
         embedder=embedder,
+        settings=settings,
     )
+    retrieved = retrieval.chunks
 
     llm_response: LLMResponse | None = None
     if not retrieved:
@@ -188,6 +242,7 @@ async def ask_question(
         llm_response=llm_response,
         footnote_count=len(footnotes),
         settings=settings,
+        top_score=retrieval.top_score,
     )
     status = "pending_review" if reasons else "published"
 
@@ -253,7 +308,7 @@ async def ask_question(
             "question_chars": len(question),
             "document_ids": [str(d) for d in document_ids or []],
             "retrieved": len(retrieved),
-            "top_score": round(max((c.score for c in retrieved), default=0.0), 4),
+            "top_score": round(retrieval.top_score or 0.0, 4),
         },
     )
     record(

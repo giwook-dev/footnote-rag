@@ -142,6 +142,11 @@ class Settings(BaseSettings):
 
     # --- retrieval / answering ---
     top_k: int = 8
+    # Consolidated notes first (docs/adr/0009): fetch max(top_k, retrieval_candidates) by
+    # similarity, then move a separate-statement note behind its consolidated counterpart from
+    # the same document (the reverse when the question says "별도"/"개별"). false = plain top_k.
+    prefer_consolidated: bool = True
+    retrieval_candidates: int = 16
     min_retrieval_score: float = 0.35
     review_mode: Literal["on_low_confidence", "always"] = "on_low_confidence"
 
