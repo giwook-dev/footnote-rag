@@ -3,10 +3,11 @@
 역할: ``search_result`` 블록을 ``[n] 제목\\n본문`` 목록으로 바꿔 Ollama ``/api/chat``에 보내고, 문장별 근거 번호
 JSON을 검증해 Claude와 같은 모양의 text 블록 + ``search_result_location`` citations로 바꾼다. 그래서 각주 번호
 매기기(``footnotes.build_footnotes``)와 신뢰도·검토·감사·사용량 흐름을 그대로 탄다.
-주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``chat_json``, ``status``, ``warm_up``, ``loaded_models``,
-``unload``), ``parse_local_answer``, ``salvage_local_answer``, ``to_content_blocks``.
+주요 요소: ``OllamaClient``(``request_body``, ``answer``, ``chat_json``, ``tools_request_body``, ``chat_tools``, ``status``,
+``warm_up``, ``loaded_models``, ``unload``), ``parse_local_answer``, ``salvage_local_answer``, ``to_content_blocks``.
 호출 관계: ``providers.make_local_llm``이 만들고(``make_llm``·``make_fallback_llm``·비교 Eval) ``answering.service.ask_question``이
-``answer``를 호출한다. ``comparison.service.summarize_note``(주석 변동 요약)가 범용 ``chat_json``을 호출한다. ``GET /llm/status``가 ``status``를, 비교 Eval이 ``status``(사전 점검), ``warm_up``(예열),
+``answer``를 호출한다. ``comparison.service.summarize_note``(주석 변동 요약)가 범용 ``chat_json``을 호출한다.
+``agent.runner``(도구 쓰는 에이전트)가 ``chat_tools``(``tools`` 포함, ``format`` 없음)를 호출한다. ``GET /llm/status``가 ``status``를, 비교 Eval이 ``status``(사전 점검), ``warm_up``(예열),
 ``unload``(쓰지 않는 모델 내리기)와 ``loaded_models``(GPU 적재율)를 호출한다. 앱은 모델을 내리지 않는다.
 학습 문서: docs/study/06-claude-citations.md (로컬 모델 경로), docs/adr/0008-local-llm-ollama.md
 
@@ -49,6 +50,8 @@ from footnote_rag.answering.llm import (
     LLMError,
     LLMResponse,
     LLMUsage,
+    ToolCall,
+    ToolChatResult,
 )
 from footnote_rag.answering.prompt import (
     LOCAL_ANSWER_SCHEMA,
@@ -236,6 +239,24 @@ def to_content_blocks(answer: LocalAnswer, results: list[dict[str, Any]]) -> Con
     if answer.insufficient or valid == 0:
         content = [{"type": "text", "text": NO_EVIDENCE_TEXT}]
     return ConvertedAnswer(content=content, dropped_source_refs=dropped, valid_refs=valid)
+
+
+def _tool_call(raw: Any) -> ToolCall | None:
+    """``{"function": {"name", "arguments"}}`` -> ``ToolCall``; arguments given as a JSON string
+    are parsed (an unparsable string is kept as is: the agent reports it to the model)."""
+    if not isinstance(raw, dict):
+        return None
+    fn = raw.get("function") if isinstance(raw.get("function"), dict) else raw
+    name = fn.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            pass
+    return ToolCall(name=name, arguments=args if args is not None else {})
 
 
 class OllamaClient:
@@ -475,6 +496,60 @@ class OllamaClient:
             usage=usage,
             latency_ms=latency_ms,
             done_reason=done_reason,
+            model_id=self.model_id,
+        )
+
+    def tools_request_body(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """``/api/chat`` body for a tool-calling turn: ``tools`` and no ``format`` (a JSON schema
+        would stop the model from calling tools). An empty ``tools`` list is left out."""
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "think": self.think,
+            "options": {
+                "num_ctx": self.num_ctx,
+                "num_predict": self.max_tokens,
+                "temperature": self.temperature,
+            },
+        }
+        if tools:
+            body["tools"] = tools
+        return body
+
+    async def chat_tools(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ToolChatResult:
+        """One model turn with tools (agent). Same transport and error mapping (503/504/502) as
+        ``answer``; no retry (the agent loop decides what to do with a turn). ``tool_calls``
+        arguments may come as an object or a JSON string; both are accepted."""
+        started = time.perf_counter()
+        data = await self._chat(self.tools_request_body(messages, tools))
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        usage = LLMUsage(
+            input_tokens=int(data.get("prompt_eval_count") or 0),
+            output_tokens=int(data.get("eval_count") or 0),
+        )
+        message = data.get("message") if isinstance(data.get("message"), dict) else {}
+        content = message.get("content")
+        calls = [
+            call for raw in message.get("tool_calls") or [] if (call := _tool_call(raw)) is not None
+        ]
+        log.info(
+            "llm.local_tool_turn",
+            model=self.model,
+            tool_calls=[c.name for c in calls],
+            done_reason=data.get("done_reason"),
+            latency_ms=latency_ms,
+        )
+        return ToolChatResult(
+            content=content if isinstance(content, str) else "",
+            tool_calls=calls,
+            usage=usage,
+            latency_ms=latency_ms,
+            done_reason=data.get("done_reason"),
             model_id=self.model_id,
         )
 

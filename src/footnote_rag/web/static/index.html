@@ -38,6 +38,7 @@
     <button type="button" role="tab" id="tab-documents" data-tab="documents" aria-controls="panel-documents" aria-selected="true">문서</button>
     <button type="button" role="tab" id="tab-questions" data-tab="questions" aria-controls="panel-questions" aria-selected="false">질문</button>
     <button type="button" role="tab" id="tab-diff" data-tab="diff" aria-controls="panel-diff" aria-selected="false">변동 분석</button>
+    <button type="button" role="tab" id="tab-agent" data-tab="agent" aria-controls="panel-agent" aria-selected="false">에이전트</button>
     <button type="button" role="tab" id="tab-reviews" data-tab="reviews" aria-controls="panel-reviews" aria-selected="false" hidden>검토 <span id="review-count" class="badge b-wait" hidden></span></button>
     <button type="button" role="tab" id="tab-admin" data-tab="admin" aria-controls="panel-admin" aria-selected="false" hidden>관리</button>
   </nav>
@@ -235,7 +236,71 @@
       </div>
     </section>
 
-    <!-- 탭 4. 검토 -->
+    <!-- 탭 4. 에이전트 (로컬 모델이 도구를 고르고, 코드가 실행·검증) -->
+    <section id="panel-agent" class="panel agent-split" role="tabpanel" aria-labelledby="tab-agent" hidden>
+      <div class="agent-main">
+        <div class="card">
+          <div class="card-head">
+            <h2>에이전트</h2>
+            <span class="note">로컬 모델이 도구를 골라 여러 단계로 답하고, 코드가 근거 번호와 숫자를 검증합니다</span>
+          </div>
+          <form id="agent-form" class="stack">
+            <label for="agent-question">질문</label>
+            <textarea id="agent-question" name="question" minlength="2" maxlength="2000" required placeholder="예: 삼성전자 2025 연결 부채비율과 전년 대비 변화는?"></textarea>
+            <div class="row">
+              <button id="agent-run-btn" type="submit" class="primary">실행</button>
+              <button id="agent-stop-btn" type="button" disabled>중지</button>
+              <span id="agent-model" class="note"></span>
+              <span id="agent-limits" class="note">로컬 모델 · 단계 최대 6 · 계산은 도구가 수행</span>
+            </div>
+            <div id="agent-examples" class="row chips" aria-label="예시 질문">
+              <span class="note">예시</span>
+              <button type="button" class="chip" data-agent-example="삼성전자 2025 연결 부채비율과 전년 대비 변화는?">부채비율과 전년 대비 변화</button>
+              <button type="button" class="chip" data-agent-example="현대차 우발부채 주석에서 전년 대비 새로 생긴 약정은?">우발부채 주석에서 새로 생긴 약정</button>
+              <button type="button" class="chip" data-agent-example="세 회사의 외부감사인을 비교하면?">세 회사 외부감사인 비교</button>
+            </div>
+          </form>
+        </div>
+
+        <div id="agent-timeline-card" class="card" hidden>
+          <div class="card-head">
+            <h2>단계</h2>
+            <div class="row">
+              <span id="agent-progress" class="row" hidden><span class="spinner" aria-hidden="true"></span><span id="agent-elapsed" class="note"></span></span>
+              <span id="agent-steps-meta" class="note"></span>
+            </div>
+          </div>
+          <ol id="agent-timeline" class="agent-tl" aria-live="polite" aria-label="실행 단계"></ol>
+        </div>
+
+        <div id="agent-answer-card" class="card" hidden>
+          <div class="card-head">
+            <h2>답</h2>
+            <span id="agent-status"></span>
+          </div>
+          <div id="agent-answer" class="agent-answer"></div>
+          <div id="agent-flags" class="agent-flags"></div>
+          <p class="note">계산은 모두 코드(calculate)가 수행했습니다. 회계적 판단은 담당자가 확정합니다.</p>
+        </div>
+      </div>
+
+      <aside class="agent-side">
+        <div id="agent-source-card" class="card agent-source">
+          <h3 id="agent-source-title">근거</h3>
+          <div id="agent-source" aria-live="polite"><p class="note">답의 [F1] 같은 근거 번호를 누르면 여기에 근거 내용이 나옵니다.</p></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h3>최근 실행</h3>
+            <button id="agent-recent-refresh" type="button" class="small">새로고침</button>
+          </div>
+          <ul id="agent-recent" class="agent-recent"></ul>
+          <p id="agent-recent-empty" class="note">아직 실행이 없습니다.</p>
+        </div>
+      </aside>
+    </section>
+
+    <!-- 탭 5. 검토 -->
     <section id="panel-reviews" class="panel" role="tabpanel" aria-labelledby="tab-reviews" hidden>
       <div class="card-head">
         <h2>검토 대기 답변</h2>
@@ -245,7 +310,7 @@
       <p id="reviews-empty" class="note" hidden>검토 대기 중인 답변이 없습니다.</p>
     </section>
 
-    <!-- 탭 5. 관리 -->
+    <!-- 탭 6. 관리 -->
     <section id="panel-admin" class="panel" role="tabpanel" aria-labelledby="tab-admin" hidden>
       <div class="card">
         <div class="card-head">
@@ -291,6 +356,8 @@
             <option value="review.decided"></option>
             <option value="comparison.created"></option>
             <option value="comparison.summarized"></option>
+            <option value="agent.run.started"></option>
+            <option value="agent.run.finished"></option>
           </datalist>
           <button type="submit" class="small">조회</button>
         </form>

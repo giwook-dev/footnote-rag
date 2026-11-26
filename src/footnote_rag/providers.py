@@ -43,6 +43,7 @@ def make_dart_client(settings: Settings | None = None) -> DartClient:
         _require(s.opendart_api_key, "OPENDART_API_KEY"),
         base_url=s.dart_base_url,
         timeout=s.dart_timeout_seconds,
+        fnltt_cache_dir=s.dart_dir / "fnltt",
     )
 
 

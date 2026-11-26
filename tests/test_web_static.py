@@ -371,6 +371,85 @@ def test_note_diff_detail_shows_tables_lines_and_local_summary():
     assert "grid-template-columns: minmax(0, 1fr) minmax(0, 2fr)" in css  # list 1/3, detail 2/3
 
 
+def test_agent_tab_markup_and_main_elements():
+    html = _read("index.html")
+    assert re.search(
+        r'<button type="button" role="tab" id="tab-agent" data-tab="agent" '
+        r'aria-controls="panel-agent" aria-selected="false">에이전트</button>',
+        html,
+    )
+    assert re.search(
+        r'<section id="panel-agent" class="panel agent-split" role="tabpanel" '
+        r'aria-labelledby="tab-agent" hidden>',
+        html,
+    )
+    for element_id in (
+        "agent-form",
+        "agent-question",
+        "agent-run-btn",
+        "agent-stop-btn",
+        "agent-model",
+        "agent-limits",
+        "agent-examples",
+        "agent-timeline-card",
+        "agent-progress",
+        "agent-elapsed",
+        "agent-answer-card",
+        "agent-status",
+        "agent-answer",
+        "agent-source",
+        "agent-recent",
+    ):
+        assert f'id="{element_id}"' in html, element_id
+    assert re.search(r'<ol id="agent-timeline" class="agent-tl" aria-live="polite"', html)
+    assert len(re.findall(r'data-agent-example="[^"]+"', html)) == 3
+    assert "로컬 모델 · 단계 최대 6 · 계산은 도구가 수행" in html
+    assert re.search(r'<button id="agent-stop-btn" type="button" disabled>중지</button>', html)
+    assert '<option value="agent.run.finished"></option>' in html
+
+
+def test_agent_js_streams_sse_with_fetch_and_abort():
+    js = _read("app.js")
+    assert "agent: () => loadAgentTab()," in js
+    assert "new EventSource" not in js  # Authorization header needs fetch
+    run = _function_body(js, "async function runAgent(ev)")
+    assert 'fetch("/agent/runs"' in run and "signal: view.controller.signal" in run
+    assert "headers.Authorization = `Bearer ${token}`" in run
+    assert 'err.name === "AbortError"' in run
+    assert "resp.body.getReader()" in _function_body(js, "async function readAgentStream(")
+    assert "view.controller.abort()" in _function_body(js, "function stopAgent()")
+    for name in (
+        "parseSseBlock",
+        "splitAgentAnswer",
+        "agentStatusText",
+        "appendAgentStep",
+        "renderAgentAnswer",
+        "showAgentSource",
+        "openAgentRun",
+        "loadAgentRecent",
+    ):
+        assert f"function {name}(" in js, name
+    # citation marks become buttons that open the source panel; amounts use fmtDecimal
+    answer = _function_body(js, "function renderAgentAnswer(payload)")
+    assert 'className: "agent-ref"' in answer and "showAgentSource(part.mark)" in answer
+    source = _function_body(js, "function showAgentSource(mark)")
+    assert "fmtDecimal(" in source and "s.inputs" in source and "dartLink(" in js
+    assert '"● 근거 확인됨"' in js and "${label}: ${list.join" in js
+    assert 'get_financials: "재무제표 조회"' in js and 'calculate: "계산"' in js
+
+
+def test_agent_css_layout_and_existing_colors_only():
+    css = _read("style.css")
+    section = css[css.index("/* ---- agent (에이전트) ---- */") :]
+    defined = set(re.findall(r"(--[a-z-]+):", css[: css.index("* { box-sizing")]))
+    used = set(re.findall(r"var\((--[a-z-]+)\)", section))
+    assert used and used <= defined, used - defined
+    assert not re.search(r"#[0-9a-fA-F]{3,6}\b", section)
+    assert "grid-template-columns: minmax(0, 2fr) minmax(0, 1fr)" in section
+    assert re.search(r"\.agent-values \{ table-layout: fixed;", section)
+    assert "word-break: keep-all" in section
+
+
 def test_document_status_shows_progress_and_retry_wait_via_text_content():
     js = _read("app.js")
     body = js[js.index("function progressNote(d)") :]
