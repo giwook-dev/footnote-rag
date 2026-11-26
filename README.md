@@ -12,7 +12,8 @@
 | API | FastAPI, OAuth2 password flow + JWT, 역할(admin / reviewer / member), 조직 격리 |
 | 저장소 | PostgreSQL 16 + pgvector(HNSW, cosine), Alembic 마이그레이션 |
 | 비동기 작업 | Postgres `FOR UPDATE SKIP LOCKED` 큐, 지수 백오프 재시도, 멈춘 작업 복구 |
-| 외부 연동 | OpenDART(`corpCode.xml`, `list.json`, `document.xml`), Voyage `voyage-4` 임베딩, Claude `claude-sonnet-5-5`, 선택: 호스트의 Ollama(로컬 LLM) |
+| 외부 연동 | OpenDART(`corpCode.xml`, `list.json`, `document.xml`, 에이전트용 `fnlttSinglAcntAll.json`), Voyage `voyage-4` 임베딩, Claude `claude-sonnet-5-5`, 선택: 호스트의 Ollama(로컬 LLM) |
+| 에이전트 | 로컬 모델이 도구 6개를 골라 여러 단계로 답함. 실행·상한·기록·검증은 코드, 계산은 출처 있는 값만 받는 `calculate` 도구, 진행은 SSE([에이전트](#에이전트)) |
 | 답변 | `search_result` 블록 + Citations → 각주 변환, 서버 측 거절 fallback. 로컬 LLM은 번호 붙은 근거 + JSON 스키마 출력 → 서버 검증 → 같은 각주 변환 |
 | 운영 | structlog JSON 로그, `X-Request-ID`, `/healthz`, `/readyz`, Docker Compose, GitHub Actions CI |
 | 품질 | pytest(실제 Postgres, 외부 네트워크 없음), Eval 실행기, MCP 서버 |
@@ -247,6 +248,10 @@ FastAPI가 빌드 없는 단일 페이지 화면(`src/footnote_rag/web/static/`�
 | `NOTE_DIFF_CHANGE_THRESHOLD` | `0.3` | 주석 변동 분석의 큰 변동 기준: \|증감\|/\|전년\| ≥ 이 값(부호 반전, 0 → 0 아님도 큰 변동). 비율 행은 제외 |
 | `NOTE_DIFF_MAX_LINES` | `400` | 주석마다 저장하는 변경 줄 수 상한. 넘으면 `truncated` |
 | `NOTE_DIFF_WATCHLIST` | `우발부채,약정,소송,특수관계자,담보,지급보증,보고기간후사건,계속기업,회계정책의변경` | 쉼표 구분. 주석 키에 이 단어가 있으면 관심 주석(우선 정렬) |
+| `AGENT_MAX_STEPS` | `6` | 에이전트 실행의 모델 단계 상한. 닿으면 도구 없이 한 번 더 물어 답하게 하고 `step_limit`([ADR 0013](docs/adr/0013-tool-using-agent.md)) |
+| `AGENT_MAX_CALLS_PER_STEP` | `3` | 한 단계에서 실행하는 도구 호출 수(나머지는 버리고 개수 기록) |
+| `AGENT_TIMEOUT_SECONDS` | `300` | 실행 전체 시간 상한. 넘으면 `failed`(`timeout`) |
+| `AGENT_TOOL_RESULT_CHARS` | `4000` | 모델에 보내는 도구 결과 하나의 최대 글자 수 |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1500` / `200` | 문자 기준 |
 | `JOB_MAX_ATTEMPTS` | `5` | 작업 최대 시도 횟수 |
 | `BASE_BACKOFF_SECONDS` | `5` | 재시도 지연 = `2^attempts × BASE` |
@@ -475,6 +480,68 @@ python -m footnote_rag.evals.note_diff --live --summaries 3   # 쌍마다 점수
 | 전기 수치 불일치 / 큰 변동 건수 | 미측정 |
 | 요약 `needs_review` 비율 | 미측정 |
 | 요약 지연 p50 / p95 | 미측정 |
+
+## 에이전트
+
+질문 하나를 받아 **로컬 모델이 도구를 골라 여러 단계로 답하는** 기능입니다. 예: "삼성전자 2025 연결 부채비율과 전년 대비 변화는?", "현대차 우발부채 주석에서 전년 대비 새로 생긴 약정은?". 설계와 한계는 [ADR 0013](docs/adr/0013-tool-using-agent.md)에 있습니다.
+
+- **모델이 하는 일**: 매 단계 도구를 부르거나 최종 답을 냅니다(Ollama tool calling).
+- **코드가 하는 일**: 도구 실행(모두 읽기 전용), 단계·시간 상한, 모든 단계 기록(`agent_steps`), 최종 답 검증. **계산은 `calculate` 도구만 합니다.**
+- 비용이 들지 않도록 **로컬 LLM(Ollama)과 Fake만 지원**합니다. `LLM_PROVIDER=real`이면 501 "에이전트는 현재 로컬 LLM에서만 지원합니다"이고 Claude를 호출하지 않습니다.
+
+**사용법**: 문서 탭에서 사업보고서를 가져온 뒤 **에이전트** 탭에서 질문을 넣고 **실행**을 누릅니다. 단계(도구 이름, 인자 요약, 성공/오류, 지연, 결과 요약)가 실시간으로 쌓이고, 펼치면 모델에 준 결과 전문이 보입니다. **중지**는 요청을 취소합니다(서버는 `failed`/`client_disconnected`로 남김). 답의 `[F2]`, `[K1]` 같은 근거 번호를 누르면 오른쪽 근거 패널에 문서·목차 경로나 계정명·금액·DART 링크가 나오고, 계산 근거 `K#`은 수식과 값마다의 출처(`F1 부채총계 당기`)를 보여 줍니다. Fake 모드에서는 가람전자(합성) `20260310900101`·`20250310900101`을 가져와 시연합니다(합성 재무제표 포함).
+
+**도구**
+
+| 도구 | 하는 일 | 근거 번호 |
+| --- | --- | --- |
+| `list_documents()` | 조직의 ready DART 문서를 별칭(`D1`…)·회사·보고서 종류·기간·접수일로 보여 줌. UUID는 보이지 않음 | - |
+| `search_filings(query, documents?, top_k?≤8)` | 기존 검색(`retrieve`, 연결 주석 우선·여러 문서 균형). 청크당 800자 | `S#` |
+| `read_note(document, note, scope?, offset?)` | 주석 하나를 줄 번호와 함께 읽음(이름·번호·유사도 0.6 이상, 없으면 후보 10개) | `N#:L#` |
+| `compare_notes(prior, current, note, scope?)` | 주석 하나를 [변동 분석 엔진](#전기-대비-주석-변동-분석)으로 비교(문장 줄 40개, 숫자 변동 상위 20행). 다른 회사면 오류 | `C#:P#`/`C#:C#` |
+| `get_financials(document, accounts, statement?, fs?)` | OpenDART `fnlttSinglAcntAll.json`(단일회사 전체 재무제표)에서 계정 부분 일치. 당기·전기 금액(원). `data/dart/fnltt/` 캐시 | `F#` |
+| `calculate(expression, values)` | `+ - * /`, 괄호, `round`만. `values`는 앞선 도구 결과에 나온 숫자만, 수식 숫자는 한 자리 정수·단위 상수만 | `K#` |
+
+**안전장치**
+
+- 단계 최대 `AGENT_MAX_STEPS`(6), 단계당 도구 호출 `AGENT_MAX_CALLS_PER_STEP`(3), 실행 전체 `AGENT_TIMEOUT_SECONDS`(300초), 도구 결과 `AGENT_TOOL_RESULT_CHARS`(4,000자).
+- 상한에 닿거나 같은 호출을 3번 반복하면 도구 없이 한 번 더 물어 "지금까지 모은 근거로만" 답하게 하고 `step_limit`/`repeated_call`을 남깁니다.
+- 최종 답의 없는 근거 번호는 지우고 개수를 기록합니다. 근거 표시가 없거나(`no_citations`), 도구 결과에 없는 숫자가 있거나(`ungrounded_number`), 도구 오류가 절반을 넘으면(`tool_errors`) `needs_review`("확인 필요")입니다.
+- 감사 로그 `agent.run.started`·`agent.run.finished`(상태, 단계 수, 도구별 호출 수, 검토 사유), 모델 호출마다 `llm_calls`(비용 0, `agent_run_id`).
+
+**API** (인증된 모든 역할, 조직 격리: 다른 조직의 실행은 404)
+
+```bash
+# SSE: event: run → step … → answer(또는 error) → done
+curl -N -X POST $API/agent/runs -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"question": "삼성전자 2025 연결 부채비율과 전년 대비 변화는?"}'
+curl -s $API/agent/runs -H "$AUTH"          # 최근 20개
+curl -s $API/agent/runs/<id> -H "$AUTH"     # 실행 + 모든 단계(모델에 준 결과 그대로) + 근거
+curl -s $API/agent/config -H "$AUTH"        # 모델·상한(화면 표시용)
+```
+
+빈 질문은 422, `LLM_PROVIDER=real`은 501(둘 다 스트림을 열기 전의 일반 JSON 오류)입니다.
+
+**Eval**
+
+```bash
+python -m footnote_rag.evals.agent                         # Fake: evals/agent_tasks.jsonl 8과제, 스크립트형 FakeLLM
+python -m footnote_rag.evals.agent --live --local-models qwen3:14b,gpt-oss:20b@low   # evals/agent_tasks_live.jsonl
+```
+
+리포트(`evals/reports/{timestamp}-{mode}-agent.md`)에는 모델별 과제 성공률, 근거 확인률(`completed` 비율), 평균 단계·도구 호출 수, 도구 오류율, `step_limit`·`repeated_call` 비율, **모델이 직접 계산하려 한 비율**(최종 답에 어떤 도구 결과에도 없는 숫자가 있었던 과제), 지연 p50/p95, 과제별 표, 실패 과제의 단계 기록이 들어갑니다. `--live`는 비교 Eval과 같은 `model[@think]` 형식이고, 모델마다 다른 모델을 내리고 예열합니다. Fake 과제는 비율 계산(재무제표 + 계산), 주석 변동(비교 도구), 답이 없는 질문과, 직접 계산·반복 호출·단계 상한을 일부러 일으키는 과제로 이뤄져 Fake 성공률은 5/8입니다(모델 성능이 아니라 장치 점검).
+
+`evals/agent_tasks_live.jsonl`에는 `_example` 행만 있습니다. 실제 회사 과제의 기대 숫자는 원문과 키가 있는 환경에서 원문 값으로 따로 작성합니다(지어내지 않음).
+
+| 지표 (실제 3개 회사, 로컬 모델) | 값 |
+| --- | --- |
+| 과제 성공률 | 미측정 |
+| 근거 확인률 | 미측정 |
+| 평균 단계 수 / 도구 호출 수 | 미측정 |
+| 도구 오류율 | 미측정 |
+| `step_limit` / `repeated_call` 비율 | 미측정 |
+| 모델이 직접 계산하려 한 비율 | 미측정 |
+| 지연 p50 / p95 | 미측정 |
 
 ## MCP 서버 (Claude Code 연결)
 

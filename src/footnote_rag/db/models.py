@@ -1,11 +1,12 @@
 """SQLAlchemy ORM 모델(테이블 매핑). 스키마 생성은 Alembic 마이그레이션이 맡는다.
 
 역할: organizations, users, documents, chunks(pgvector), embedding_cache(pgvector), jobs, questions,
-answers, llm_calls, audit_logs, note_comparisons, note_comparison_summaries 테이블과 상태 enum 값을 정의한다.
+answers, llm_calls, audit_logs, note_comparisons, note_comparison_summaries, agent_runs, agent_steps 테이블과
+상태 enum 값을 정의한다.
 주요 요소: ``Document``, ``Chunk``, ``EmbeddingCache``, ``Job``, ``Answer``, ``LlmCall``, ``AuditLog``,
-``NoteComparison``, ``NoteComparisonSummary``, ``ANSWER_STATUSES`` 등.
+``NoteComparison``, ``NoteComparisonSummary``, ``AgentRun``, ``AgentStep``, ``ANSWER_STATUSES`` 등.
 호출 관계: 서비스·라우터·워커가 import해 쿼리한다. 실제 DDL은 alembic/versions/0001_initial.py,
-0002_embedding_cache.py, 0003_llm_calls_dropped_refs.py, 0004_note_comparisons.py.
+0002_embedding_cache.py, 0003_llm_calls_dropped_refs.py, 0004_note_comparisons.py, 0005_agent_runs.py.
 학습 문서: docs/study/01-big-picture.md, ERD는 docs/architecture.md
 
 ORM models. The schema itself is created by Alembic (see alembic/versions).
@@ -213,6 +214,60 @@ class LlmCall(Base):
     note_comparison_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("note_comparisons.id"), nullable=True
     )
+    # Agent model turns (agent.runner): set instead of ``answer_id``.
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = _created_at()
+
+
+AGENT_RUN_STATUSES = ("running", "completed", "needs_review", "failed")
+AGENT_STEP_KINDS = ("model", "tool")
+
+
+class AgentRun(Base):
+    """One tool-using agent run (docs/adr/0013-tool-using-agent.md)."""
+
+    __tablename__ = "agent_runs"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
+    answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Sources the final answer cites (full source objects, see agent.tools.Source).
+    citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    review_reasons: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    step_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentStep(Base):
+    """One model turn or tool call of an agent run, stored as it happens."""
+
+    __tablename__ = "agent_steps"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    idx: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    tool_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    args: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Exactly what the model was given (tool) or what it said (model).
+    result_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    sources: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = _created_at()
 
 

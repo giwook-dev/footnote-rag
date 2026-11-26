@@ -481,7 +481,7 @@ async def test_migration_0004_downgrade_and_upgrade(sessionmaker):
     assert "note_comparisons" not in tables and "note_comparison_summaries" not in tables
     assert "note_comparison_id" not in columns
     await asyncio.to_thread(_alembic, "upgrade", "head")
-    assert "0004_note_comparisons (head)" in await asyncio.to_thread(_alembic, "current")
+    assert "(head)" in await asyncio.to_thread(_alembic, "current")  # 0004 and later applied
     async with sessionmaker() as s:
         tables = set(
             await s.scalars(text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'"))

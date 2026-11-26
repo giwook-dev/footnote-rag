@@ -1,6 +1,7 @@
 """애플리케이션 설정(환경변수 → ``Settings``).
 
 역할: 모든 설정값과 기본값, Claude 가격표(``DEFAULT_LLM_PRICES``), 제공자 모드(auto/fake/real, LLM은 local 추가) 해석.
+에이전트 상한(``AGENT_MAX_STEPS`` 등, docs/adr/0013-tool-using-agent.md)도 여기 있다.
 주요 요소: ``Settings``, ``ModelPrice``, ``load_settings``, ``get_settings``(lru_cache).
 호출 관계: 거의 모든 모듈이 ``get_settings()``를 읽는다. ``providers``가 ``*_mode``로 실제/Fake를 고른다.
 학습 문서: docs/study/09-testing-and-ops.md (SecretStr, Fake 모드)
@@ -175,6 +176,16 @@ class Settings(BaseSettings):
     note_diff_watchlist: str = (
         "우발부채,약정,소송,특수관계자,담보,지급보증,보고기간후사건,계속기업,회계정책의변경"
     )
+
+    # --- tool-using agent (docs/adr/0013-tool-using-agent.md; local / fake LLM only) ---
+    # Model turns per run; at the limit the model is asked once more without tools (step_limit).
+    agent_max_steps: int = 6
+    # Tool calls executed per model turn (the rest of that turn's calls are dropped).
+    agent_max_calls_per_step: int = 3
+    # Whole run (model turns + tools); over it the run is failed (timeout).
+    agent_timeout_seconds: float = 300.0
+    # Characters of one tool result sent to the model (longer results are cut).
+    agent_tool_result_chars: int = 4000
 
     # --- chunking ---
     chunk_size: int = 1500

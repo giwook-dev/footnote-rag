@@ -34,6 +34,7 @@ PowerShell에서는 쉼표로 구분한 종목코드를 따옴표로 감싸야 �
 2. `list.json`에 `corp_code`, 기간, `pblntf_ty`(종류 코드의 첫 글자: A001 → `A`, F001/F002 → `F`), `pblntf_detail_ty`(기본 `A001`), `last_reprt_at=Y`(최종 보고서만)를 넣어 접수번호를 찾습니다. 여러 페이지면 모두 읽습니다. `013`(데이터 없음)은 빈 목록으로 처리합니다.
 3. `document.xml?rcept_no=`로 원문 ZIP을 받아 `data/dart/{rcept_no}.zip`에 저장하고, 있으면 재사용합니다. ZIP 대신 JSON/XML 오류 본문이 오면 `status` 코드로 분류합니다.
 4. 원문 XML을 목차 경로별 섹션으로 파싱하고(→ [ADR 0004](adr/0004-opendart-xml-over-pdf.md)), 청킹·임베딩 후 pgvector에 저장합니다.
+5. (에이전트의 `get_financials` 도구만) `fnlttSinglAcntAll.json`(단일회사 전체 재무제표)에 `corp_code`, `bsns_year`, `reprt_code`(사업 11011, 반기 11012, 1분기 11013, 3분기 11014), `fs_div`(연결 `CFS`/별도 `OFS`)를 넣어 계정별 당기·전기 금액(원)을 받습니다. 사업연도·분기는 표지의 보고 기간에서 읽습니다. 정상 응답은 `data/dart/fnltt/{corp_code}_{year}_{reprt}_{fs}.json`에 캐시하고, `013`(자료 없음)은 빈 목록입니다(→ [ADR 0013](adr/0013-tool-using-agent.md)). 문서 수집 워커는 이 API를 부르지 않습니다.
 
 요청 URL은 로그에 남기되 `crtfc_key`는 `***`로 마스킹합니다. httpx 자체 요청 로그는 꺼 두었습니다.
 

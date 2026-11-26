@@ -29,6 +29,7 @@ TOPIC_DOCS = [
     "08-review-audit-usage.md",
     "09-testing-and-ops.md",
     "10-eval-and-mcp.md",
+    "12-agent.md",
 ]
 REQUIRED_DOCS = ["README.md", *TOPIC_DOCS, "interview-qa.md", "glossary.md", "exercises.md"]
 

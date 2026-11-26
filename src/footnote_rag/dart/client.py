@@ -1,6 +1,7 @@
 """OpenDART API 클라이언트(Protocol 뒤의 HTTP 실제 구현과 합성 데이터 Fake).
 
-역할: ``list.json``(공시 목록, 페이지 반복. ``pblntf_ty``는 종류 코드의 첫 글자: A001→A, F001/F002→F), ``document.xml``(원문 ZIP), ``corpCode.xml``(고유번호 ZIP)을 호출하고,
+역할: ``list.json``(공시 목록, 페이지 반복. ``pblntf_ty``는 종류 코드의 첫 글자: A001→A, F001/F002→F), ``document.xml``(원문 ZIP), ``corpCode.xml``(고유번호 ZIP),
+``fnlttSinglAcntAll.json``(단일회사 전체 재무제표, 에이전트 ``get_financials`` 도구용, ``data/dart/fnltt/`` 캐시)을 호출하고,
 OpenDART ``status`` 코드와 HTTP 오류를 재시도 가능/불가 ``DartError``로 분류한다. 로그 URL의 ``crtfc_key``는 가린다.
 주요 요소: ``DartClient``, ``HttpDartClient``, ``FakeDartClient``, ``classify_status``, ``parse_error_body``,
 ``REPORT_DETAILS``(A001 사업보고서 기본, F001, F002), ``pblntf_ty_for``.
@@ -21,10 +22,13 @@ Status codes (OpenDART developer guide):
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import os
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -105,6 +109,44 @@ class DartClient(Protocol):
 
     async def download_corp_codes(self) -> bytes: ...
 
+    async def financial_statements(
+        self, corp_code: str, bsns_year: str, reprt_code: str, fs_div: str
+    ) -> list[dict[str, Any]]: ...
+
+
+# fnlttSinglAcntAll.json (단일회사 전체 재무제표) report codes and statement kinds.
+REPORT_CODES: dict[str, str] = {
+    "11011": "사업보고서",
+    "11012": "반기보고서",
+    "11013": "1분기보고서",
+    "11014": "3분기보고서",
+}
+FS_DIVS: dict[str, str] = {"CFS": "연결재무제표", "OFS": "재무제표(별도)"}
+STATEMENT_DIVS: dict[str, str] = {
+    "BS": "재무상태표",
+    "IS": "손익계산서",
+    "CIS": "포괄손익계산서",
+    "CF": "현금흐름표",
+    "SCE": "자본변동표",
+}
+
+
+def _read_json_list(path: Path) -> list[dict[str, Any]] | None:
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _write_json_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.part")
+    tmp.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
 
 def _is_zip(content: bytes) -> bool:
     return content[:2] == b"PK"
@@ -140,11 +182,14 @@ class HttpDartClient:
         base_url: str = "https://opendart.fss.or.kr/api",
         timeout: float = 60.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        fnltt_cache_dir: Path | None = None,
     ) -> None:
         self._key = api_key
         self._base = base_url.rstrip("/")
         self._timeout = timeout
         self._transport = transport
+        # data/dart/fnltt: financial statement responses (status 000) are cached here.
+        self._fnltt_cache_dir = fnltt_cache_dir
 
     async def _get(self, path: str, params: dict[str, Any]) -> httpx.Response:
         query = {"crtfc_key": self._key, **params}
@@ -220,6 +265,47 @@ class HttpDartClient:
     async def download_corp_codes(self) -> bytes:
         return await self._download_zip("corpCode.xml", {})
 
+    def fnltt_cache_path(
+        self, corp_code: str, bsns_year: str, reprt_code: str, fs_div: str
+    ) -> Path | None:
+        if self._fnltt_cache_dir is None:
+            return None
+        return self._fnltt_cache_dir / f"{corp_code}_{bsns_year}_{reprt_code}_{fs_div}.json"
+
+    async def financial_statements(
+        self, corp_code: str, bsns_year: str, reprt_code: str, fs_div: str
+    ) -> list[dict[str, Any]]:
+        """``fnlttSinglAcntAll.json`` rows (단일회사 전체 재무제표). Status ``013`` (no data) is an
+        empty list; other statuses raise ``DartError``. Status 000 responses are cached in
+        ``fnltt_cache_dir`` and reused."""
+        cache = self.fnltt_cache_path(corp_code, bsns_year, reprt_code, fs_div)
+        if cache is not None:
+            cached = await asyncio.to_thread(_read_json_list, cache)
+            if cached is not None:
+                return cached
+        resp = await self._get(
+            "fnlttSinglAcntAll.json",
+            {
+                "corp_code": corp_code,
+                "bsns_year": bsns_year,
+                "reprt_code": reprt_code,
+                "fs_div": fs_div,
+            },
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            raise DartError("invalid_response", "expected JSON", retryable=True) from None
+        code = str(data.get("status", ""))
+        if code == "013":  # no financial statements for this report
+            return []
+        if code != "000":
+            raise classify_status(code, str(data.get("message", "")))
+        rows = [r for r in data.get("list") or [] if isinstance(r, dict)]
+        if cache is not None:
+            await asyncio.to_thread(_write_json_atomic, cache, rows)
+        return rows
+
 
 class FakeDartClient:
     """Synthetic, network-free DART client used in tests and in fake mode."""
@@ -230,6 +316,7 @@ class FakeDartClient:
         self._fake_data = fake_data
         self._documents = documents
         self.download_calls: list[str] = []
+        self.financial_calls: list[tuple[str, str, str, str]] = []
 
     async def list_reports(
         self, *, corp_code: str, bgn_de: str, end_de: str, detail: str = DEFAULT_DETAIL
@@ -251,6 +338,13 @@ class FakeDartClient:
 
     async def download_corp_codes(self) -> bytes:
         return self._fake_data.build_corp_code_zip()
+
+    async def financial_statements(
+        self, corp_code: str, bsns_year: str, reprt_code: str, fs_div: str
+    ) -> list[dict[str, Any]]:
+        """Synthetic statements of 가람전자(합성) (``fake_data.financial_statement_rows``)."""
+        self.financial_calls.append((corp_code, bsns_year, reprt_code, fs_div))
+        return self._fake_data.financial_statement_rows(corp_code, bsns_year, reprt_code, fs_div)
 
 
 def read_zip_members(content: bytes) -> dict[str, bytes]:

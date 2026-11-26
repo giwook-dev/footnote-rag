@@ -28,6 +28,7 @@
 | 9 | [09. 테스트와 운영](09-testing-and-ops.md) | Protocol+Fake, 실제 Postgres 테스트, 비밀값, Docker, CI, 제공자 선택도 | 45분 |
 | 10 | [10. Eval과 MCP](10-eval-and-mcp.md) | 지표 정의, 검증기, 데이터셋 상태, MCP 구조 | 30분 |
 | 11 | [11. 전기 대비 주석 변동 분석](11-note-change-analysis.md) | 코드가 탐지하고 모델은 요약만: 주석 짝짓기, 기간 블록 표, 전기 수치 불일치, 요약 숫자 검증 | 30분 |
+| 12 | [12. 도구를 쓰는 에이전트](12-agent.md) | 모델은 도구를 고르고 코드가 실행·제한·검증: 도구 루프, 출처 있는 값만 받는 계산기, 최종 답 검증, SSE | 40분 |
 | 복습 | [면접 Q&A](interview-qa.md) | 질문 32개: 요점, 근거, 꼬리 질문 | 60분 |
 | 복습 | [실습](exercises.md) | 직접 고치고 깨뜨려 보는 실습 10개 | 실습당 20~60분 |
 | 참고 | [용어집](glossary.md) | 용어 40여 개 | 필요할 때 |
@@ -52,7 +53,7 @@
 | --- | --- | --- | --- |
 | 인증·인가 | `src/footnote_rag/auth/deps.py`, `src/footnote_rag/auth/security.py`, `src/footnote_rag/auth/router.py` | [03](03-auth-rbac-isolation.md) | OAuth2/OIDC SSO(외부 IdP 연동): **없음**. 리프레시 토큰·토큰 폐기: **없음** |
 | 비동기·배치 처리 | `src/footnote_rag/jobs/queue.py`, `src/footnote_rag/jobs/worker.py`, `src/footnote_rag/jobs/handlers.py` | [04](04-job-queue.md) | 정기 실행 스케줄러(cron 배치): **없음** |
-| Agent Tool / MCP | `src/footnote_rag/mcp_server.py` | [10](10-eval-and-mcp.md) | Claude tool use를 쓰는 에이전트 루프: **없음**(MCP 서버가 도구를 제공하는 쪽만 구현) |
+| Agent Tool / MCP | `src/footnote_rag/agent/`, `src/footnote_rag/mcp_server.py` | [12](12-agent.md), [10](10-eval-and-mcp.md) | 로컬 모델(Ollama tool calling) 에이전트 루프는 있음. Claude tool use 에이전트: **없음**(비용 때문에 로컬·Fake만). 실측: **미측정** |
 | HITL·재시도·오류 복구 | `src/footnote_rag/reviews/router.py`, `src/footnote_rag/answering/service.py`, `src/footnote_rag/jobs/queue.py` | [04](04-job-queue.md), [08](08-review-audit-usage.md) | 실패 작업 재실행 API, 데드레터 큐: **없음** |
 | RAG·임베딩·벡터 검색 | `src/footnote_rag/retrieval/embedder.py`, `src/footnote_rag/retrieval/search.py`, `src/footnote_rag/documents/chunking.py`, `src/footnote_rag/answering/` | [05](05-rag-retrieval.md), [06](06-claude-citations.md) | 하이브리드 검색(BM25)·재랭킹: **없음** |
 | Eval·비용·지연시간·가드레일·감사 로그 | `src/footnote_rag/evals/`, `src/footnote_rag/usage/`, `src/footnote_rag/answering/service.py`, `src/footnote_rag/audit/` | [08](08-review-audit-usage.md), [10](10-eval-and-mcp.md) | 실제 데이터 Eval 결과: **없음**(데이터셋이 예시뿐). LLM 채점기: **없음** |

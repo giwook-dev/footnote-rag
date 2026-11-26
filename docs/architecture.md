@@ -12,7 +12,8 @@ flowchart LR
     reviewer["Reviewer"] -->|"approve / reject"| api
     api <--> db[("PostgreSQL 16 + pgvector<br/>chunks · jobs · audit_logs · llm_calls")]
     api -->|"search_result + citations"| claude["Claude Sonnet 5.5<br/>(server-side fallback)"]
-    api -.->|"LLM_PROVIDER=local<br/>/api/chat + JSON 스키마"| ollama["Ollama (호스트)<br/>host.docker.internal:11434"]
+    api -.->|"LLM_PROVIDER=local<br/>/api/chat + JSON 스키마 · 에이전트 tools"| ollama["Ollama (호스트)<br/>host.docker.internal:11434"]
+    api -.->|"에이전트 get_financials<br/>fnlttSinglAcntAll.json"| dart
     api -->|"input_type=query"| voyage["Voyage voyage-4"]
     worker["Worker (N개)"] -->|"FOR UPDATE SKIP LOCKED"| db
     worker -->|"document.xml ZIP"| dart["OpenDART"]
@@ -43,6 +44,10 @@ erDiagram
     documents ||--o{ note_comparisons : "prior / current"
     note_comparisons ||--o{ note_comparison_summaries : "summarized (latest per note)"
     note_comparisons ||--o{ llm_calls : "cost of summaries"
+    organizations ||--o{ agent_runs : owns
+    users ||--o{ agent_runs : "asked by"
+    agent_runs ||--o{ agent_steps : "steps (ON DELETE CASCADE)"
+    agent_runs ||--o{ llm_calls : "cost of model turns"
 
     organizations { uuid id PK  text name  timestamptz created_at }
     users { uuid id PK  uuid org_id FK  text email UK  text password_hash  user_role role  bool is_active }
@@ -52,10 +57,12 @@ erDiagram
     jobs { uuid id PK  text type  jsonb payload  job_status status  int attempts  int max_attempts  timestamptz run_after  timestamptz locked_at  text locked_by  text last_error  jsonb result }
     questions { uuid id PK  uuid org_id FK  uuid asked_by FK  text text }
     answers { uuid id PK  uuid question_id FK  uuid org_id  text text  jsonb footnotes  answer_status status  text review_reason  uuid reviewed_by  timestamptz reviewed_at  text review_comment }
-    llm_calls { uuid id PK  uuid org_id  uuid answer_id FK  uuid note_comparison_id FK  text model  int input_tokens  int output_tokens  int cache_read_input_tokens  int cache_creation_input_tokens  numeric cost_usd  int latency_ms  text stop_reason  int dropped_source_refs }
+    llm_calls { uuid id PK  uuid org_id  uuid answer_id FK  uuid note_comparison_id FK  uuid agent_run_id FK  text model  int input_tokens  int output_tokens  int cache_read_input_tokens  int cache_creation_input_tokens  numeric cost_usd  int latency_ms  text stop_reason  int dropped_source_refs }
     audit_logs { uuid id PK  uuid org_id  uuid actor_user_id  text action  text target_type  text target_id  jsonb metadata  text request_id }
     note_comparisons { uuid id PK  uuid org_id FK  uuid created_by FK  uuid prior_document_id FK  uuid current_document_id FK  text scope  jsonb result  timestamptz created_at }
     note_comparison_summaries { uuid id PK  uuid comparison_id FK  uuid org_id  int note_index  text note_key  jsonb bullets  text status  jsonb ungrounded_numbers  text model  uuid created_by FK  timestamptz created_at }
+    agent_runs { uuid id PK  uuid org_id FK  uuid user_id FK  text question  text status  text answer  jsonb citations  jsonb review_reasons  text model  int step_count  int tool_call_count  int latency_ms  text error  timestamptz created_at  timestamptz finished_at }
+    agent_steps { uuid id PK  uuid run_id FK  int idx  text kind  text tool_name  jsonb args  bool ok  text result_text  jsonb sources  int latency_ms  timestamptz created_at }
 ```
 
 - `documents`: `UNIQUE(org_id, source, source_ref)` — 같은 조직의 같은 접수번호는 하나만 존재합니다.
@@ -64,6 +71,7 @@ erDiagram
 - `jobs`: 조직 컬럼 대신 `payload.org_id`를 두고 `GET /jobs/{id}`가 이 값으로 범위를 제한합니다. 실행 중에는 `result.progress = {stage, done, total}`(진행률)만 담기고, claim할 때 비워집니다. 성공하면 수집 결과(청크 수, `embedding_tokens`(실제 청구 대상), `embedding_cache_hits`, `embedding_cache_misses`, 마지막 `progress`)로 바뀝니다.
 - `audit_logs`: `BEFORE UPDATE OR DELETE` 행 트리거와 `BEFORE TRUNCATE` 문장 트리거가 예외를 던집니다. 실패한 로그인처럼 조직을 알 수 없는 행은 `org_id`가 NULL입니다.
 - `note_comparisons`: 전년·당년 사업보고서의 주석 비교 결과(`comparison.notes.compare_documents`의 JSON, 숫자는 문자열). `note_comparison_summaries`: 주석 하나의 로컬 모델 요약(`status` = `ok` | `needs_review`, `comparison_id`는 `ON DELETE CASCADE`). 다시 생성하면 행을 추가하고 조회는 주석별 최신 행을 씁니다. 요약 호출의 `llm_calls` 행은 `answer_id`가 NULL이고 `note_comparison_id`가 채워집니다([ADR 0012](adr/0012-note-change-analysis.md)).
+- `agent_runs`: 도구 쓰는 에이전트 실행 하나(`status` = `running` | `completed` | `needs_review` | `failed`, `citations` = 최종 답이 인용한 근거 객체, `review_reasons` = `no_citations`·`ungrounded_number`·`tool_errors`·`step_limit`·`repeated_call` 등, 실패 사유는 `error`). `agent_steps`: 모델 호출(`kind=model`, `result_text` = 모델이 한 말, `args.tool_calls`)과 도구 호출(`kind=tool`, `result_text` = 모델에 보낸 결과 그대로, `sources` = 그 결과의 근거 `S#`/`N#`/`C#`/`F#`/`K#`)을 일어나는 즉시 한 행씩 커밋합니다. 마지막 모델 단계의 `args.verification`에 없앤 근거 번호와 근거 없는 숫자가 남습니다. 모델 호출마다 `llm_calls` 행(`agent_run_id`, 비용 0)이 생깁니다([ADR 0013](adr/0013-tool-using-agent.md)).
 
 ## 조직 격리
 

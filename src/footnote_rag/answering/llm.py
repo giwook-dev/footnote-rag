@@ -3,9 +3,9 @@
 역할: Claude Messages API 요청을 만들고, 오류를 502/503으로 바꾸고, 응답을 ``LLMResponse``(dict 블록)로 정규화한다.
 로컬 모델(Ollama) 구현은 ``answering/local_llm.py``의 ``OllamaClient``다.
 주요 요소: ``LLMClient``(Protocol), ``ClaudeClient``(``request_params``, ``answer``), ``FakeLLM``
-(``answer``, ``chat_json``), ``LLMError``, ``JsonResult``.
+(``answer``, ``chat_json``, 스크립트형 ``chat_tools``), ``LLMError``, ``JsonResult``, ``ToolCall``, ``ToolChatResult``.
 호출 관계: ``providers.make_llm``이 만들고 ``answering.service.ask_question``이 ``answer``를,
-``comparison.service.summarize_note``가 ``chat_json``(로컬·Fake만)을 호출한다.
+``comparison.service.summarize_note``가 ``chat_json``(로컬·Fake만)을, ``agent.runner``가 ``chat_tools``(로컬·Fake만)를 호출한다.
 학습 문서: docs/study/06-claude-citations.md
 
 LLM clients behind a Protocol.
@@ -25,6 +25,7 @@ the Messages API wire shape, so footnote conversion is provider-agnostic and tes
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from dataclasses import dataclass, field
@@ -82,6 +83,27 @@ class JsonResult:
     """A schema-constrained JSON reply (``chat_json``; local and fake clients only)."""
 
     data: dict[str, Any]
+    usage: LLMUsage = field(default_factory=LLMUsage)
+    latency_ms: int = 0
+    done_reason: str | None = None
+    model_id: str = "unknown"
+
+
+@dataclass
+class ToolCall:
+    """One tool call of a model turn. ``arguments`` is the parsed JSON object, or the raw value
+    when the model sent something else (a string that is not a JSON object)."""
+
+    name: str
+    arguments: Any = field(default_factory=dict)
+
+
+@dataclass
+class ToolChatResult:
+    """One model turn with tools (``chat_tools``; local and fake clients only)."""
+
+    content: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
     usage: LLMUsage = field(default_factory=LLMUsage)
     latency_ms: int = 0
     done_reason: str | None = None
@@ -187,10 +209,21 @@ class FakeLLM:
     provider = "fake"
     citation_method = CITATION_API
 
-    def __init__(self, *, stop_reason: str = "end_turn", model: str = "fake-llm") -> None:
+    def __init__(
+        self,
+        *,
+        stop_reason: str = "end_turn",
+        model: str = "fake-llm",
+        agent_script: list[Any] | None = None,
+        agent_delay_seconds: float = 0.0,
+    ) -> None:
         self.stop_reason = stop_reason
         self.model = model
         self.calls: list[dict[str, Any]] = []
+        # chat_tools: a scripted agent (see ``chat_tools``); None = the built-in demo policy.
+        self.agent_script = agent_script
+        self.agent_delay_seconds = agent_delay_seconds
+        self.tool_turns: list[dict[str, Any]] = []
 
     async def status(self) -> dict[str, Any]:
         return {
@@ -269,3 +302,73 @@ class FakeLLM:
         return JsonResult(
             data=data, usage=usage, latency_ms=5, done_reason="stop", model_id=self.model
         )
+
+    async def chat_tools(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> ToolChatResult:
+        """Deterministic stand-in for ``OllamaClient.chat_tools`` (agent tests and fake mode).
+
+        Turn ``n`` = the number of assistant messages already in ``messages``. With
+        ``agent_script`` the turn's entry is replayed: a list of ``{"name", "arguments"}`` (or
+        ``{"tool_calls": [...]}``) is a tool turn, a string (or ``{"content": ...}``) a final
+        answer. Without tools (the runner's last call at the step limit) the next final answer
+        of the script is returned. Past the end of the script: an "unresolved" answer.
+
+        Without a script, a demo policy: ``list_documents`` -> ``search_filings(question)`` ->
+        an answer quoting the first line of the first search result with its ``[S#]`` mark.
+        """
+        if self.agent_delay_seconds:
+            await asyncio.sleep(self.agent_delay_seconds)
+        turn = sum(1 for m in messages if m.get("role") == "assistant")
+        self.tool_turns.append({"turn": turn, "tools": [t["function"]["name"] for t in tools]})
+        chars = sum(len(str(m.get("content") or "")) for m in messages)
+        usage = LLMUsage(input_tokens=max(1, chars // 2), output_tokens=40)
+        content, calls = (
+            self._scripted_turn(turn, bool(tools))
+            if self.agent_script is not None
+            else _demo_turn(turn, messages, bool(tools))
+        )
+        return ToolChatResult(
+            content=content,
+            tool_calls=calls,
+            usage=usage,
+            latency_ms=5,
+            done_reason="stop",
+            model_id=self.model,
+        )
+
+    def _scripted_turn(self, turn: int, tools_allowed: bool) -> tuple[str, list[ToolCall]]:
+        script = self.agent_script or []
+        entries = script[turn:] if tools_allowed else [e for e in script[turn:] if _is_final(e)]
+        if not entries:
+            return AGENT_UNRESOLVED_TEXT, []
+        entry = entries[0]
+        if _is_final(entry):
+            return str(entry["content"] if isinstance(entry, dict) else entry), []
+        raw = entry["tool_calls"] if isinstance(entry, dict) else entry
+        return "", [ToolCall(str(c["name"]), c.get("arguments", {})) for c in raw]
+
+
+AGENT_UNRESOLVED_TEXT = "지금까지 모은 근거로는 답을 확정하지 못했습니다."
+_SEARCH_HIT_RE = re.compile(r"^\[(S\d+)\][^\n]*\n([^\n]+)", re.MULTILINE)
+
+
+def _is_final(entry: Any) -> bool:
+    return isinstance(entry, str) or (isinstance(entry, dict) and "content" in entry)
+
+
+def _demo_turn(
+    turn: int, messages: list[dict[str, Any]], tools_allowed: bool
+) -> tuple[str, list[ToolCall]]:
+    question = next((str(m.get("content")) for m in messages if m.get("role") == "user"), "")
+    if tools_allowed and turn == 0:
+        return "", [ToolCall("list_documents", {})]
+    if tools_allowed and turn == 1:
+        return "", [ToolCall("search_filings", {"query": question[:200], "top_k": 3})]
+    tool_texts = [str(m.get("content") or "") for m in messages if m.get("role") == "tool"]
+    for text in reversed(tool_texts):
+        hit = _SEARCH_HIT_RE.search(text)
+        if hit:
+            sentence = hit.group(2).strip()[:160].rstrip()
+            return f"검색된 공시에 따르면 다음과 같습니다: {sentence} [{hit.group(1)}]", []
+    return NO_EVIDENCE_TEXT, []

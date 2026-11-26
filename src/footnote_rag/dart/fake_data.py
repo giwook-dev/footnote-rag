@@ -4,9 +4,11 @@
 원문 XML/ZIP(첨부 XML 포함), corpCode ZIP을 만든다. 합성 사업보고서의 주석은 실제 사업보고서처럼
 주석 번호별 소제목을 ``TITLE`` 요소로 둔다. 가람전자(합성)에는 전기 대비 주석 변동 분석 시연용 전년 사업보고서
 (``20250310900101``, 2024 사업연도)가 있고, 2025 보고서(``20260310900101``)와 비교하면 주석 추가·삭제,
-우발부채 문장 변경, 차입금 금액 변동(큰 변동 포함), 전기 수치 불일치가 나온다.
+우발부채 문장 변경, 차입금 금액 변동(큰 변동 포함), 전기 수치 불일치가 나온다. 에이전트 ``get_financials`` 도구용으로
+가람전자(합성) 2024·2025 사업보고서의 합성 재무제표(``FAKE_FINANCIALS``, 원 단위)도 있다.
 주요 요소: ``FAKE_CORPS``, ``FAKE_REPORTS``, ``FAKE_ANNUAL_REPORTS``, ``FAKE_PRIOR_ANNUAL_REPORTS``,
-``FAKE_ANNUAL_PAIR``, ``reports_for``, ``build_document_xml``, ``build_document_zip``, ``build_corp_code_zip``.
+``FAKE_ANNUAL_PAIR``, ``reports_for``, ``build_document_xml``, ``build_document_zip``, ``build_corp_code_zip``,
+``FAKE_FINANCIALS``, ``financial_statement_rows``.
 호출 관계: ``dart.client.FakeDartClient``가 호출한다. 파서는 이 데이터와 테스트 픽스처로만 검증됐다.
 학습 문서: docs/study/07-dart-integration.md, docs/study/09-testing-and-ops.md
 
@@ -312,6 +314,83 @@ def build_document_zip(rcept_no: str, *, encoding: str = "utf-8") -> bytes:
             '<?xml version="1.0" encoding="utf-8"?><DOCUMENT><BODY><P>첨부(합성)</P></BODY></DOCUMENT>'.encode(),
         )
     return buf.getvalue()
+
+
+# Synthetic OpenDART fnlttSinglAcntAll rows (원, consolidated and separate alike) of
+# 가람전자(합성), per fiscal year. NOT real figures. 2025 -> 2024 report pairs: 부채비율 64.6% / 63.6%.
+FAKE_FINANCIALS: dict[str, dict[str, int]] = {
+    "2025": {
+        "자산총계": 98_765_000_000,
+        "부채총계": 38_765_000_000,
+        "자본총계": 60_000_000_000,
+        "매출액": 120_000_000_000,
+        "영업이익": 9_600_000_000,
+        "당기순이익": 7_200_000_000,
+    },
+    "2024": {
+        "자산총계": 90_000_000_000,
+        "부채총계": 35_000_000_000,
+        "자본총계": 55_000_000_000,
+        "매출액": 110_000_000_000,
+        "영업이익": 8_800_000_000,
+        "당기순이익": 6_600_000_000,
+    },
+    "2023": {
+        "자산총계": 84_000_000_000,
+        "부채총계": 33_000_000_000,
+        "자본총계": 51_000_000_000,
+        "매출액": 100_000_000_000,
+        "영업이익": 8_000_000_000,
+        "당기순이익": 6_000_000_000,
+    },
+}
+_FAKE_ACCOUNTS: tuple[tuple[str, str, str, str], ...] = (
+    # (account_nm, sj_div, sj_nm, account_id)
+    ("자산총계", "BS", "재무상태표", "ifrs-full_Assets"),
+    ("부채총계", "BS", "재무상태표", "ifrs-full_Liabilities"),
+    ("자본총계", "BS", "재무상태표", "ifrs-full_Equity"),
+    ("매출액", "IS", "손익계산서", "ifrs-full_Revenue"),
+    ("영업이익", "IS", "손익계산서", "dart_OperatingIncomeLoss"),
+    ("당기순이익", "IS", "손익계산서", "ifrs-full_ProfitLoss"),
+)
+_FAKE_TERMS = {"2025": "57", "2024": "56", "2023": "55"}
+
+
+def financial_statement_rows(
+    corp_code: str, bsns_year: str, reprt_code: str, fs_div: str
+) -> list[dict[str, str]]:
+    """``fnlttSinglAcntAll``-shaped rows for 가람전자(합성) annual reports (``11011``) of 2024 and
+    2025; anything else is ``[]`` (what the real API answers with status 013)."""
+    prior_year = str(int(bsns_year) - 1) if bsns_year.isdigit() else ""
+    if (
+        corp_code != FAKE_CORPS[0]["corp_code"]
+        or reprt_code != "11011"
+        or bsns_year not in ("2024", "2025")
+        or fs_div not in ("CFS", "OFS")
+    ):
+        return []
+    rcept_no = PRIOR_ANNUAL_RCEPT_NO if bsns_year == "2024" else FAKE_ANNUAL_PAIR[1]
+    current, prior = FAKE_FINANCIALS[bsns_year], FAKE_FINANCIALS[prior_year]
+    return [
+        {
+            "rcept_no": rcept_no,
+            "reprt_code": reprt_code,
+            "bsns_year": bsns_year,
+            "corp_code": corp_code,
+            "sj_div": sj_div,
+            "sj_nm": sj_nm,
+            "account_id": account_id,
+            "account_nm": name,
+            "account_detail": "-",
+            "thstrm_nm": f"제 {_FAKE_TERMS[bsns_year]} 기",
+            "thstrm_amount": str(current[name]),
+            "frmtrm_nm": f"제 {_FAKE_TERMS[prior_year]} 기",
+            "frmtrm_amount": str(prior[name]),
+            "ord": str(order),
+            "currency": "KRW",
+        }
+        for order, (name, sj_div, sj_nm, account_id) in enumerate(_FAKE_ACCOUNTS, start=1)
+    ]
 
 
 def build_corp_code_zip() -> bytes:
