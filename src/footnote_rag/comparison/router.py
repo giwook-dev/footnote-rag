@@ -88,6 +88,10 @@ class NumberChange(BaseModel):
     table: str
     label: str
     occurrence: int
+    unit: str | None = Field(
+        default=None,
+        description="표의 단위(예: 백만원, 원문 '(단위 : …)' 표기). 표기가 없거나 이전 결과면 null",
+    )
     prior_values: list[str] = Field(
         description="yoy: 전년 보고서 당기 값, prior_mismatch: 전년 보고서 당기 값"
     )

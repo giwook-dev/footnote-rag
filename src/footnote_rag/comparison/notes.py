@@ -29,7 +29,8 @@ Rules (docs/adr/0012-note-change-analysis.md):
   rows) is a row of that period instead. Label = the non-numeric cells before the first number; values = the numeric
   cells (``1,234``, ``(1,234)``/``△1,234`` negative, ``-`` = 0; dates and bare 4-digit years
   are not numbers). Row id = (title, label, occurrence among rows of the same period, title and
-  label).
+  label). Unit: a ``(단위 : 백만원)`` line or a ``(단위 : …)`` cell of a period marker line sets
+  the unit (``백만원``) of the rows below; a new table title resets it (``None`` = not written).
 * number changes (``compare_rows``): ``yoy`` = current-period rows of both reports differ (also
   rows outside any period block, compared with each other); ``prior_mismatch`` = the current
   report's prior-period row differs from the prior report's current-period row (restatement /
@@ -104,6 +105,8 @@ _PERIOD_MARK_RE = re.compile(r"^(당기|전기)(말)?\s*(?:\||$)")
 # A column header cell ("당기", "전기말", "당기(제57기)") with spaces removed.
 _PERIOD_CELL_RE = re.compile(r"^(당기|전기)(말)?(?:\(.*\))?$")
 _UNIT_LINE_RE = re.compile(r"^\(?\s*단위\s*[:：]")
+# The unit text of a "(단위 : 백만원)" line or cell: "백만원".
+_UNIT_VALUE_RE = re.compile(r"^\(?\s*단위\s*[:：]\s*(?P<unit>[^)]*?)\s*\)?\s*$")
 _DIGIT_RE = re.compile(r"\d")
 _NUMBER_CELL_RE = re.compile(
     r"^(?P<open>\()?\s*(?P<sign>[△\-−])?\s*(?P<int>\d{1,3}(?:,\d{3})+|\d+)(?P<frac>\.\d+)?"
@@ -344,6 +347,7 @@ class TableRow:
     values: tuple[Decimal, ...]
     percent: bool
     line: int  # 0-based index in the note's lines
+    unit: str | None = None  # "백만원" from "(단위 : 백만원)"; None when the table names none
 
     @property
     def row_id(self) -> tuple[str, str, int]:
@@ -370,11 +374,18 @@ def _column_order(cells: Sequence[str]) -> Literal["current_first", "prior_first
     return "current_first" if current_at < prior_at else "prior_first"
 
 
+def parse_unit(text: str) -> str | None:
+    """``"(단위 : 백만원)"`` -> ``"백만원"``; None when ``text`` is not a unit note."""
+    m = _UNIT_VALUE_RE.match(text.strip())
+    return (m.group("unit") or None) if m else None
+
+
 def parse_table_rows(lines: Sequence[str]) -> list[TableRow]:
     """Numeric table rows of a note with their table title and period (see module docstring)."""
     rows: list[TableRow] = []
     seen: dict[tuple[Period | None, str, str], int] = {}
     title = ""
+    unit: str | None = None
     period: Period | None = None
     columns: Literal["current_first", "prior_first"] | None = None
 
@@ -382,11 +393,12 @@ def parse_table_rows(lines: Sequence[str]) -> list[TableRow]:
         key = (per, title, label)
         occurrence = seen.get(key, 0)
         seen[key] = occurrence + 1
-        rows.append(TableRow(title, label, occurrence, per, values, pct, i))
+        rows.append(TableRow(title, label, occurrence, per, values, pct, i, unit))
 
     for i, line in enumerate(lines):
         if "|" not in line:
             if _UNIT_LINE_RE.match(line):
+                unit = parse_unit(line) or unit
                 continue
             mark = _PERIOD_MARK_RE.match(line)
             if mark is not None:
@@ -394,7 +406,7 @@ def parse_table_rows(lines: Sequence[str]) -> list[TableRow]:
                 columns = None
                 continue
             if not _DIGIT_RE.search(line):
-                title, period, columns = line, None, None
+                title, unit, period, columns = line, None, None, None
             continue
         cells = _cells(line)
         order = _column_order(cells)
@@ -407,6 +419,7 @@ def parse_table_rows(lines: Sequence[str]) -> list[TableRow]:
             rest = cells[1:]
             if not any(parse_number(c) for c in rest):
                 period, columns = row_period, None  # "당기 | (단위 : 백만원)": a block marker
+                unit = next((u for u in map(parse_unit, rest) if u), unit)
                 continue
             # "당기 | 1,000 | 800": a row named after its period (periods as rows).
             parsed = [parse_number(c) for c in rest]
@@ -515,6 +528,7 @@ def _change(
         "table": base.table,
         "label": base.label,
         "occurrence": base.occurrence,
+        "unit": base.unit,
         "prior_values": [_fmt(v) for v in prior.values] if prior is not None else [],
         "current_values": [_fmt(v) for v in current.values] if current is not None else [],
         "prior_ref": f"P{prior.line + 1}" if prior is not None else None,

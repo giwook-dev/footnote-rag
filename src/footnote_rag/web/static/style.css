@@ -180,6 +180,9 @@ main { padding: 20px 24px; max-width: 1280px; margin: 0 auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+/* 한국어를 글자 단위가 아니라 띄어쓰기 단위로 꺾는다. 넘칠 때만 단어 안에서 끊고, overflow-wrap: anywhere를
+   쓰는 셀(td.error 등)은 더 구체적인 규칙이 그대로 이긴다. */
+td { word-break: keep-all; overflow-wrap: break-word; }
 td.mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px; }
 td.error { color: var(--fail); max-width: 320px; overflow-wrap: anywhere; }
 
@@ -226,31 +229,101 @@ button.fn.on { background: var(--accent-bg); }
 /* ---- note change analysis (변동 분석) ---- */
 .diff-controls { align-items: flex-end; }
 .diff-controls .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.diff-controls select { max-width: 360px; }
+.diff-controls select { max-width: 440px; }
 .seg { display: flex; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; }
 .seg label { display: flex; gap: 4px; align-items: center; padding: 6px 10px; color: var(--fg); cursor: pointer; }
 .seg label:has(input:checked) { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
 .diff-recent { margin-top: 10px; }
 .recent-list { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; }
-.diff-stats { margin: 0 0 var(--gap-lg); }
+button.primary.warn { background: var(--wait); border-color: var(--wait); color: var(--surface); }
+.pair-warning { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.diff-warnings { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; margin: 0 0 var(--gap-lg); }
+.diff-warnings .msg { flex: 1 1 320px; }
+.warn-icon { font-weight: 700; }
+
+/* 요약 카드: 누르면 주석 목록을 거르는 토글 버튼 */
+.diff-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 8px; margin: 0 0 var(--gap-lg); }
+.stat-card {
+  display: flex; flex-direction: column; gap: 2px; text-align: left; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); color: var(--fg);
+}
+.stat-card span { font-size: 12px; color: var(--muted); }
+.stat-card b { font-size: 18px; }
+button.stat-card[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: var(--accent-bg); }
+.stat-card.static { cursor: help; }
+
+/* 칩: aria-pressed 토글 버튼 */
+button.chip { font-size: 12px; padding: 3px 10px; border-radius: 999px; }
+button.chip[aria-pressed="true"] { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
 .diff-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 12px; align-items: start; }
 @media (max-width: 900px) { .diff-split { grid-template-columns: minmax(0, 1fr); } }
-.diff-filter { display: flex; gap: 6px; align-items: center; margin: 0 0 6px; }
+/* 넓은 화면에서는 목록 열이 자체 스크롤을 갖고 상세를 내려도 화면에 남는다. */
+@media (min-width: 901px) {
+  .diff-list-col { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow-y: auto; padding: 2px 4px 2px 2px; }
+}
+.diff-list-tools { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.diff-list-tools input[type="search"] { width: 100%; }
+.diff-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.diff-list-meta { gap: 6px; }
+.diff-list-meta select { min-width: 0; }
+.diff-filter { display: flex; gap: 6px; align-items: center; margin: 0; }
 .note-list { list-style: none; margin: 0; padding: 0; }
 .note-list li { margin-bottom: 6px; }
 .note-item {
   width: 100%; text-align: left; display: flex; flex-direction: column; gap: 4px;
   background: var(--surface); padding: 9px 10px;
 }
-.note-item .t { font-weight: 600; overflow-wrap: anywhere; }
+.note-item .t { font-weight: 600; word-break: keep-all; overflow-wrap: anywhere; }
 .note-item.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .note-item .row { gap: 4px; }
 .diff-detail { margin: 0; }
-.diff-detail h3.diff-title { color: var(--fg); font-size: 15px; margin-bottom: 4px; }
-.diff-detail h4 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); }
+.diff-detail h3.diff-title { color: var(--fg); font-size: 15px; margin-bottom: 4px; word-break: keep-all; overflow-wrap: anywhere; }
+.diff-detail h3.diff-title .badge { margin-right: 4px; }
+.diff-detail h4 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); word-break: keep-all; }
 .diff-detail .path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-.diff-detail .path a { font-size: 12px; }
-.num-table th.n, .num-table td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.diff-sides { font-size: 12px; color: var(--muted); }
+.diff-sides a { font-size: 12px; }
+.diff-sides .sep { margin: 0 6px; }
+.diff-info { font-size: 12px; margin-top: 4px; }
+.diff-info summary { color: var(--muted); cursor: pointer; }
+.subtabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--line); margin: 12px 0 10px; }
+.subtabs button {
+  border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none;
+  padding: 7px 12px; color: var(--muted);
+}
+.subtabs button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); font-weight: 600; }
+.num-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 8px; }
+.num-toolbar .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.num-toolbar select { min-width: 0; }
+.num-toolbar input[type="search"] { flex: 1 1 160px; min-width: 140px; }
+.diff-detail .table-wrap { margin-top: 6px; }
+.more { margin-top: 8px; display: flex; gap: 8px; justify-content: center; align-items: center; flex-wrap: wrap; }
+
+/* 숫자 변동 표: 고정 레이아웃 + 열 폭. 행 이름 열이 남는 폭을 모두 갖고(최소 200px), 숫자 열은 고정 폭이다.
+   자동 레이아웃에서 긴 숫자 칸이 표를 넓히고 한국어 열이 한 글자 폭으로 줄던 문제를 막는다. */
+.num-table { table-layout: fixed; width: 100%; min-width: calc(200px + 36.5em); }
+.num-table col.c-num { width: 7.5em; }
+.num-table col.c-pct { width: 6em; }
+.num-table col.c-flag { width: 8em; }
+.num-table th { white-space: normal; word-break: keep-all; overflow-wrap: anywhere; }
+.num-table td.lbl, .num-table tr.group th { word-break: keep-all; overflow-wrap: anywhere; }
+.num-table th.n, .num-table td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.num-table td.n { overflow-wrap: anywhere; }
+.num-table td.n.many { white-space: normal; }
+.num-table td.flags .badge { margin: 0 2px 2px 0; }
+.num-table .occ { color: var(--muted); font-size: 11px; }
+.num-table .up { color: var(--ok); }
+.num-table .down { color: var(--fail); }
+.num-table tr.group th { padding: 0; background: var(--bg); }
+.group-toggle {
+  width: 100%; text-align: left; border: 0; border-radius: 0; background: none; padding: 6px 8px;
+  color: var(--fg); font-weight: 600; font-size: 12px; white-space: normal; word-break: keep-all; overflow-wrap: anywhere;
+}
+.group-toggle .muted { color: var(--muted); font-weight: 400; }
+.vals summary { cursor: pointer; color: var(--accent); }
+.vals-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.vals-list li { white-space: normal; overflow-wrap: anywhere; }
 .num-table tr.mis td { background: var(--wait-bg); }
 .difflines {
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px;
@@ -263,6 +336,7 @@ button.fn.on { background: var(--accent-bg); }
 .difflines .fold, .difflines summary { color: var(--muted); background: var(--bg); padding: 3px 8px; }
 .difflines summary { cursor: pointer; }
 .difflines .ln { color: var(--muted); display: inline-block; min-width: 44px; }
+.difflines .cellsep { color: var(--muted); }
 .sum { border: 1px dashed var(--line); border-radius: var(--radius-sm); padding: 10px; }
 .sum ul { margin: 8px 0 6px 18px; padding: 0; }
 .sum li { margin-bottom: 4px; }
