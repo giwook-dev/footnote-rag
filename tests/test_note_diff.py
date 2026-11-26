@@ -209,6 +209,39 @@ def test_period_block_table_rows():
     assert rows[0].line == 3
 
 
+def test_table_unit_from_period_marker_and_unit_line_and_reset_by_new_title():
+    lines = [
+        "특수관계자거래에 대한 공시",
+        "당기 | (단위 : 백만원)",
+        "매출 등 | 110,512",
+        "전기 | (단위 : 백만원)",
+        "매출 등 | 90,000",
+        "차입금 내역",
+        "(단위 : 천원)",
+        "단기차입금 | 3,000",
+        "단위 없는 표",
+        "건수 | 12",
+    ]
+    rows = parse_table_rows(lines)
+    assert [(r.table, r.period, r.unit) for r in rows] == [
+        ("특수관계자거래에 대한 공시", "current", "백만원"),
+        ("특수관계자거래에 대한 공시", "prior", "백만원"),
+        ("차입금 내역", None, "천원"),
+        ("단위 없는 표", None, None),  # the new title reset the unit
+    ]
+    prior = ["차입금 내역", "(단위 : 천원)", "단기차입금 | 2,000", "단위 없는 표", "건수 | 10"]
+    changes = compare_rows(prior, lines[5:]).changes
+    assert [(c["table"], c["unit"]) for c in changes] == [
+        ("차입금 내역", "천원"),
+        ("단위 없는 표", None),
+    ]
+
+
+def test_samsung_like_rows_carry_the_unit_of_their_period_block():
+    rows = parse_table_rows(SAMSUNG_LIKE)
+    assert [r.unit for r in rows] == ["백만원", "백만원", "백만원", "백만원", None]
+
+
 def test_periods_written_as_rows_are_rows_not_block_markers():
     prior = ["손익 요약", "구분 | 매출 | 원가", "당기 | 1,000 | 800", "전기 | 900 | 700"]
     current = ["손익 요약", "구분 | 매출 | 원가", "당기 | 1,500 | 820", "전기 | 1,000 | 790"]

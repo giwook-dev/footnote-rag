@@ -169,7 +169,7 @@
           </div>
           <div class="field">
             <label for="diff-prior">전년 보고서 (같은 회사, 자동 선택)</label>
-            <select id="diff-prior" required></select>
+            <select id="diff-prior" required aria-describedby="diff-pair-warning"></select>
           </div>
           <fieldset class="seg">
             <legend class="sr-only">범위</legend>
@@ -179,6 +179,7 @@
           <button id="diff-btn" type="submit" class="primary">비교</button>
           <span id="diff-spinner" class="spinner" hidden aria-label="비교 중"></span>
         </form>
+        <div id="diff-pair-warning" class="notice pair-warning" role="status" hidden></div>
         <p id="diff-prior-empty" class="notice" hidden>전년 보고서를 먼저 가져오세요. 문서 탭에서 같은 회사의 전년 사업보고서를 검색해 가져오면 여기에서 고를 수 있습니다.</p>
         <p id="diff-docs-empty" class="note" hidden>준비된(ready) DART 사업보고서가 없습니다. 문서 탭에서 사업보고서를 가져오세요.</p>
         <div class="row diff-recent">
@@ -189,15 +190,47 @@
       </div>
 
       <div id="diff-result" hidden>
-        <dl id="diff-stats" class="stats diff-stats" aria-label="변동 요약"></dl>
-        <p id="diff-warnings" class="notice" hidden></p>
+        <div id="diff-stats" class="diff-stats" role="group" aria-label="변동 요약 (카드를 누르면 주석 목록을 그 조건으로 거릅니다)"></div>
+        <div id="diff-warnings" class="notice diff-warnings" role="status" hidden></div>
         <div class="diff-split">
           <div class="diff-list-col">
-            <label class="note diff-filter"><input id="diff-changed-only" type="checkbox" checked> 변경된 주석만 · 관심도 순</label>
+            <div class="diff-list-tools">
+              <label for="diff-note-search" class="sr-only">주석 제목 검색</label>
+              <input id="diff-note-search" type="search" placeholder="주석 제목 검색" autocomplete="off">
+              <div class="chips diff-chips" role="group" aria-label="주석 필터 (여러 개를 고르면 모두 만족하는 주석)">
+                <button type="button" class="chip" data-note-chip="watchlist" aria-pressed="false">관심 주석</button>
+                <button type="button" class="chip" data-note-chip="large" aria-pressed="false">큰 변동</button>
+                <button type="button" class="chip" data-note-chip="mismatch" aria-pressed="false">전기 불일치</button>
+                <button type="button" class="chip" data-note-chip="text" aria-pressed="false">문장 변경</button>
+                <button type="button" class="chip" data-note-chip="added_removed" aria-pressed="false">신규·삭제</button>
+              </div>
+              <div class="row diff-list-meta">
+                <label for="diff-note-sort" class="sr-only">주석 정렬</label>
+                <select id="diff-note-sort">
+                  <option value="score" selected>정렬: 관심도</option>
+                  <option value="large">정렬: 큰 변동 수</option>
+                  <option value="text">정렬: 문장 변경 수</option>
+                  <option value="number">정렬: 주석 번호</option>
+                </select>
+                <span id="diff-notes-count" class="note" aria-live="polite"></span>
+              </div>
+              <label class="note diff-filter"><input id="diff-changed-only" type="checkbox" checked> 변경된 주석만</label>
+            </div>
             <ul id="diff-notes" class="note-list" aria-label="주석 목록"></ul>
             <p id="diff-notes-empty" class="note" hidden>표시할 주석이 없습니다.</p>
           </div>
-          <article id="diff-detail" class="card diff-detail" aria-label="주석 변동 상세"></article>
+          <article id="diff-detail" class="card diff-detail" aria-label="주석 변동 상세">
+            <div id="diff-detail-head"></div>
+            <div id="diff-subtabs" class="subtabs" role="tablist" aria-label="주석 상세 보기">
+              <button type="button" role="tab" id="diff-tab-numbers" data-diff-tab="numbers" aria-controls="diff-pane-numbers" aria-selected="true">숫자 변동</button>
+              <button type="button" role="tab" id="diff-tab-lines" data-diff-tab="lines" aria-controls="diff-pane-lines" aria-selected="false" tabindex="-1">문장 변경</button>
+              <button type="button" role="tab" id="diff-tab-summary" data-diff-tab="summary" aria-controls="diff-pane-summary" aria-selected="false" tabindex="-1">요약</button>
+            </div>
+            <section id="diff-pane-numbers" class="diff-pane" role="tabpanel" aria-labelledby="diff-tab-numbers"></section>
+            <section id="diff-pane-lines" class="diff-pane" role="tabpanel" aria-labelledby="diff-tab-lines" hidden></section>
+            <section id="diff-pane-summary" class="diff-pane" role="tabpanel" aria-labelledby="diff-tab-summary" hidden></section>
+            <p id="diff-detail-empty" class="note" hidden>왼쪽에서 주석을 고르세요.</p>
+          </article>
         </div>
       </div>
     </section>
